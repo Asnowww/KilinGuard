@@ -121,6 +121,13 @@ pub struct MetricSnapshot {
     pub alerts: Vec<Alert>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorruptSampleDetail {
+    pub sample_id: i64,
+    pub collected_at_ms: u64,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CpuSnapshot {
     #[serde(default)]

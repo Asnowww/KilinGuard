@@ -21,13 +21,13 @@ pub use context::{build_alert_context, collect_context, ContextRequest};
 pub use error::{OsSenseError, Result};
 pub use logs::{query_logs, LogQuery};
 pub use model::{
-    Alert, AlertContext, CollectionMode, CollectionStatus, CpuCoreSnapshot, CpuSnapshot,
-    DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading, HealthProbeResult,
-    HwmonSensorReading, LoadAverage, LogEntry, LogPattern, LogQueryResult, MemorySnapshot,
-    MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot,
-    NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessInfo, ProcessList, RateStatus,
-    ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit, TemperatureReading,
-    ThermalSnapshot,
+    Alert, AlertContext, CollectionMode, CollectionStatus, CorruptSampleDetail, CpuCoreSnapshot,
+    CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading,
+    HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogPattern, LogQueryResult,
+    MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
+    NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessInfo,
+    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
+    TemperatureReading, ThermalSnapshot,
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{
@@ -43,4 +43,4 @@ pub use scheduler::{
     MEMORY_INTERVAL_MS, NETWORK_INTERVAL_MS, THERMAL_INTERVAL_MS,
 };
 pub use services::{query_services, ServiceQuery};
-pub use storage::OsSenseStore;
+pub use storage::{OsSenseStore, MAX_HISTORY_POINTS};

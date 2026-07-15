@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{build_alert_context, collect_context_with, ContextRequest};
 use crate::error::Result;
-use crate::model::{AlertContext, CollectionMode, MetricSnapshot, OsContext, ResourceDimension};
+use crate::model::{
+    AlertContext, CollectionMode, CorruptSampleDetail, MetricSnapshot, OsContext, ResourceDimension,
+};
 use crate::procfs::{now_ms, MetricsThresholds, ProcfsCollector};
 use crate::scheduler::{CollectionScheduler, SchedulerConfig};
 use crate::storage::OsSenseStore;
@@ -47,6 +49,13 @@ pub struct MetricsHistory {
     pub window: TimeSeriesWindow,
     pub since_ms: u64,
     pub until_ms: u64,
+    pub source_sample_count: u64,
+    pub returned_sample_count: u64,
+    pub bucket_width_ms: u64,
+    pub downsampled: bool,
+    pub skipped_corrupt_samples: u64,
+    pub corrupt_sample_details: Vec<CorruptSampleDetail>,
+    pub warnings: Vec<String>,
     pub samples: Vec<MetricSnapshot>,
 }
 
@@ -93,6 +102,7 @@ impl OsSenseRuntime {
         config: OsSenseRuntimeConfig,
         start_ms: u64,
     ) -> Result<Self> {
+        store.delete_metrics_before(start_ms.saturating_sub(RETENTION_MS))?;
         let scheduler = CollectionScheduler::new(config.scheduler.clone(), start_ms)?;
         Ok(Self {
             collector,
@@ -166,11 +176,19 @@ impl OsSenseRuntime {
         current_time_ms: u64,
     ) -> Result<MetricsHistory> {
         let since_ms = current_time_ms.saturating_sub(window.duration_ms());
+        let query = self.store.query_history_range(since_ms, current_time_ms)?;
         Ok(MetricsHistory {
             window,
             since_ms,
             until_ms: current_time_ms,
-            samples: self.store.query_metrics_range(since_ms, current_time_ms)?,
+            source_sample_count: query.source_sample_count,
+            returned_sample_count: query.returned_sample_count,
+            bucket_width_ms: query.bucket_width_ms,
+            downsampled: query.downsampled,
+            skipped_corrupt_samples: query.skipped_corrupt_samples,
+            corrupt_sample_details: query.corrupt_sample_details,
+            warnings: query.warnings,
+            samples: query.samples,
         })
     }
 
@@ -184,10 +202,11 @@ impl OsSenseRuntime {
         self.scheduler.next_due_ms()
     }
 
-    fn persist_metrics(&self, snapshot: &MetricSnapshot) -> Result<()> {
-        self.store.insert_metrics(snapshot)?;
-        self.store
-            .delete_metrics_before(snapshot.meta.collected_at_ms.saturating_sub(RETENTION_MS))?;
+    fn persist_metrics(&mut self, snapshot: &MetricSnapshot) -> Result<()> {
+        self.store.insert_metrics_and_prune(
+            snapshot,
+            snapshot.meta.collected_at_ms.saturating_sub(RETENTION_MS),
+        )?;
         Ok(())
     }
 }
@@ -327,6 +346,44 @@ mod tests {
             .expect("history");
         assert_eq!(history.window.label(), "1h");
         assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.source_sample_count, 1);
+        assert_eq!(history.returned_sample_count, 1);
+        assert_eq!(history.bucket_width_ms, 0);
+        assert!(!history.downsampled);
+        assert_eq!(history.skipped_corrupt_samples, 0);
+    }
+
+    #[test]
+    fn runtime_startup_prunes_older_rows_and_keeps_the_seven_day_boundary() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let start_ms = RETENTION_MS + 1_000;
+        let cutoff_ms = start_ms - RETENTION_MS;
+        let clock = Arc::new(ManualClock::new(start_ms));
+        let mut collector = fixture_collector(root.path(), clock);
+        let template = collector.collect_metrics(&MetricsThresholds::default());
+        let store = OsSenseStore::in_memory().expect("store");
+        for timestamp in [cutoff_ms - 1, cutoff_ms, start_ms] {
+            let mut snapshot = template.clone();
+            snapshot.meta.collected_at_ms = timestamp;
+            snapshot.started_at_ms = timestamp;
+            snapshot.completed_at_ms = timestamp;
+            store.insert_metrics(&snapshot).expect("insert startup row");
+        }
+
+        let runtime =
+            OsSenseRuntime::with_parts(collector, store, OsSenseRuntimeConfig::default(), start_ms)
+                .expect("runtime");
+        let result = runtime
+            .store
+            .query_history_range(0, start_ms)
+            .expect("query retained rows");
+        let timestamps = result
+            .samples
+            .iter()
+            .map(|snapshot| snapshot.meta.collected_at_ms)
+            .collect::<Vec<_>>();
+
+        assert_eq!(timestamps, vec![cutoff_ms, start_ms]);
     }
 
     #[test]
