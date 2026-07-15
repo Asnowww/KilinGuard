@@ -2414,7 +2414,8 @@ fn run_os_process_list_with_runtime(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_os_log_query(input: OsLogQuery) -> Result<String, String> {
-    to_pretty_json(query_logs(&input))
+    let logs = query_logs(&input).map_err(|error| error.to_string())?;
+    to_pretty_json(logs)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -11126,6 +11127,35 @@ printf 'pwsh:%s' "$1"
             process_spec.input_schema["properties"]["state"]["enum"],
             json!(["R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I"])
         );
+        let log_spec = specs
+            .iter()
+            .find(|spec| spec.name == "os_log_query")
+            .expect("log tool spec");
+        assert_eq!(
+            log_spec.input_schema["properties"]["sources"]["maxItems"],
+            4
+        );
+        assert_eq!(
+            log_spec.input_schema["properties"]["sources"]["items"]["enum"],
+            json!([
+                "journalctl",
+                "journal",
+                "syslog",
+                "dmesg",
+                "auth",
+                "auth.log"
+            ])
+        );
+    }
+
+    #[test]
+    fn os_log_query_propagates_source_validation_errors() {
+        let error = super::run_os_log_query(os_sense::LogQuery {
+            sources: vec!["kern.log".to_string()],
+            ..os_sense::LogQuery::default()
+        })
+        .expect_err("unknown source must fail");
+        assert!(error.contains("unsupported log source"));
     }
 
     #[test]

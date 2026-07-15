@@ -58,13 +58,15 @@ pub(crate) fn collect_context_with(
     } else {
         None
     };
-    let logs = include_logs.then(|| {
-        query_logs(&LogQuery {
+    let logs = if include_logs {
+        Some(query_logs(&LogQuery {
             limit: request.log_limit.or(Some(50)),
             summarize: true,
             ..LogQuery::default()
-        })
-    });
+        })?)
+    } else {
+        None
+    };
     let network = include_network.then(|| {
         collect_network(&NetworkQuery {
             limit: Some(100),

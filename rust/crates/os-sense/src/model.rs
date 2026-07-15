@@ -476,9 +476,27 @@ pub enum ProcessAnomalyEvidence {
 pub struct LogQueryResult {
     pub meta: OsSampleMeta,
     pub truncated: bool,
+    #[serde(default)]
+    pub collection_status: CollectionStatus,
+    #[serde(default)]
+    pub source_statuses: Vec<LogSourceStatus>,
+    #[serde(default)]
+    pub omitted_warning_count: usize,
     pub entries: Vec<LogEntry>,
     pub patterns: Vec<LogPattern>,
     pub summary: Option<LogSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSourceStatus {
+    pub logical_source: String,
+    pub actual_source: Option<String>,
+    pub available: bool,
+    pub status: CollectionStatus,
+    pub error: Option<String>,
+    /// Number of bounded entries collected from this source before query filters.
+    pub entry_count: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
