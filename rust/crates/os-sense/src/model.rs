@@ -108,6 +108,8 @@ pub struct MetricSnapshot {
     pub attempted_dimensions: Vec<ResourceDimension>,
     #[serde(default)]
     pub updated_dimensions: Vec<ResourceDimension>,
+    #[serde(default)]
+    pub alert_evaluations: AlertEvaluationFreshness,
     pub cpu: CpuSnapshot,
     pub memory: MemorySnapshot,
     pub load: Option<LoadAverage>,
@@ -119,6 +121,14 @@ pub struct MetricSnapshot {
     #[serde(default)]
     pub thermal: ThermalSnapshot,
     pub alerts: Vec<Alert>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertEvaluationFreshness {
+    pub cpu_usage: bool,
+    pub load1: bool,
+    pub memory: bool,
+    pub disk_capacity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,10 +284,45 @@ pub struct FanReading {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Alert {
     pub dimension: String,
+    #[serde(default)]
+    pub subject: Option<String>,
     pub severity: String,
     pub message: String,
     pub value: f64,
     pub threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveAlertDimension {
+    Cpu,
+    Memory,
+    Load,
+    Disk,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActiveAlert {
+    pub dimension: ActiveAlertDimension,
+    pub subject: String,
+    pub severity: &'static str,
+    pub value: f64,
+    pub threshold: f64,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActiveAlertSnapshot {
+    pub schema: &'static str,
+    pub trust: &'static str,
+    pub handling: &'static str,
+    pub instructions_allowed: bool,
+    pub tool_requests_allowed: bool,
+    pub permission_grants_allowed: bool,
+    pub generated_at_ms: u64,
+    pub omitted_count: usize,
+    pub alerts: Vec<ActiveAlert>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

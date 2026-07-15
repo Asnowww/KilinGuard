@@ -21,10 +21,11 @@ pub use context::{build_alert_context, collect_context, ContextRequest};
 pub use error::{OsSenseError, Result};
 pub use logs::{query_logs, LogQuery};
 pub use model::{
-    Alert, AlertContext, CollectionMode, CollectionStatus, CorruptSampleDetail, CpuCoreSnapshot,
-    CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading,
-    HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogPattern, LogQueryResult,
-    MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
+    ActiveAlert, ActiveAlertDimension, ActiveAlertSnapshot, Alert, AlertContext,
+    AlertEvaluationFreshness, CollectionMode, CollectionStatus, CorruptSampleDetail,
+    CpuCoreSnapshot, CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
+    FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogPattern,
+    LogQueryResult, MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
     NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessInfo,
     ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
     TemperatureReading, ThermalSnapshot,
@@ -32,11 +33,12 @@ pub use model::{
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{
     collect_metrics, collect_processes, Clock, KylinPartitionUsageProvider, MetricsThresholds,
-    PartitionUsageProvider, ProcessQuery, ProcfsCollector, SystemClock,
+    PartitionUsageProvider, ProcessQuery, ProcfsCollector, SystemClock, OS_SENSE_THRESHOLDS_ENV,
 };
 pub use runtime::{
-    current_time_ms, default_database_path, MetricsHistory, OsSenseRuntime, OsSenseRuntimeConfig,
-    TimeSeriesWindow,
+    current_time_ms, default_database_path, ActiveAlertStore, MetricsHistory, OsSenseRuntime,
+    OsSenseRuntimeConfig, TimeSeriesWindow, ACTIVE_ALERT_TTL_MS, MAX_ACTIVE_ALERTS,
+    MAX_ACTIVE_ALERT_JSON_BYTES, MAX_TRACKED_ACTIVE_ALERTS,
 };
 pub use scheduler::{
     CollectionIntervals, CollectionScheduler, SchedulerConfig, CPU_INTERVAL_MS, DISK_INTERVAL_MS,

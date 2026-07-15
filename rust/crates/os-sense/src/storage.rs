@@ -398,6 +398,7 @@ mod tests {
             dimension_results: Vec::new(),
             attempted_dimensions: Vec::new(),
             updated_dimensions: Vec::new(),
+            alert_evaluations: crate::model::AlertEvaluationFreshness::default(),
             cpu: CpuSnapshot {
                 usage_percent: Some(1.0),
                 total_jiffies: 1,
@@ -656,7 +657,13 @@ mod tests {
             },
             "load": null,
             "disks": [],
-            "alerts": []
+            "alerts": [{
+                "dimension": "disk",
+                "severity": "warning",
+                "message": "legacy alert",
+                "value": 95.0,
+                "threshold": 90.0
+            }]
         }"#;
         store
             .conn
@@ -673,6 +680,8 @@ mod tests {
         let snapshot = &result.samples[0];
         assert_eq!(snapshot.mode, CollectionMode::OnDemand);
         assert_eq!(snapshot.status, CollectionStatus::Partial);
+        assert_eq!(snapshot.alerts.len(), 1);
+        assert_eq!(snapshot.alerts[0].subject, None);
         assert!(snapshot.disk_devices.is_empty());
         assert!(snapshot.network.interfaces.is_empty());
         assert_eq!(

@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::command::run_limited_command;
 use crate::error::{OsSenseError, Result};
 use crate::model::{
-    Alert, CollectionMode, CollectionStatus, CpuCoreSnapshot, CpuSnapshot,
-    DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading, HwmonSensorReading,
-    LoadAverage, LoongArchInfo, MemorySnapshot, MetricSnapshot, NetworkInterfaceSnapshot,
-    NetworkMetricsSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly, ProcessInfo, ProcessList,
-    RateStatus, ResourceDimension, SensorAvailability, TemperatureReading, ThermalSnapshot,
+    Alert, AlertEvaluationFreshness, CollectionMode, CollectionStatus, CpuCoreSnapshot,
+    CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading,
+    HwmonSensorReading, LoadAverage, LoongArchInfo, MemorySnapshot, MetricSnapshot,
+    NetworkInterfaceSnapshot, NetworkMetricsSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly,
+    ProcessInfo, ProcessList, RateStatus, ResourceDimension, SensorAvailability,
+    TemperatureReading, ThermalSnapshot,
 };
 use crate::redaction::redact_sensitive_text;
 
@@ -83,6 +84,8 @@ pub struct MetricsThresholds {
     pub load1: Option<f64>,
 }
 
+pub const OS_SENSE_THRESHOLDS_ENV: &str = "CLAW_OS_SENSE_THRESHOLDS";
+
 impl Default for MetricsThresholds {
     fn default() -> Self {
         Self {
@@ -91,6 +94,49 @@ impl Default for MetricsThresholds {
             disk_percent: Some(90.0),
             load1: None,
         }
+    }
+}
+
+impl MetricsThresholds {
+    pub fn from_environment() -> Result<Self> {
+        match std::env::var(OS_SENSE_THRESHOLDS_ENV) {
+            Ok(value) => Self::from_json(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => Err(OsSenseError::Configuration(format!(
+                "{OS_SENSE_THRESHOLDS_ENV} must contain UTF-8 JSON"
+            ))),
+        }
+    }
+
+    pub fn from_json(value: &str) -> Result<Self> {
+        let thresholds = serde_json::from_str::<Self>(value).map_err(|error| {
+            OsSenseError::Configuration(format!("invalid {OS_SENSE_THRESHOLDS_ENV} JSON: {error}"))
+        })?;
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("cpu_percent", self.cpu_percent),
+            ("memory_percent", self.memory_percent),
+            ("disk_percent", self.disk_percent),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value)) {
+                return Err(OsSenseError::Configuration(format!(
+                    "{OS_SENSE_THRESHOLDS_ENV}.{name} must be finite and between 0 and 100"
+                )));
+            }
+        }
+        if self
+            .load1
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(OsSenseError::Configuration(format!(
+                "{OS_SENSE_THRESHOLDS_ENV}.load1 must be finite and non-negative"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -187,15 +233,23 @@ impl ProcfsCollector {
         let mut warnings = Vec::new();
         let mut platform = self.platform_info(&mut warnings);
         let mut dimension_results = Vec::new();
+        let mut alert_evaluations = AlertEvaluationFreshness::default();
 
         if dimensions.contains(&ResourceDimension::Cpu) {
-            dimension_results.push(self.collect_cpu(mode, started_at_ms, &mut warnings));
+            let (result, cpu_usage, load1) = self.collect_cpu(mode, started_at_ms, &mut warnings);
+            alert_evaluations.cpu_usage = cpu_usage;
+            alert_evaluations.load1 = load1;
+            dimension_results.push(result);
         }
         if dimensions.contains(&ResourceDimension::Memory) {
-            dimension_results.push(self.collect_memory(mode, started_at_ms, &mut warnings));
+            let (result, memory) = self.collect_memory(mode, started_at_ms, &mut warnings);
+            alert_evaluations.memory = memory;
+            dimension_results.push(result);
         }
         if dimensions.contains(&ResourceDimension::Disk) {
-            dimension_results.push(self.collect_disk(mode, started_at_ms, &mut warnings));
+            let (result, disk_capacity) = self.collect_disk(mode, started_at_ms, &mut warnings);
+            alert_evaluations.disk_capacity = disk_capacity;
+            dimension_results.push(result);
         }
         if dimensions.contains(&ResourceDimension::Network) {
             dimension_results.push(self.collect_network_metrics(
@@ -258,6 +312,7 @@ impl ProcfsCollector {
             dimension_results,
             attempted_dimensions: dimensions.to_vec(),
             updated_dimensions,
+            alert_evaluations,
             cpu,
             memory,
             load,
@@ -274,13 +329,17 @@ impl ProcfsCollector {
         mode: CollectionMode,
         collected_at_ms: u64,
         warnings: &mut Vec<String>,
-    ) -> DimensionCollectionResult {
+    ) -> (DimensionCollectionResult, bool, bool) {
         let mut rate_status = None;
+        let mut cpu_usage_evaluated = false;
         let stat_collected = match fs::read_to_string(self.proc_root.join("stat")) {
             Ok(content) => match parse_cpu_stat(&content) {
                 Some(mut cpu) => {
                     cpu.collected_at_ms = collected_at_ms;
-                    rate_status = Some(apply_cpu_delta(&mut cpu, self.metrics(mode).cpu.as_ref()));
+                    let status = apply_cpu_delta(&mut cpu, self.metrics(mode).cpu.as_ref());
+                    cpu_usage_evaluated = status == RateStatus::Ready
+                        && cpu.usage_percent.is_some_and(f64::is_finite);
+                    rate_status = Some(status);
                     self.metrics_mut(mode).cpu = Some(cpu);
                     true
                 }
@@ -311,12 +370,16 @@ impl ProcfsCollector {
                 false
             }
         };
-        source_result(
-            ResourceDimension::Cpu,
-            stat_collected as usize + load_collected as usize,
-            2,
-            rate_status,
-            "CPU counters or load average could not be collected",
+        (
+            source_result(
+                ResourceDimension::Cpu,
+                stat_collected as usize + load_collected as usize,
+                2,
+                rate_status,
+                "CPU counters or load average could not be collected",
+            ),
+            cpu_usage_evaluated,
+            load_collected,
         )
     }
 
@@ -325,7 +388,7 @@ impl ProcfsCollector {
         mode: CollectionMode,
         collected_at_ms: u64,
         warnings: &mut Vec<String>,
-    ) -> DimensionCollectionResult {
+    ) -> (DimensionCollectionResult, bool) {
         let collected = match fs::read_to_string(self.proc_root.join("meminfo")) {
             Ok(content) => match parse_meminfo(&content) {
                 Some(mut memory) => {
@@ -343,12 +406,15 @@ impl ProcfsCollector {
                 false
             }
         };
-        source_result(
-            ResourceDimension::Memory,
-            usize::from(collected),
-            1,
-            None,
-            "/proc/meminfo could not be collected",
+        (
+            source_result(
+                ResourceDimension::Memory,
+                usize::from(collected),
+                1,
+                None,
+                "/proc/meminfo could not be collected",
+            ),
+            collected,
         )
     }
 
@@ -357,7 +423,7 @@ impl ProcfsCollector {
         mode: CollectionMode,
         collected_at_ms: u64,
         warnings: &mut Vec<String>,
-    ) -> DimensionCollectionResult {
+    ) -> (DimensionCollectionResult, bool) {
         let mut rate_status = None;
         let diskstats_collected = match fs::read_to_string(self.proc_root.join("diskstats")) {
             Ok(content) => {
@@ -400,12 +466,15 @@ impl ProcfsCollector {
                 false
             }
         };
-        source_result(
-            ResourceDimension::Disk,
-            diskstats_collected as usize + usage_collected as usize,
-            2,
-            rate_status,
-            "disk counters or partition usage could not be collected",
+        (
+            source_result(
+                ResourceDimension::Disk,
+                diskstats_collected as usize + usage_collected as usize,
+                2,
+                rate_status,
+                "disk counters or partition usage could not be collected",
+            ),
+            usage_collected,
         )
     }
 
@@ -1399,6 +1468,7 @@ fn build_metric_alerts(
         if value >= threshold {
             alerts.push(Alert {
                 dimension: "cpu".to_string(),
+                subject: Some("total".to_string()),
                 severity: "warning".to_string(),
                 message: format!("CPU usage {value:.2}% exceeds threshold {threshold:.2}%"),
                 value,
@@ -1410,6 +1480,7 @@ fn build_metric_alerts(
         if value >= threshold {
             alerts.push(Alert {
                 dimension: "memory".to_string(),
+                subject: Some("total".to_string()),
                 severity: "warning".to_string(),
                 message: format!("memory usage {value:.2}% exceeds threshold {threshold:.2}%"),
                 value,
@@ -1421,6 +1492,7 @@ fn build_metric_alerts(
         if load.one >= threshold {
             alerts.push(Alert {
                 dimension: "load".to_string(),
+                subject: Some("1m".to_string()),
                 severity: "warning".to_string(),
                 message: format!("load1 {:.2} exceeds threshold {threshold:.2}", load.one),
                 value: load.one,
@@ -1434,6 +1506,7 @@ fn build_metric_alerts(
                 if value >= threshold {
                     alerts.push(Alert {
                         dimension: "disk".to_string(),
+                        subject: Some(disk.mount_point.clone()),
                         severity: "warning".to_string(),
                         message: format!(
                             "disk {} usage {value:.2}% exceeds threshold {threshold:.2}%",
@@ -1615,6 +1688,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[test]
+    fn parses_and_validates_automatic_threshold_json() {
+        assert_eq!(
+            MetricsThresholds::from_json("{}").expect("default thresholds"),
+            MetricsThresholds::default()
+        );
+        let thresholds = MetricsThresholds::from_json(
+            r#"{"cpu_percent":0.0,"memory_percent":100.0,"disk_percent":null,"load1":2.5}"#,
+        )
+        .expect("valid thresholds");
+        assert_eq!(thresholds.cpu_percent, Some(0.0));
+        assert_eq!(thresholds.memory_percent, Some(100.0));
+        assert_eq!(thresholds.disk_percent, None);
+        assert_eq!(thresholds.load1, Some(2.5));
+        let disabled = MetricsThresholds::from_json(
+            r#"{"cpu_percent":null,"memory_percent":null,"disk_percent":null,"load1":null}"#,
+        )
+        .expect("disabled thresholds");
+        assert_eq!(disabled.cpu_percent, None);
+        assert_eq!(disabled.memory_percent, None);
+        assert_eq!(disabled.disk_percent, None);
+        assert_eq!(disabled.load1, None);
+    }
+
+    #[test]
+    fn rejects_invalid_automatic_threshold_json_and_values() {
+        for value in [
+            r#"{"cpu_percent":101}"#,
+            r#"{"memory_percent":-1}"#,
+            r#"{"load1":-0.1}"#,
+            r#"{"unknown":1}"#,
+            "null",
+            "not-json",
+        ] {
+            let error = MetricsThresholds::from_json(value).expect_err("invalid thresholds");
+            assert!(error.to_string().contains(OS_SENSE_THRESHOLDS_ENV));
+        }
+    }
 
     struct ManualClock(AtomicU64);
 

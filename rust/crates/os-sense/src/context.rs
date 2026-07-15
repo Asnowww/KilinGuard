@@ -117,6 +117,7 @@ pub(crate) fn collect_context_with(
         for anomaly in &processes.anomalies {
             alerts.push(Alert {
                 dimension: "process".to_string(),
+                subject: Some(anomaly.pid.to_string()),
                 severity: "warning".to_string(),
                 message: anomaly.message.clone(),
                 value: anomaly.score,

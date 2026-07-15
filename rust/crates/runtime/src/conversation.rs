@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -56,6 +57,11 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+}
+
+/// Supplies request-scoped system prompt data without persisting it in the session.
+pub trait SystemPromptProvider: Send + Sync {
+    fn system_prompt_section(&self) -> Option<String>;
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -133,6 +139,7 @@ pub struct ConversationRuntime<C, T> {
     tool_executor: T,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
+    system_prompt_providers: Vec<Arc<dyn SystemPromptProvider>>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
@@ -182,6 +189,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
+            system_prompt_providers: Vec::new(),
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
@@ -196,6 +204,23 @@ where
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    #[must_use]
+    pub fn with_system_prompt_provider(mut self, provider: Arc<dyn SystemPromptProvider>) -> Self {
+        self.system_prompt_providers.push(provider);
+        self
+    }
+
+    fn request_system_prompt(&self) -> Vec<String> {
+        let mut prompt = self.system_prompt.clone();
+        prompt.extend(
+            self.system_prompt_providers
+                .iter()
+                .filter_map(|provider| provider.system_prompt_section())
+                .filter(|section| !section.is_empty()),
+        );
+        prompt
     }
 
     #[must_use]
@@ -355,7 +380,7 @@ where
             }
 
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: self.request_system_prompt(),
                 messages: self.session.messages.clone(),
             };
             let events = match self.api_client.stream(request) {
@@ -843,7 +868,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, SystemPromptProvider, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -857,12 +883,82 @@ mod tests {
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     struct ScriptedApiClient {
         call_count: usize,
+    }
+
+    struct SharedSystemPromptProvider {
+        section: Arc<RwLock<Option<String>>>,
+    }
+
+    impl SystemPromptProvider for SharedSystemPromptProvider {
+        fn system_prompt_section(&self) -> Option<String> {
+            self.section
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    struct CapturingApiClient {
+        requests: Arc<Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for CapturingApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn dynamic_system_prompt_is_read_for_each_request_and_never_persisted() {
+        let section = Arc::new(RwLock::new(Some(
+            "dynamic-active-alert-snapshot".to_string(),
+        )));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(SharedSystemPromptProvider {
+            section: section.clone(),
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CapturingApiClient {
+                requests: requests.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["base-system".to_string()],
+        )
+        .with_system_prompt_provider(provider);
+
+        runtime.run_turn("first", None).expect("first turn");
+        *section
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        runtime.run_turn("second", None).expect("second turn");
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].system_prompt,
+            vec!["base-system", "dynamic-active-alert-snapshot"]
+        );
+        assert_eq!(requests[1].system_prompt, vec!["base-system"]);
+        assert!(
+            !format!("{:?}", runtime.session().messages).contains("dynamic-active-alert-snapshot")
+        );
     }
 
     impl ApiClient for ScriptedApiClient {
