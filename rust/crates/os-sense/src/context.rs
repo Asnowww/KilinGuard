@@ -21,16 +21,13 @@ pub struct ContextRequest {
 
 #[must_use]
 pub fn collect_context(request: &ContextRequest) -> OsContext {
-    collect_context_with(
-        request,
-        &ProcfsCollector::default(),
-        &MetricsThresholds::default(),
-    )
+    let mut collector = ProcfsCollector::default();
+    collect_context_with(request, &mut collector, &MetricsThresholds::default())
 }
 
 pub(crate) fn collect_context_with(
     request: &ContextRequest,
-    procfs: &ProcfsCollector,
+    procfs: &mut ProcfsCollector,
     thresholds: &MetricsThresholds,
 ) -> OsContext {
     let wanted = dimensions_for_intent(request.intent.as_deref());

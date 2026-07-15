@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,9 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::command::run_limited_command;
 use crate::error::{OsSenseError, Result};
 use crate::model::{
-    Alert, CpuSnapshot, DiskSnapshot, HwmonSensorReading, LoadAverage, LoongArchInfo,
-    MemorySnapshot, MetricSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly, ProcessInfo,
-    ProcessList,
+    Alert, CollectionMode, CollectionStatus, CpuCoreSnapshot, CpuSnapshot,
+    DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading, HwmonSensorReading,
+    LoadAverage, LoongArchInfo, MemorySnapshot, MetricSnapshot, NetworkInterfaceSnapshot,
+    NetworkMetricsSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly, ProcessInfo, ProcessList,
+    RateStatus, ResourceDimension, SensorAvailability, TemperatureReading, ThermalSnapshot,
 };
 use crate::redaction::redact_sensitive_text;
 
@@ -22,6 +25,54 @@ const DEFAULT_PROCESS_LIMIT: usize = 100;
 const MAX_PROCESS_LIMIT: usize = 500;
 const MAX_CMDLINE_CHARS: usize = 256;
 const MAX_HWMON_SENSORS: usize = 128;
+const DISK_SECTOR_BYTES: u64 = 512;
+
+pub trait Clock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
+pub trait PartitionUsageProvider: Send + Sync {
+    fn read_df_output(&self) -> Result<String>;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        now_ms()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct KylinPartitionUsageProvider;
+
+impl PartitionUsageProvider for KylinPartitionUsageProvider {
+    fn read_df_output(&self) -> Result<String> {
+        let output = run_limited_command(
+            "df",
+            &["-P", "-B1"],
+            Duration::from_secs(2),
+            64 * 1024,
+            16 * 1024,
+        )?;
+        if output.timed_out {
+            return Err(OsSenseError::Command("df -P -B1 timed out".to_string()));
+        }
+        if !output.success {
+            return Err(OsSenseError::Command(format!(
+                "df -P -B1 failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        if output.stdout_truncated {
+            return Err(OsSenseError::Command(
+                "df -P -B1 output exceeded the collection limit".to_string(),
+            ));
+        }
+        Ok(output.stdout)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -53,10 +104,29 @@ pub struct ProcessQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default)]
+struct MetricsState {
+    cpu: Option<CpuSnapshot>,
+    memory: Option<MemorySnapshot>,
+    load: Option<LoadAverage>,
+    disks: Vec<DiskSnapshot>,
+    disk_devices: Vec<DiskDeviceSnapshot>,
+    network: Option<NetworkMetricsSnapshot>,
+    thermal: Option<ThermalSnapshot>,
+}
+
+#[derive(Default)]
+struct MetricsByMode {
+    on_demand: MetricsState,
+    scheduled: MetricsState,
+}
+
 pub struct ProcfsCollector {
     proc_root: PathBuf,
     sys_root: PathBuf,
+    clock: Arc<dyn Clock>,
+    partition_usage: Arc<dyn PartitionUsageProvider>,
+    metrics: MetricsByMode,
 }
 
 impl Default for ProcfsCollector {
@@ -64,6 +134,9 @@ impl Default for ProcfsCollector {
         Self {
             proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
             sys_root: PathBuf::from(DEFAULT_SYS_ROOT),
+            clock: Arc::new(SystemClock),
+            partition_usage: Arc::new(KylinPartitionUsageProvider),
+            metrics: MetricsByMode::default(),
         }
     }
 }
@@ -74,80 +147,335 @@ impl ProcfsCollector {
         Self {
             proc_root: proc_root.into(),
             sys_root: sys_root.into(),
+            clock: Arc::new(SystemClock),
+            partition_usage: Arc::new(KylinPartitionUsageProvider),
+            metrics: MetricsByMode::default(),
         }
     }
 
-    pub fn collect_metrics(&self, thresholds: &MetricsThresholds) -> MetricSnapshot {
+    #[must_use]
+    pub fn with_dependencies(
+        proc_root: impl Into<PathBuf>,
+        sys_root: impl Into<PathBuf>,
+        clock: Arc<dyn Clock>,
+        partition_usage: Arc<dyn PartitionUsageProvider>,
+    ) -> Self {
+        Self {
+            proc_root: proc_root.into(),
+            sys_root: sys_root.into(),
+            clock,
+            partition_usage,
+            metrics: MetricsByMode::default(),
+        }
+    }
+
+    pub fn collect_metrics(&mut self, thresholds: &MetricsThresholds) -> MetricSnapshot {
+        self.collect_dimensions(
+            CollectionMode::OnDemand,
+            &ResourceDimension::ALL,
+            thresholds,
+        )
+    }
+
+    pub fn collect_dimensions(
+        &mut self,
+        mode: CollectionMode,
+        dimensions: &[ResourceDimension],
+        thresholds: &MetricsThresholds,
+    ) -> MetricSnapshot {
+        let started_at_ms = self.clock.now_ms();
         let mut warnings = Vec::new();
-        let platform = self.platform_info(&mut warnings);
-        let cpu = match fs::read_to_string(self.proc_root.join("stat")) {
-            Ok(content) => parse_cpu_stat(&content).unwrap_or_else(|| {
-                warnings.push("failed to parse /proc/stat".to_string());
-                CpuSnapshot {
-                    usage_percent: None,
-                    total_jiffies: 0,
-                    idle_jiffies: 0,
-                    cpu_count: 0,
-                }
-            }),
-            Err(error) => {
-                warnings.push(format!("failed to read /proc/stat: {error}"));
-                CpuSnapshot {
-                    usage_percent: None,
-                    total_jiffies: 0,
-                    idle_jiffies: 0,
-                    cpu_count: 0,
-                }
-            }
-        };
-        let memory = match fs::read_to_string(self.proc_root.join("meminfo")) {
-            Ok(content) => parse_meminfo(&content).unwrap_or_else(|| {
-                warnings.push("failed to parse /proc/meminfo".to_string());
-                MemorySnapshot {
-                    total_kb: 0,
-                    available_kb: 0,
-                    used_kb: 0,
-                    used_percent: None,
-                }
-            }),
-            Err(error) => {
-                warnings.push(format!("failed to read /proc/meminfo: {error}"));
-                MemorySnapshot {
-                    total_kb: 0,
-                    available_kb: 0,
-                    used_kb: 0,
-                    used_percent: None,
-                }
-            }
-        };
-        let load = match fs::read_to_string(self.proc_root.join("loadavg")) {
-            Ok(content) => match parse_loadavg(&content) {
-                Some(load) => Some(load),
-                None => {
-                    warnings.push("failed to parse /proc/loadavg".to_string());
-                    None
-                }
-            },
-            Err(error) => {
-                warnings.push(format!("failed to read /proc/loadavg: {error}"));
-                None
-            }
-        };
-        let disks = collect_disks(&mut warnings);
+        let mut platform = self.platform_info(&mut warnings);
+        let mut dimension_results = Vec::new();
+
+        if dimensions.contains(&ResourceDimension::Cpu) {
+            dimension_results.push(self.collect_cpu(mode, started_at_ms, &mut warnings));
+        }
+        if dimensions.contains(&ResourceDimension::Memory) {
+            dimension_results.push(self.collect_memory(mode, started_at_ms, &mut warnings));
+        }
+        if dimensions.contains(&ResourceDimension::Disk) {
+            dimension_results.push(self.collect_disk(mode, started_at_ms, &mut warnings));
+        }
+        if dimensions.contains(&ResourceDimension::Network) {
+            dimension_results.push(self.collect_network_metrics(
+                mode,
+                started_at_ms,
+                &mut warnings,
+            ));
+        }
+        if dimensions.contains(&ResourceDimension::Thermal) {
+            let (thermal, transient_failure) =
+                collect_thermal(&self.sys_root, started_at_ms, &mut warnings);
+            let thermal_available = thermal.availability == SensorAvailability::Available;
+            self.metrics_mut(mode).thermal = Some(thermal);
+            dimension_results.push(DimensionCollectionResult {
+                dimension: ResourceDimension::Thermal,
+                status: if thermal_available {
+                    CollectionStatus::Complete
+                } else {
+                    CollectionStatus::Failed
+                },
+                rate_status: None,
+                retryable: !thermal_available && transient_failure,
+                message: (!thermal_available).then(|| {
+                    "no valid reading from /sys/class/thermal or /sys/class/hwmon".to_string()
+                }),
+            });
+        }
+
+        let metrics = self.metrics(mode);
+        let cpu = metrics.cpu.clone().unwrap_or_default();
+        let memory = metrics.memory.clone().unwrap_or_default();
+        let load = metrics.load.clone();
+        let disks = metrics.disks.clone();
+        let disk_devices = metrics.disk_devices.clone();
+        let network = metrics.network.clone().unwrap_or_default();
+        let thermal = metrics.thermal.clone().unwrap_or_default();
+        if platform.loongarch.detected {
+            platform.loongarch.hwmon_sensors = thermal_to_hwmon(&thermal);
+        }
         let alerts = build_metric_alerts(&cpu, &memory, load.as_ref(), &disks, thresholds);
+        let completed_at_ms = self.clock.now_ms();
+        let status = collection_status(dimensions, &dimension_results);
+        let updated_dimensions = dimension_results
+            .iter()
+            .filter(|result| result.status != CollectionStatus::Failed)
+            .map(|result| result.dimension)
+            .collect();
 
         MetricSnapshot {
             meta: OsSampleMeta {
-                collected_at_ms: now_ms(),
-                source: "procfs".to_string(),
+                collected_at_ms: completed_at_ms,
+                source: "procfs+sysfs".to_string(),
                 platform,
                 warnings,
             },
+            mode,
+            started_at_ms,
+            completed_at_ms,
+            status,
+            dimension_results,
+            attempted_dimensions: dimensions.to_vec(),
+            updated_dimensions,
             cpu,
             memory,
             load,
             disks,
+            disk_devices,
+            network,
+            thermal,
             alerts,
+        }
+    }
+
+    fn collect_cpu(
+        &mut self,
+        mode: CollectionMode,
+        collected_at_ms: u64,
+        warnings: &mut Vec<String>,
+    ) -> DimensionCollectionResult {
+        let mut rate_status = None;
+        let stat_collected = match fs::read_to_string(self.proc_root.join("stat")) {
+            Ok(content) => match parse_cpu_stat(&content) {
+                Some(mut cpu) => {
+                    cpu.collected_at_ms = collected_at_ms;
+                    rate_status = Some(apply_cpu_delta(&mut cpu, self.metrics(mode).cpu.as_ref()));
+                    self.metrics_mut(mode).cpu = Some(cpu);
+                    true
+                }
+                None => {
+                    warnings.push("failed to parse /proc/stat".to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                warnings.push(format!("failed to read /proc/stat: {error}"));
+                false
+            }
+        };
+
+        let load_collected = match fs::read_to_string(self.proc_root.join("loadavg")) {
+            Ok(content) => match parse_loadavg(&content) {
+                Some(load) => {
+                    self.metrics_mut(mode).load = Some(load);
+                    true
+                }
+                None => {
+                    warnings.push("failed to parse /proc/loadavg".to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                warnings.push(format!("failed to read /proc/loadavg: {error}"));
+                false
+            }
+        };
+        source_result(
+            ResourceDimension::Cpu,
+            stat_collected as usize + load_collected as usize,
+            2,
+            rate_status,
+            "CPU counters or load average could not be collected",
+        )
+    }
+
+    fn collect_memory(
+        &mut self,
+        mode: CollectionMode,
+        collected_at_ms: u64,
+        warnings: &mut Vec<String>,
+    ) -> DimensionCollectionResult {
+        let collected = match fs::read_to_string(self.proc_root.join("meminfo")) {
+            Ok(content) => match parse_meminfo(&content) {
+                Some(mut memory) => {
+                    memory.collected_at_ms = collected_at_ms;
+                    self.metrics_mut(mode).memory = Some(memory);
+                    true
+                }
+                None => {
+                    warnings.push("failed to parse /proc/meminfo".to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                warnings.push(format!("failed to read /proc/meminfo: {error}"));
+                false
+            }
+        };
+        source_result(
+            ResourceDimension::Memory,
+            usize::from(collected),
+            1,
+            None,
+            "/proc/meminfo could not be collected",
+        )
+    }
+
+    fn collect_disk(
+        &mut self,
+        mode: CollectionMode,
+        collected_at_ms: u64,
+        warnings: &mut Vec<String>,
+    ) -> DimensionCollectionResult {
+        let mut rate_status = None;
+        let diskstats_collected = match fs::read_to_string(self.proc_root.join("diskstats")) {
+            Ok(content) => {
+                let mut devices = parse_diskstats(&content);
+                if devices.is_empty() {
+                    warnings.push("/proc/diskstats contained no valid device rows".to_string());
+                    false
+                } else {
+                    rate_status = Some(apply_disk_deltas(
+                        &mut devices,
+                        &self.metrics(mode).disk_devices,
+                        collected_at_ms,
+                    ));
+                    self.metrics_mut(mode).disk_devices = devices;
+                    true
+                }
+            }
+            Err(error) => {
+                warnings.push(format!("failed to read /proc/diskstats: {error}"));
+                false
+            }
+        };
+
+        let usage_collected = match self.partition_usage.read_df_output() {
+            Ok(content) => {
+                let mut disks = parse_df_output(&content);
+                if disks.is_empty() {
+                    warnings.push("df -P -B1 contained no valid partition rows".to_string());
+                    false
+                } else {
+                    for disk in &mut disks {
+                        disk.collected_at_ms = collected_at_ms;
+                    }
+                    self.metrics_mut(mode).disks = disks;
+                    true
+                }
+            }
+            Err(error) => {
+                warnings.push(format!("failed to collect partition usage: {error}"));
+                false
+            }
+        };
+        source_result(
+            ResourceDimension::Disk,
+            diskstats_collected as usize + usage_collected as usize,
+            2,
+            rate_status,
+            "disk counters or partition usage could not be collected",
+        )
+    }
+
+    fn collect_network_metrics(
+        &mut self,
+        mode: CollectionMode,
+        collected_at_ms: u64,
+        warnings: &mut Vec<String>,
+    ) -> DimensionCollectionResult {
+        let mut connection_sources_collected = false;
+        let mut rate_status = None;
+        let dev_collected = match fs::read_to_string(self.proc_root.join("net/dev")) {
+            Ok(content) => {
+                let mut interfaces = parse_net_dev(&content);
+                if interfaces.is_empty() {
+                    warnings.push("/proc/net/dev contained no valid interfaces".to_string());
+                    return source_result(
+                        ResourceDimension::Network,
+                        0,
+                        2,
+                        None,
+                        "network counters or connection tables could not be collected",
+                    );
+                }
+                let previous = self
+                    .metrics(mode)
+                    .network
+                    .as_ref()
+                    .map(|network| network.interfaces.as_slice())
+                    .unwrap_or_default();
+                rate_status = Some(apply_network_deltas(
+                    &mut interfaces,
+                    previous,
+                    collected_at_ms,
+                ));
+                let (connection_count, connections_available) =
+                    count_network_connections(&self.proc_root, warnings);
+                connection_sources_collected = connections_available;
+                self.metrics_mut(mode).network = Some(NetworkMetricsSnapshot {
+                    collected_at_ms,
+                    connection_count,
+                    interfaces,
+                });
+                true
+            }
+            Err(error) => {
+                warnings.push(format!("failed to read /proc/net/dev: {error}"));
+                false
+            }
+        };
+        source_result(
+            ResourceDimension::Network,
+            dev_collected as usize + connection_sources_collected as usize,
+            2,
+            rate_status,
+            "network counters or connection tables could not be collected",
+        )
+    }
+
+    fn metrics(&self, mode: CollectionMode) -> &MetricsState {
+        match mode {
+            CollectionMode::OnDemand => &self.metrics.on_demand,
+            CollectionMode::Scheduled => &self.metrics.scheduled,
+        }
+    }
+
+    fn metrics_mut(&mut self, mode: CollectionMode) -> &mut MetricsState {
+        match mode {
+            CollectionMode::OnDemand => &mut self.metrics.on_demand,
+            CollectionMode::Scheduled => &mut self.metrics.scheduled,
         }
     }
 
@@ -298,12 +626,6 @@ impl ProcfsCollector {
                 }
                 Vec::new()
             });
-        let hwmon_sensors = if detected {
-            collect_hwmon_sensors(&hwmon_root, warnings)
-        } else {
-            Vec::new()
-        };
-
         PlatformInfo {
             os: std::env::consts::OS.to_string(),
             arch,
@@ -312,15 +634,19 @@ impl ProcfsCollector {
                 detected,
                 cpu_model,
                 hwmon_paths,
-                hwmon_sensors,
+                hwmon_sensors: Vec::new(),
             },
         }
     }
 }
 
-fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSensorReading> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
+fn collect_hwmon_sensors(
+    root: &Path,
+    warnings: &mut Vec<String>,
+) -> (Vec<HwmonSensorReading>, bool) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return (Vec::new(), root.exists()),
     };
     let mut device_paths = entries
         .flatten()
@@ -329,6 +655,7 @@ fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSe
     device_paths.sort();
 
     let mut sensors = Vec::new();
+    let mut transient_failure = false;
     for device_path in device_paths {
         let device = fs::read_to_string(device_path.join("name"))
             .ok()
@@ -342,6 +669,7 @@ fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSe
                     .to_string()
             });
         let Ok(files) = fs::read_dir(&device_path) else {
+            transient_failure = true;
             continue;
         };
         let mut input_paths = files
@@ -358,9 +686,9 @@ fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSe
         for input_path in input_paths {
             if sensors.len() >= MAX_HWMON_SENSORS {
                 warnings.push(format!(
-                    "LoongArch hwmon sensor list was capped at {MAX_HWMON_SENSORS} entries"
+                    "hwmon sensor list was capped at {MAX_HWMON_SENSORS} entries"
                 ));
-                return sensors;
+                return (sensors, transient_failure);
             }
             let Some(sensor) = input_path
                 .file_name()
@@ -370,13 +698,15 @@ fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSe
                 continue;
             };
             let Ok(raw) = fs::read_to_string(&input_path) else {
+                transient_failure = true;
                 continue;
             };
             let Ok(value) = raw.trim().parse::<i64>() else {
                 warnings.push(format!(
-                    "failed to parse LoongArch hwmon sensor {}",
+                    "failed to parse hwmon sensor {}",
                     input_path.display()
                 ));
+                transient_failure = true;
                 continue;
             };
             let label_path = input_path.with_file_name(sensor.replace("_input", "_label"));
@@ -394,7 +724,7 @@ fn collect_hwmon_sensors(root: &Path, warnings: &mut Vec<String>) -> Vec<HwmonSe
             });
         }
     }
-    sensors
+    (sensors, transient_failure)
 }
 
 fn is_supported_hwmon_input(name: &str) -> bool {
@@ -437,6 +767,139 @@ fn hwmon_unit(sensor: &str) -> &'static str {
     }
 }
 
+fn collect_thermal(
+    sys_root: &Path,
+    collected_at_ms: u64,
+    warnings: &mut Vec<String>,
+) -> (ThermalSnapshot, bool) {
+    let mut temperatures = Vec::new();
+    let mut transient_failure = false;
+    let thermal_root = sys_root.join("class/thermal");
+    let thermal_entries = fs::read_dir(&thermal_root);
+    if thermal_entries.is_err() && thermal_root.exists() {
+        transient_failure = true;
+    }
+    if let Ok(entries) = thermal_entries {
+        let mut zones = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("thermal_zone"))
+            })
+            .collect::<Vec<_>>();
+        zones.sort();
+        for zone in zones {
+            let temp_path = zone.join("temp");
+            let Ok(raw) = fs::read_to_string(&temp_path) else {
+                transient_failure |= temp_path.exists();
+                continue;
+            };
+            let Ok(value) = raw.trim().parse::<i64>() else {
+                warnings.push(format!(
+                    "failed to parse thermal sensor {}",
+                    temp_path.display()
+                ));
+                transient_failure = true;
+                continue;
+            };
+            let label = fs::read_to_string(zone.join("type"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            temperatures.push(TemperatureReading {
+                source: "thermal_zone".to_string(),
+                label,
+                millidegrees_celsius: value,
+                path: temp_path.display().to_string(),
+            });
+        }
+    }
+
+    let mut fans = Vec::new();
+    let hwmon_root = sys_root.join("class/hwmon");
+    let (hwmon_sensors, hwmon_transient_failure) = collect_hwmon_sensors(&hwmon_root, warnings);
+    transient_failure |= hwmon_transient_failure;
+    for sensor in hwmon_sensors {
+        if sensor.sensor.starts_with("temp") {
+            temperatures.push(TemperatureReading {
+                source: sensor.device,
+                label: sensor.label,
+                millidegrees_celsius: sensor.value,
+                path: sensor.path,
+            });
+        } else if sensor.sensor.starts_with("fan") {
+            if let Ok(rpm) = u64::try_from(sensor.value) {
+                fans.push(FanReading {
+                    source: sensor.device,
+                    label: sensor.label,
+                    rpm,
+                    path: sensor.path,
+                });
+            } else {
+                transient_failure = true;
+            }
+        }
+    }
+    let thermal_zone_available = temperatures
+        .iter()
+        .any(|reading| reading.source == "thermal_zone");
+    let hwmon_available = temperatures
+        .iter()
+        .any(|reading| reading.source != "thermal_zone")
+        || !fans.is_empty();
+    let availability = if thermal_zone_available || hwmon_available {
+        SensorAvailability::Available
+    } else {
+        SensorAvailability::Unavailable
+    };
+
+    (
+        ThermalSnapshot {
+            collected_at_ms,
+            availability,
+            thermal_zone_available,
+            hwmon_available,
+            temperatures,
+            fans,
+        },
+        transient_failure,
+    )
+}
+
+fn thermal_to_hwmon(thermal: &ThermalSnapshot) -> Vec<HwmonSensorReading> {
+    let temperatures = thermal
+        .temperatures
+        .iter()
+        .filter(|reading| reading.source != "thermal_zone")
+        .map(|reading| HwmonSensorReading {
+            device: reading.source.clone(),
+            sensor: Path::new(&reading.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("temp_input")
+                .to_string(),
+            label: reading.label.clone(),
+            value: reading.millidegrees_celsius,
+            unit: "millidegrees_celsius".to_string(),
+            path: reading.path.clone(),
+        });
+    let fans = thermal.fans.iter().map(|reading| HwmonSensorReading {
+        device: reading.source.clone(),
+        sensor: Path::new(&reading.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fan_input")
+            .to_string(),
+        label: reading.label.clone(),
+        value: i64::try_from(reading.rpm).unwrap_or(i64::MAX),
+        unit: "rpm".to_string(),
+        path: reading.path.clone(),
+    });
+    temperatures.chain(fans).collect()
+}
+
 #[must_use]
 pub fn collect_metrics(thresholds: &MetricsThresholds) -> MetricSnapshot {
     ProcfsCollector::default().collect_metrics(thresholds)
@@ -472,33 +935,104 @@ pub(crate) fn basic_meta(source: &str, warnings: Vec<String>) -> OsSampleMeta {
 
 #[must_use]
 pub fn parse_cpu_stat(content: &str) -> Option<CpuSnapshot> {
-    let mut lines = content.lines();
-    let cpu_line = lines.next()?.trim();
-    let mut parts = cpu_line.split_whitespace();
-    (parts.next()? == "cpu").then_some(())?;
+    let mut cpu_lines = content.lines().filter(|line| line.starts_with("cpu"));
+    let aggregate = parse_cpu_line(cpu_lines.next()?)?;
+    if aggregate.name != "cpu" {
+        return None;
+    }
+    let cores = cpu_lines.filter_map(parse_cpu_line).collect::<Vec<_>>();
+    Some(CpuSnapshot {
+        collected_at_ms: 0,
+        sample_interval_ms: None,
+        usage_percent: None,
+        total_jiffies: aggregate.total_jiffies,
+        idle_jiffies: aggregate.idle_jiffies,
+        cpu_count: cores.len(),
+        cores,
+    })
+}
+
+fn parse_cpu_line(line: &str) -> Option<CpuCoreSnapshot> {
+    let mut parts = line.split_whitespace();
+    let name = parts.next()?.to_string();
     let values = parts
         .map(|part| part.parse::<u64>().ok())
         .collect::<Option<Vec<_>>>()?;
     if values.len() < 4 {
         return None;
     }
-    let idle =
+    let idle_jiffies =
         values.get(3).copied().unwrap_or_default() + values.get(4).copied().unwrap_or_default();
-    let total = values.iter().sum::<u64>();
-    let usage_percent = (total > 0).then(|| round2(((total - idle) as f64 / total as f64) * 100.0));
-    let cpu_count = content
-        .lines()
-        .filter(|line| {
-            line.strip_prefix("cpu")
-                .and_then(|rest| rest.chars().next())
-                .is_some_and(|ch| ch.is_ascii_digit())
-        })
-        .count();
-    Some(CpuSnapshot {
-        usage_percent,
-        total_jiffies: total,
-        idle_jiffies: idle,
-        cpu_count,
+    Some(CpuCoreSnapshot {
+        name,
+        usage_percent: None,
+        total_jiffies: values.iter().sum(),
+        idle_jiffies,
+    })
+}
+
+fn apply_cpu_delta(current: &mut CpuSnapshot, previous: Option<&CpuSnapshot>) -> RateStatus {
+    let Some(previous) = previous else {
+        return RateStatus::WarmingUp;
+    };
+    let Some(elapsed_ms) = current
+        .collected_at_ms
+        .checked_sub(previous.collected_at_ms)
+    else {
+        return RateStatus::CounterReset;
+    };
+    if elapsed_ms == 0 {
+        return RateStatus::WarmingUp;
+    }
+    current.sample_interval_ms = Some(elapsed_ms);
+    let counters_reset = current.total_jiffies < previous.total_jiffies
+        || current.idle_jiffies < previous.idle_jiffies;
+    current.usage_percent = cpu_usage_percent(
+        current.total_jiffies,
+        current.idle_jiffies,
+        previous.total_jiffies,
+        previous.idle_jiffies,
+    );
+    let mut warming_up = current.usage_percent.is_none() && !counters_reset;
+    let mut counters_reset = counters_reset;
+    for core in &mut current.cores {
+        if let Some(previous_core) = previous.cores.iter().find(|item| item.name == core.name) {
+            if core.total_jiffies < previous_core.total_jiffies
+                || core.idle_jiffies < previous_core.idle_jiffies
+            {
+                counters_reset = true;
+            }
+            core.usage_percent = cpu_usage_percent(
+                core.total_jiffies,
+                core.idle_jiffies,
+                previous_core.total_jiffies,
+                previous_core.idle_jiffies,
+            );
+            warming_up |= core.usage_percent.is_none() && !counters_reset;
+        } else {
+            warming_up = true;
+        }
+    }
+    if counters_reset {
+        RateStatus::CounterReset
+    } else if warming_up {
+        RateStatus::WarmingUp
+    } else {
+        RateStatus::Ready
+    }
+}
+
+fn cpu_usage_percent(
+    total: u64,
+    idle: u64,
+    previous_total: u64,
+    previous_idle: u64,
+) -> Option<f64> {
+    let total_delta = total.checked_sub(previous_total)?;
+    let idle_delta = idle.checked_sub(previous_idle)?;
+    (total_delta > 0).then(|| {
+        let busy_delta = total_delta.saturating_sub(idle_delta);
+        round2((busy_delta as f64 / total_delta as f64) * 100.0)
     })
 }
 
@@ -520,11 +1054,26 @@ pub fn parse_meminfo(content: &str) -> Option<MemorySnapshot> {
         .unwrap_or_default();
     let used = total.saturating_sub(available);
     let used_percent = (total > 0).then(|| round2((used as f64 / total as f64) * 100.0));
+    let buffers = values.get("Buffers").copied().unwrap_or_default();
+    let cached = values
+        .get("Cached")
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(values.get("SReclaimable").copied().unwrap_or_default())
+        .saturating_sub(values.get("Shmem").copied().unwrap_or_default());
+    let swap_total = values.get("SwapTotal").copied().unwrap_or_default();
+    let swap_free = values.get("SwapFree").copied().unwrap_or_default();
     Some(MemorySnapshot {
+        collected_at_ms: 0,
         total_kb: total,
         available_kb: available,
         used_kb: used,
         used_percent,
+        buffers_kb: buffers,
+        cached_kb: cached,
+        swap_total_kb: swap_total,
+        swap_free_kb: swap_free,
+        swap_used_kb: swap_total.saturating_sub(swap_free),
     })
 }
 
@@ -562,6 +1111,7 @@ pub fn parse_df_output(content: &str) -> Vec<DiskSnapshot> {
                 .get(4)
                 .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
             Some(DiskSnapshot {
+                collected_at_ms: 0,
                 filesystem: parts[0].to_string(),
                 total_bytes,
                 used_bytes,
@@ -573,33 +1123,268 @@ pub fn parse_df_output(content: &str) -> Vec<DiskSnapshot> {
         .collect()
 }
 
-fn collect_disks(warnings: &mut Vec<String>) -> Vec<DiskSnapshot> {
-    match run_limited_command(
-        "df",
-        &["-P", "-B1"],
-        Duration::from_secs(2),
-        64 * 1024,
-        16 * 1024,
-    ) {
-        Ok(output) if output.success => {
-            if output.stdout_truncated {
-                warnings.push("df output was truncated".to_string());
+#[must_use]
+pub fn parse_diskstats(content: &str) -> Vec<DiskDeviceSnapshot> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            if parts.len() < 14 {
+                return None;
             }
-            parse_df_output(&output.stdout)
+            Some(DiskDeviceSnapshot {
+                name: parts.get(2)?.to_string(),
+                reads_completed_total: parts.get(3)?.parse().ok()?,
+                sectors_read_total: parts.get(5)?.parse().ok()?,
+                writes_completed_total: parts.get(7)?.parse().ok()?,
+                sectors_written_total: parts.get(9)?.parse().ok()?,
+                io_in_progress: parts.get(11)?.parse().ok()?,
+                ..DiskDeviceSnapshot::default()
+            })
+        })
+        .collect()
+}
+
+fn apply_disk_deltas(
+    current: &mut [DiskDeviceSnapshot],
+    previous: &[DiskDeviceSnapshot],
+    collected_at_ms: u64,
+) -> RateStatus {
+    let mut warming_up = previous.is_empty();
+    let mut counters_reset = false;
+    for device in current {
+        device.collected_at_ms = collected_at_ms;
+        let Some(previous) = previous.iter().find(|item| item.name == device.name) else {
+            warming_up = true;
+            continue;
+        };
+        let Some(elapsed_ms) = collected_at_ms.checked_sub(previous.collected_at_ms) else {
+            counters_reset = true;
+            continue;
+        };
+        if elapsed_ms == 0 {
+            warming_up = true;
+            continue;
         }
-        Ok(output) => {
-            if output.timed_out {
-                warnings.push("df -P -B1 timed out".to_string());
-            } else {
-                warnings.push(format!("df -P -B1 failed: {}", output.stderr.trim()));
-            }
-            Vec::new()
-        }
-        Err(error) => {
-            warnings.push(format!("df command unavailable: {error}"));
-            Vec::new()
-        }
+        device.sample_interval_ms = Some(elapsed_ms);
+        counters_reset |= device.reads_completed_total < previous.reads_completed_total
+            || device.writes_completed_total < previous.writes_completed_total
+            || device.sectors_read_total < previous.sectors_read_total
+            || device.sectors_written_total < previous.sectors_written_total;
+        device.read_iops = counter_rate(
+            device.reads_completed_total,
+            previous.reads_completed_total,
+            elapsed_ms,
+            1,
+        );
+        device.write_iops = counter_rate(
+            device.writes_completed_total,
+            previous.writes_completed_total,
+            elapsed_ms,
+            1,
+        );
+        device.read_bytes_per_sec = counter_rate(
+            device.sectors_read_total,
+            previous.sectors_read_total,
+            elapsed_ms,
+            DISK_SECTOR_BYTES,
+        );
+        device.write_bytes_per_sec = counter_rate(
+            device.sectors_written_total,
+            previous.sectors_written_total,
+            elapsed_ms,
+            DISK_SECTOR_BYTES,
+        );
     }
+    if counters_reset {
+        RateStatus::CounterReset
+    } else if warming_up {
+        RateStatus::WarmingUp
+    } else {
+        RateStatus::Ready
+    }
+}
+
+#[must_use]
+pub fn parse_net_dev(content: &str) -> Vec<NetworkInterfaceSnapshot> {
+    content
+        .lines()
+        .skip(2)
+        .filter_map(|line| {
+            let (name, counters) = line.split_once(':')?;
+            let values = counters
+                .split_whitespace()
+                .map(|value| value.parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            if values.len() < 16 {
+                return None;
+            }
+            Some(NetworkInterfaceSnapshot {
+                name: name.trim().to_string(),
+                receive_bytes_total: values[0],
+                receive_packets_total: values[1],
+                receive_errors_total: values[2],
+                receive_dropped_total: values[3],
+                transmit_bytes_total: values[8],
+                transmit_packets_total: values[9],
+                transmit_errors_total: values[10],
+                transmit_dropped_total: values[11],
+                ..NetworkInterfaceSnapshot::default()
+            })
+        })
+        .collect()
+}
+
+fn apply_network_deltas(
+    current: &mut [NetworkInterfaceSnapshot],
+    previous: &[NetworkInterfaceSnapshot],
+    collected_at_ms: u64,
+) -> RateStatus {
+    let mut warming_up = previous.is_empty();
+    let mut counters_reset = false;
+    for interface in current {
+        interface.collected_at_ms = collected_at_ms;
+        let Some(previous) = previous.iter().find(|item| item.name == interface.name) else {
+            warming_up = true;
+            continue;
+        };
+        let Some(elapsed_ms) = collected_at_ms.checked_sub(previous.collected_at_ms) else {
+            counters_reset = true;
+            continue;
+        };
+        if elapsed_ms == 0 {
+            warming_up = true;
+            continue;
+        }
+        interface.sample_interval_ms = Some(elapsed_ms);
+        counters_reset |= interface.receive_bytes_total < previous.receive_bytes_total
+            || interface.receive_packets_total < previous.receive_packets_total
+            || interface.transmit_bytes_total < previous.transmit_bytes_total
+            || interface.transmit_packets_total < previous.transmit_packets_total;
+        interface.receive_bytes_per_sec = counter_rate(
+            interface.receive_bytes_total,
+            previous.receive_bytes_total,
+            elapsed_ms,
+            1,
+        );
+        interface.transmit_bytes_per_sec = counter_rate(
+            interface.transmit_bytes_total,
+            previous.transmit_bytes_total,
+            elapsed_ms,
+            1,
+        );
+        interface.receive_packets_per_sec = counter_rate(
+            interface.receive_packets_total,
+            previous.receive_packets_total,
+            elapsed_ms,
+            1,
+        );
+        interface.transmit_packets_per_sec = counter_rate(
+            interface.transmit_packets_total,
+            previous.transmit_packets_total,
+            elapsed_ms,
+            1,
+        );
+    }
+    if counters_reset {
+        RateStatus::CounterReset
+    } else if warming_up {
+        RateStatus::WarmingUp
+    } else {
+        RateStatus::Ready
+    }
+}
+
+fn counter_rate(current: u64, previous: u64, elapsed_ms: u64, scale: u64) -> Option<f64> {
+    let delta = current.checked_sub(previous)?;
+    (elapsed_ms > 0).then(|| round2((delta as f64 * scale as f64 * 1_000.0) / elapsed_ms as f64))
+}
+
+fn count_network_connections(proc_root: &Path, warnings: &mut Vec<String>) -> (usize, bool) {
+    let mut available_sources = 0;
+    let count = ["net/tcp", "net/tcp6", "net/udp", "net/udp6"]
+        .into_iter()
+        .map(|relative_path| {
+            let path = proc_root.join(relative_path);
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    available_sources += 1;
+                    content
+                        .lines()
+                        .skip(1)
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                }
+                Err(error) => {
+                    warnings.push(format!("failed to read /proc/{relative_path}: {error}"));
+                    0
+                }
+            }
+        })
+        .sum();
+    (count, available_sources == 4)
+}
+
+fn source_result(
+    dimension: ResourceDimension,
+    collected_sources: usize,
+    expected_sources: usize,
+    rate_status: Option<RateStatus>,
+    failure_message: &str,
+) -> DimensionCollectionResult {
+    let source_status = if collected_sources == expected_sources {
+        CollectionStatus::Complete
+    } else if collected_sources == 0 {
+        CollectionStatus::Failed
+    } else {
+        CollectionStatus::Partial
+    };
+    let status = if source_status == CollectionStatus::Complete
+        && rate_status.is_some_and(|status| status != RateStatus::Ready)
+    {
+        CollectionStatus::Partial
+    } else {
+        source_status
+    };
+    let message = if source_status != CollectionStatus::Complete {
+        Some(failure_message.to_string())
+    } else {
+        match rate_status {
+            Some(RateStatus::WarmingUp) => Some("rate baseline is warming up".to_string()),
+            Some(RateStatus::CounterReset) => {
+                Some("counter reset detected; rate was not calculated".to_string())
+            }
+            _ => None,
+        }
+    };
+    DimensionCollectionResult {
+        dimension,
+        status,
+        rate_status,
+        retryable: source_status == CollectionStatus::Failed,
+        message,
+    }
+}
+
+fn collection_status(
+    dimensions: &[ResourceDimension],
+    results: &[DimensionCollectionResult],
+) -> CollectionStatus {
+    if dimensions.is_empty()
+        || results.len() != dimensions.len()
+        || results
+            .iter()
+            .all(|result| result.status == CollectionStatus::Failed)
+    {
+        return CollectionStatus::Failed;
+    }
+    if results
+        .iter()
+        .all(|result| result.status == CollectionStatus::Complete)
+    {
+        return CollectionStatus::Complete;
+    }
+    CollectionStatus::Partial
 }
 
 fn build_metric_alerts(
@@ -827,7 +1612,97 @@ fn path_exists(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn new(now_ms: u64) -> Self {
+            Self(AtomicU64::new(now_ms))
+        }
+
+        fn set(&self, now_ms: u64) {
+            self.0.store(now_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct StaticPartitionUsage(&'static str);
+
+    impl PartitionUsageProvider for StaticPartitionUsage {
+        fn read_df_output(&self) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    struct FailingPartitionUsage;
+
+    impl PartitionUsageProvider for FailingPartitionUsage {
+        fn read_df_output(&self) -> Result<String> {
+            Err(OsSenseError::Command("fixture failure".to_string()))
+        }
+    }
+
+    const DF_FIXTURE: &str =
+        "Filesystem 1B-blocks Used Available Use% Mounted on\n/dev/sda1 1000 400 600 40% /\n";
+
+    fn write_resource_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc kernel fixture");
+        fs::create_dir_all(proc_root.join("net")).expect("proc net fixture");
+        fs::create_dir_all(sys_root.join("class/thermal/thermal_zone0")).expect("thermal fixture");
+        fs::create_dir_all(sys_root.join("class/hwmon/hwmon0")).expect("hwmon fixture");
+        fs::write(
+            proc_root.join("stat"),
+            "cpu 100 0 0 900 0 0 0 0\ncpu0 60 0 0 440 0 0 0 0\ncpu1 40 0 0 460 0 0 0 0\n",
+        )
+        .expect("stat fixture");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 1000 kB\nMemAvailable: 400 kB\nBuffers: 50 kB\nCached: 120 kB\nSReclaimable: 20 kB\nShmem: 10 kB\nSwapTotal: 500 kB\nSwapFree: 300 kB\n",
+        )
+        .expect("meminfo fixture");
+        fs::write(proc_root.join("loadavg"), "0.1 0.2 0.3 1/10 42\n").expect("load fixture");
+        fs::write(
+            proc_root.join("diskstats"),
+            "8 0 sda 10 0 100 0 20 0 200 0 0 0 0 0 0 0 0\n",
+        )
+        .expect("diskstats fixture");
+        fs::write(
+            proc_root.join("net/dev"),
+            "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\neth0: 1000 10 1 2 0 0 0 0 2000 20 3 4 0 0 0 0\n",
+        )
+        .expect("net dev fixture");
+        let socket_header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        fs::write(
+            proc_root.join("net/tcp"),
+            format!("{socket_header} 0: 0100007F:0016 00000000:0000 0A 0 0 0 0 0 1\n"),
+        )
+        .expect("tcp fixture");
+        for name in ["tcp6", "udp", "udp6"] {
+            fs::write(proc_root.join("net").join(name), socket_header).expect("socket fixture");
+        }
+        fs::write(proc_root.join("cpuinfo"), "model name: LoongArch 3A6000\n")
+            .expect("cpuinfo fixture");
+        fs::write(proc_root.join("sys/kernel/osrelease"), "6.6.0-kylin\n").expect("kernel fixture");
+        let thermal = sys_root.join("class/thermal/thermal_zone0");
+        fs::write(thermal.join("type"), "cpu-thermal\n").expect("thermal type");
+        fs::write(thermal.join("temp"), "46000\n").expect("thermal temp");
+        let hwmon = sys_root.join("class/hwmon/hwmon0");
+        fs::write(hwmon.join("name"), "loongson_hwmon\n").expect("hwmon name");
+        fs::write(hwmon.join("temp1_input"), "47500\n").expect("hwmon temp");
+        fs::write(hwmon.join("temp1_label"), "CPU Package\n").expect("hwmon label");
+        fs::write(hwmon.join("fan1_input"), "1800\n").expect("hwmon fan");
+        (proc_root, sys_root)
+    }
 
     #[test]
     fn parses_cpu_stat() {
@@ -835,16 +1710,20 @@ mod tests {
         let parsed = parse_cpu_stat(stat).expect("cpu stat");
         assert_eq!(parsed.total_jiffies, 1000);
         assert_eq!(parsed.idle_jiffies, 850);
-        assert_eq!(parsed.usage_percent, Some(15.0));
+        assert_eq!(parsed.usage_percent, None);
         assert_eq!(parsed.cpu_count, 1);
+        assert_eq!(parsed.cores[0].name, "cpu0");
     }
 
     #[test]
     fn parses_meminfo() {
-        let meminfo = "MemTotal:       1000 kB\nMemAvailable:    250 kB\n";
+        let meminfo = "MemTotal: 1000 kB\nMemAvailable: 250 kB\nBuffers: 20 kB\nCached: 100 kB\nSReclaimable: 30 kB\nShmem: 10 kB\nSwapTotal: 500 kB\nSwapFree: 125 kB\n";
         let parsed = parse_meminfo(meminfo).expect("meminfo");
         assert_eq!(parsed.used_kb, 750);
         assert_eq!(parsed.used_percent, Some(75.0));
+        assert_eq!(parsed.buffers_kb, 20);
+        assert_eq!(parsed.cached_kb, 120);
+        assert_eq!(parsed.swap_used_kb, 375);
     }
 
     #[test]
@@ -863,6 +1742,21 @@ mod tests {
         assert_eq!(disks.len(), 1);
         assert_eq!(disks[0].mount_point, "/");
         assert_eq!(disks[0].used_percent, Some(91.0));
+    }
+
+    #[test]
+    fn parses_disk_and_network_counters_without_treating_them_as_rates() {
+        let disks = parse_diskstats("8 0 sda 10 0 100 0 20 0 200 0 1 0 0 0 0 0 0\n");
+        assert_eq!(disks[0].reads_completed_total, 10);
+        assert_eq!(disks[0].sectors_written_total, 200);
+        assert_eq!(disks[0].read_bytes_per_sec, None);
+
+        let interfaces = parse_net_dev(
+            "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\neth0: 1000 10 1 2 0 0 0 0 2000 20 3 4 0 0 0 0\n",
+        );
+        assert_eq!(interfaces[0].receive_errors_total, 1);
+        assert_eq!(interfaces[0].transmit_dropped_total, 4);
+        assert_eq!(interfaces[0].receive_bytes_per_sec, None);
     }
 
     #[test]
@@ -902,31 +1796,16 @@ mod tests {
     #[test]
     fn loongarch_platform_reads_hwmon_sensor_values() {
         let root = tempfile::tempdir().expect("tempdir");
-        let proc_root = root.path().join("proc");
-        let sys_root = root.path().join("sys");
-        let hwmon = sys_root.join("class/hwmon/hwmon0");
-        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc dirs");
-        fs::create_dir_all(&hwmon).expect("hwmon dirs");
-        fs::write(
-            proc_root.join("stat"),
-            "cpu  1 0 0 9 0 0 0 0\ncpu0 1 0 0 9 0 0 0 0\n",
-        )
-        .expect("stat");
-        fs::write(
-            proc_root.join("meminfo"),
-            "MemTotal: 1000 kB\nMemAvailable: 500 kB\n",
-        )
-        .expect("meminfo");
-        fs::write(proc_root.join("loadavg"), "0.1 0.2 0.3 1/2 3\n").expect("loadavg");
-        fs::write(proc_root.join("cpuinfo"), "model name: LoongArch 3A6000\n").expect("cpuinfo");
-        fs::write(proc_root.join("sys/kernel/osrelease"), "6.6.0-kylin\n").expect("kernel");
-        fs::write(hwmon.join("name"), "loongson_hwmon\n").expect("name");
-        fs::write(hwmon.join("temp1_input"), "47500\n").expect("temperature");
-        fs::write(hwmon.join("temp1_label"), "CPU Package\n").expect("label");
-        fs::write(hwmon.join("fan1_input"), "1800\n").expect("fan");
+        let (proc_root, sys_root) = write_resource_fixture(root.path());
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut collector = ProcfsCollector::with_dependencies(
+            proc_root,
+            sys_root,
+            clock,
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+        );
 
-        let snapshot = ProcfsCollector::new(proc_root, sys_root)
-            .collect_metrics(&MetricsThresholds::default());
+        let snapshot = collector.collect_metrics(&MetricsThresholds::default());
         let platform = snapshot.meta.platform;
         assert!(platform.loongarch.detected);
         assert_eq!(platform.loongarch.hwmon_sensors.len(), 2);
@@ -941,5 +1820,243 @@ mod tests {
             .hwmon_sensors
             .iter()
             .any(|sensor| sensor.sensor == "fan1_input" && sensor.value == 1_800));
+    }
+
+    #[test]
+    fn fixture_collection_uses_adjacent_samples_for_cpu_disk_and_network_rates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (proc_root, sys_root) = write_resource_fixture(root.path());
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut collector = ProcfsCollector::with_dependencies(
+            proc_root.clone(),
+            sys_root,
+            clock.clone(),
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+        );
+
+        let first = collector.collect_dimensions(
+            CollectionMode::Scheduled,
+            &ResourceDimension::ALL,
+            &MetricsThresholds::default(),
+        );
+        assert_eq!(first.mode, CollectionMode::Scheduled);
+        assert_eq!(first.status, CollectionStatus::Partial);
+        assert_eq!(first.started_at_ms, 1_000);
+        assert_eq!(first.completed_at_ms, 1_000);
+        assert_eq!(first.cpu.usage_percent, None);
+        assert_eq!(first.cpu.cores[0].usage_percent, None);
+        assert_eq!(first.disk_devices[0].read_iops, None);
+        assert_eq!(first.network.interfaces[0].receive_bytes_per_sec, None);
+        for dimension in [
+            ResourceDimension::Cpu,
+            ResourceDimension::Disk,
+            ResourceDimension::Network,
+        ] {
+            assert!(first.dimension_results.iter().any(|result| {
+                result.dimension == dimension
+                    && result.status == CollectionStatus::Partial
+                    && result.rate_status == Some(RateStatus::WarmingUp)
+            }));
+        }
+
+        fs::write(
+            proc_root.join("stat"),
+            "cpu 150 0 0 950 0 0 0 0\ncpu0 90 0 0 460 0 0 0 0\ncpu1 60 0 0 490 0 0 0 0\n",
+        )
+        .expect("updated stat");
+        fs::write(
+            proc_root.join("net/dev"),
+            "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\neth0: 6000 35 1 2 0 0 0 0 7000 50 3 4 0 0 0 0\n",
+        )
+        .expect("updated net dev");
+        clock.set(6_000);
+        let five_second = collector.collect_dimensions(
+            CollectionMode::Scheduled,
+            &[ResourceDimension::Cpu, ResourceDimension::Network],
+            &MetricsThresholds::default(),
+        );
+        assert_eq!(five_second.status, CollectionStatus::Complete);
+        assert_eq!(
+            five_second.attempted_dimensions,
+            vec![ResourceDimension::Cpu, ResourceDimension::Network]
+        );
+        assert_eq!(
+            five_second.updated_dimensions,
+            five_second.attempted_dimensions
+        );
+        assert_eq!(five_second.cpu.sample_interval_ms, Some(5_000));
+        assert_eq!(five_second.cpu.usage_percent, Some(50.0));
+        assert_eq!(five_second.cpu.cores[0].usage_percent, Some(60.0));
+        assert_eq!(
+            five_second.network.interfaces[0].receive_bytes_per_sec,
+            Some(1_000.0)
+        );
+        assert_eq!(
+            five_second.network.interfaces[0].transmit_packets_per_sec,
+            Some(6.0)
+        );
+
+        fs::write(
+            proc_root.join("diskstats"),
+            "8 0 sda 30 0 300 0 50 0 500 0 0 0 0 0 0 0 0\n",
+        )
+        .expect("updated diskstats");
+        clock.set(11_000);
+        let ten_second = collector.collect_dimensions(
+            CollectionMode::Scheduled,
+            &[ResourceDimension::Disk],
+            &MetricsThresholds::default(),
+        );
+        assert_eq!(ten_second.disk_devices[0].sample_interval_ms, Some(10_000));
+        assert_eq!(ten_second.disk_devices[0].read_iops, Some(2.0));
+        assert_eq!(ten_second.disk_devices[0].write_iops, Some(3.0));
+        assert_eq!(
+            ten_second.disk_devices[0].read_bytes_per_sec,
+            Some(10_240.0)
+        );
+        assert_eq!(
+            ten_second.disk_devices[0].write_bytes_per_sec,
+            Some(15_360.0)
+        );
+    }
+
+    #[test]
+    fn counter_decrease_is_treated_as_a_reset_without_a_bogus_rate() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (proc_root, sys_root) = write_resource_fixture(root.path());
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut collector = ProcfsCollector::with_dependencies(
+            proc_root.clone(),
+            sys_root,
+            clock.clone(),
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+        );
+        collector.collect_metrics(&MetricsThresholds::default());
+
+        fs::write(
+            proc_root.join("stat"),
+            "cpu 10 0 0 90 0 0 0 0\ncpu0 5 0 0 45 0 0 0 0\n",
+        )
+        .expect("reset stat");
+        fs::write(
+            proc_root.join("diskstats"),
+            "8 0 sda 1 0 10 0 2 0 20 0 0 0 0 0 0 0 0\n",
+        )
+        .expect("reset diskstats");
+        fs::write(
+            proc_root.join("net/dev"),
+            "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\neth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n",
+        )
+        .expect("reset net dev");
+        clock.set(6_000);
+        let reset = collector.collect_metrics(&MetricsThresholds::default());
+
+        assert_eq!(reset.status, CollectionStatus::Partial);
+        assert_eq!(reset.cpu.usage_percent, None);
+        assert_eq!(reset.disk_devices[0].read_bytes_per_sec, None);
+        assert_eq!(reset.network.interfaces[0].receive_bytes_per_sec, None);
+        for dimension in [
+            ResourceDimension::Cpu,
+            ResourceDimension::Disk,
+            ResourceDimension::Network,
+        ] {
+            assert!(reset.dimension_results.iter().any(|result| {
+                result.dimension == dimension
+                    && result.status == CollectionStatus::Partial
+                    && result.rate_status == Some(RateStatus::CounterReset)
+            }));
+        }
+    }
+
+    #[test]
+    fn missing_sources_are_reported_as_structured_partial_results() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (proc_root, sys_root) = write_resource_fixture(root.path());
+        fs::remove_file(proc_root.join("meminfo")).expect("remove meminfo fixture");
+        fs::remove_dir_all(sys_root.join("class/thermal")).expect("remove thermal fixture");
+        fs::remove_dir_all(sys_root.join("class/hwmon")).expect("remove hwmon fixture");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut collector = ProcfsCollector::with_dependencies(
+            proc_root,
+            sys_root,
+            clock,
+            Arc::new(FailingPartitionUsage),
+        );
+
+        let snapshot = collector.collect_metrics(&MetricsThresholds::default());
+
+        assert_eq!(snapshot.status, CollectionStatus::Partial);
+        assert_eq!(snapshot.attempted_dimensions, ResourceDimension::ALL);
+        assert!(!snapshot
+            .updated_dimensions
+            .contains(&ResourceDimension::Memory));
+        assert!(!snapshot
+            .updated_dimensions
+            .contains(&ResourceDimension::Thermal));
+        assert_eq!(
+            snapshot.thermal.availability,
+            SensorAvailability::Unavailable
+        );
+        assert!(!snapshot.thermal.thermal_zone_available);
+        assert!(!snapshot.thermal.hwmon_available);
+        assert!(snapshot.dimension_results.iter().any(|result| {
+            result.dimension == ResourceDimension::Memory
+                && result.status == CollectionStatus::Failed
+                && result.message.is_some()
+        }));
+        assert!(snapshot.dimension_results.iter().any(|result| {
+            result.dimension == ResourceDimension::Disk
+                && result.status == CollectionStatus::Partial
+        }));
+        assert!(snapshot.dimension_results.iter().any(|result| {
+            result.dimension == ResourceDimension::Thermal
+                && result.status == CollectionStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn empty_or_invalid_thermal_sources_are_unavailable_and_not_updated() {
+        for invalid_values in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let proc_root = root.path().join("proc");
+            let sys_root = root.path().join("sys");
+            fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+            fs::create_dir_all(sys_root.join("class/thermal/thermal_zone0"))
+                .expect("thermal fixture");
+            fs::create_dir_all(sys_root.join("class/hwmon/hwmon0")).expect("hwmon fixture");
+            if invalid_values {
+                fs::write(
+                    sys_root.join("class/thermal/thermal_zone0/temp"),
+                    "invalid\n",
+                )
+                .expect("invalid thermal");
+                fs::write(sys_root.join("class/hwmon/hwmon0/temp1_input"), "invalid\n")
+                    .expect("invalid hwmon");
+            }
+            let clock = Arc::new(ManualClock::new(1_000));
+            let mut collector = ProcfsCollector::with_dependencies(
+                proc_root,
+                sys_root,
+                clock,
+                Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+            );
+
+            let snapshot = collector.collect_dimensions(
+                CollectionMode::OnDemand,
+                &[ResourceDimension::Thermal],
+                &MetricsThresholds::default(),
+            );
+
+            assert_eq!(snapshot.status, CollectionStatus::Failed);
+            assert_eq!(
+                snapshot.thermal.availability,
+                SensorAvailability::Unavailable
+            );
+            assert_eq!(
+                snapshot.attempted_dimensions,
+                vec![ResourceDimension::Thermal]
+            );
+            assert!(snapshot.updated_dimensions.is_empty());
+        }
     }
 }

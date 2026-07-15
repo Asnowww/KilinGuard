@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
 pub enum OsSenseError {
+    Configuration(String),
     Io(String),
     Parse(String),
     Storage(String),
@@ -13,6 +14,7 @@ pub type Result<T> = std::result::Result<T, OsSenseError>;
 impl Display for OsSenseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Configuration(message) => write!(f, "configuration error: {message}"),
             Self::Io(message) => write!(f, "I/O error: {message}"),
             Self::Parse(message) => write!(f, "parse error: {message}"),
             Self::Storage(message) => write!(f, "storage error: {message}"),
