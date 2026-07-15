@@ -1389,14 +1389,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_process_list",
-            description: "List OS processes with PID, name, state, sampled CPU and memory usage, cumulative CPU time, RSS, uptime, user, filters, and structured zombie, sustained RSS-growth, sustained high-CPU, or unauthorized-process anomaly markers.",
+            description: "List OS processes with composable PID, parent PID, UID, user, name or command, Linux state, anomaly kind, and authorization filters, plus sampled CPU and memory usage and structured anomaly markers.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pid": { "type": "integer", "minimum": 0 },
-                    "name_contains": { "type": "string", "maxLength": 128 },
-                    "user": { "type": "string", "maxLength": 64 },
-                    "allowed_names": { "type": "array", "maxItems": 200, "items": { "type": "string", "maxLength": 128 } },
+                    "ppid": { "type": "integer", "minimum": 0 },
+                    "uid": { "type": "integer", "minimum": 0 },
+                    "name_contains": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "user": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "state": { "type": "string", "enum": ["R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I"] },
+                    "anomaly_kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "authorized": { "type": "boolean" },
+                    "allowed_names": { "type": "array", "maxItems": 200, "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
                 },
                 "additionalProperties": false
@@ -2401,7 +2406,10 @@ fn run_os_process_list_with_runtime(
     runtime: &mut OsSenseRuntime,
     input: &OsProcessQuery,
 ) -> Result<String, String> {
-    to_pretty_json(runtime.collect_processes(input))
+    let processes = runtime
+        .collect_processes(input)
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(processes)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -11100,9 +11108,24 @@ printf 'pwsh:%s' "$1"
             .iter()
             .find(|spec| spec.name == "os_process_list")
             .expect("process tool spec");
-        assert!(process_spec.description.contains("zombie"));
-        assert!(process_spec.description.contains("sustained RSS-growth"));
-        assert!(process_spec.description.contains("sustained high-CPU"));
+        assert!(process_spec.description.contains("parent PID"));
+        assert!(process_spec.description.contains("Linux state"));
+        for field in [
+            "pid",
+            "ppid",
+            "uid",
+            "name_contains",
+            "user",
+            "state",
+            "anomaly_kind",
+            "authorized",
+        ] {
+            assert!(process_spec.input_schema["properties"][field].is_object());
+        }
+        assert_eq!(
+            process_spec.input_schema["properties"]["state"]["enum"],
+            json!(["R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I"])
+        );
     }
 
     #[test]
@@ -11211,6 +11234,8 @@ printf 'pwsh:%s' "$1"
         assert_eq!(first["anomaly_count"], 0);
         assert_eq!(first["anomalies_truncated"], false);
         assert_eq!(first["omitted_anomaly_count"], 0);
+        assert_eq!(first["indeterminate_filter_count"], 0);
+        assert_eq!(first["filter_complete"], true);
 
         clock.0.store(3_000, Ordering::SeqCst);
         fs::write(
@@ -11227,6 +11252,36 @@ printf 'pwsh:%s' "$1"
         assert_eq!(second["processes"][0]["cpu_rate_status"], "ready");
         assert_eq!(second["processes"][0]["cpu_sample_interval_ms"], 2_000);
         assert_eq!(second["processes"][0]["cpu_usage_percent"], 25.0);
+
+        let filtered = super::run_os_process_list_with_runtime(
+            &mut runtime,
+            &os_sense::ProcessQuery {
+                pid: Some(77),
+                ppid: Some(1),
+                uid: Some(0),
+                name_contains: Some("WORK".to_string()),
+                user: Some("root".to_string()),
+                state: Some("S".to_string()),
+                authorized: Some(true),
+                allowed_names: vec!["worker".to_string()],
+                limit: Some(1),
+                ..os_sense::ProcessQuery::default()
+            },
+        )
+        .expect("filtered process list");
+        let filtered: Value = serde_json::from_str(&filtered).expect("filtered JSON");
+        assert_eq!(filtered["total"], 1);
+        assert_eq!(filtered["processes"][0]["pid"], 77);
+
+        let invalid = super::run_os_process_list_with_runtime(
+            &mut runtime,
+            &os_sense::ProcessQuery {
+                limit: Some(0),
+                ..os_sense::ProcessQuery::default()
+            },
+        )
+        .expect_err("invalid query");
+        assert!(invalid.contains("limit must be between 1 and 500"));
 
         drop(runtime);
         fs::remove_dir_all(root).expect("remove fixture");

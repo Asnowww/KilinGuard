@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
 use crate::logs::{query_logs, LogQuery};
 use crate::model::{Alert, AlertContext, OsContext};
 use crate::network::{collect_network, NetworkQuery};
@@ -20,7 +21,7 @@ pub struct ContextRequest {
 }
 
 #[must_use]
-pub fn collect_context(request: &ContextRequest) -> OsContext {
+pub fn collect_context(request: &ContextRequest) -> Result<OsContext> {
     let mut collector = ProcfsCollector::default();
     collect_context_with(request, &mut collector, &MetricsThresholds::default())
 }
@@ -29,7 +30,7 @@ pub(crate) fn collect_context_with(
     request: &ContextRequest,
     procfs: &mut ProcfsCollector,
     thresholds: &MetricsThresholds,
-) -> OsContext {
+) -> Result<OsContext> {
     let wanted = dimensions_for_intent(request.intent.as_deref());
     let include_metrics = request
         .include_metrics
@@ -48,13 +49,15 @@ pub(crate) fn collect_context_with(
         .unwrap_or_else(|| wanted.contains(&"services"));
 
     let metrics = include_metrics.then(|| procfs.collect_metrics(thresholds));
-    let processes = include_processes.then(|| {
-        procfs.collect_processes(&ProcessQuery {
+    let processes = if include_processes {
+        Some(procfs.collect_processes(&ProcessQuery {
             allowed_names: request.process_allowed_names.clone(),
             limit: Some(100),
             ..ProcessQuery::default()
-        })
-    });
+        })?)
+    } else {
+        None
+    };
     let logs = include_logs.then(|| {
         query_logs(&LogQuery {
             limit: request.log_limit.or(Some(50)),
@@ -146,7 +149,7 @@ pub(crate) fn collect_context_with(
     let collected_at_ms = crate::procfs::now_ms();
     let alert_context = build_alert_context(&alerts, collected_at_ms);
 
-    OsContext {
+    Ok(OsContext {
         meta: basic_meta("context", warnings),
         dimensions,
         metrics,
@@ -158,7 +161,7 @@ pub(crate) fn collect_context_with(
         alert_context,
         summary,
         cropped_dimensions,
-    }
+    })
 }
 
 #[must_use]

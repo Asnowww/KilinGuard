@@ -352,14 +352,14 @@ impl OsSenseRuntime {
     }
 
     pub fn collect_context_on_demand(&mut self, request: &ContextRequest) -> Result<OsContext> {
-        let context = collect_context_with(request, &mut self.collector, &self.config.thresholds);
+        let context = collect_context_with(request, &mut self.collector, &self.config.thresholds)?;
         if let Some(metrics) = &context.metrics {
             self.persist_metrics(metrics)?;
         }
         Ok(context)
     }
 
-    pub fn collect_processes(&mut self, query: &ProcessQuery) -> ProcessList {
+    pub fn collect_processes(&mut self, query: &ProcessQuery) -> Result<ProcessList> {
         self.collector.collect_processes(query)
     }
 

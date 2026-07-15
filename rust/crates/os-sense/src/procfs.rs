@@ -57,6 +57,10 @@ pub trait PartitionUsageProvider: Send + Sync {
 }
 
 pub trait ProcessUserResolver: Send + Sync {
+    fn resolve_local(&self, _uid: u32) -> Option<String> {
+        None
+    }
+
     fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String>;
 }
 
@@ -74,10 +78,11 @@ impl Default for KylinProcessUserResolver {
 }
 
 impl ProcessUserResolver for KylinProcessUserResolver {
+    fn resolve_local(&self, uid: u32) -> Option<String> {
+        self.passwd_users.get(&uid).cloned()
+    }
+
     fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String> {
-        if let Some(user) = self.passwd_users.get(&uid) {
-            return Ok(Some(user.clone()));
-        }
         resolve_user_with_getent(uid)
     }
 }
@@ -142,7 +147,15 @@ struct CachedUserResolution {
 struct ProcessReadOutcome {
     process: ProcessInfo,
     sampled_at_ms: u64,
+    status_available: bool,
+    cmdline_available: bool,
     warnings: Vec<String>,
+}
+
+enum ProcessFilterDecision {
+    Matches,
+    DoesNotMatch,
+    Indeterminate(&'static str),
 }
 
 struct ProcessCandidate {
@@ -336,10 +349,76 @@ impl MetricsThresholds {
 #[serde(default, deny_unknown_fields)]
 pub struct ProcessQuery {
     pub pid: Option<u32>,
+    pub ppid: Option<u32>,
+    pub uid: Option<u32>,
     pub name_contains: Option<String>,
     pub user: Option<String>,
+    pub state: Option<String>,
+    pub anomaly_kind: Option<String>,
+    pub authorized: Option<bool>,
     pub allowed_names: Vec<String>,
     pub limit: Option<usize>,
+}
+
+impl ProcessQuery {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value, max_chars) in [
+            ("name_contains", self.name_contains.as_deref(), 128),
+            ("user", self.user.as_deref(), 64),
+            ("anomaly_kind", self.anomaly_kind.as_deref(), 64),
+        ] {
+            if let Some(value) = value {
+                if value.trim().is_empty() {
+                    return Err(OsSenseError::Configuration(format!(
+                        "process query {name} must not be blank"
+                    )));
+                }
+                if value.chars().count() > max_chars {
+                    return Err(OsSenseError::Configuration(format!(
+                        "process query {name} must not exceed {max_chars} characters"
+                    )));
+                }
+            }
+        }
+        if self.allowed_names.len() > 200 {
+            return Err(OsSenseError::Configuration(
+                "process query allowed_names must not contain more than 200 entries".to_string(),
+            ));
+        }
+        for (index, name) in self.allowed_names.iter().enumerate() {
+            if name.trim().is_empty() {
+                return Err(OsSenseError::Configuration(format!(
+                    "process query allowed_names[{index}] must not be blank"
+                )));
+            }
+            if name.chars().count() > 128 {
+                return Err(OsSenseError::Configuration(format!(
+                    "process query allowed_names[{index}] must not exceed 128 characters"
+                )));
+            }
+        }
+        if self.authorized.is_some() && self.allowed_names.is_empty() {
+            return Err(OsSenseError::Configuration(
+                "process query authorized requires a non-empty allowed_names baseline".to_string(),
+            ));
+        }
+        if let Some(state) = &self.state {
+            if normalized_linux_process_state(state).is_none() {
+                return Err(OsSenseError::Configuration(
+                    "process query state must be one Linux process state character: R, S, D, Z, T, t, W, X, x, K, P, or I"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(limit) = self.limit {
+            if !(1..=MAX_PROCESS_LIMIT).contains(&limit) {
+                return Err(OsSenseError::Configuration(format!(
+                    "process query limit must be between 1 and {MAX_PROCESS_LIMIT}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -820,7 +899,18 @@ impl ProcfsCollector {
         }
     }
 
-    pub fn collect_processes(&mut self, query: &ProcessQuery) -> ProcessList {
+    pub fn collect_processes(&mut self, query: &ProcessQuery) -> Result<ProcessList> {
+        query.validate()?;
+        Ok(self.collect_processes_unchecked(query))
+    }
+
+    #[cfg(test)]
+    fn collect_processes_for_test(&mut self, query: &ProcessQuery) -> ProcessList {
+        self.collect_processes(query)
+            .expect("valid process collection test query")
+    }
+
+    fn collect_processes_unchecked(&mut self, query: &ProcessQuery) -> ProcessList {
         let scan_started_at_ms = self.clock.now_ms();
         let scan_started_at_monotonic_ms = self.process_clock.now_ms();
         self.process_scan_id = self.process_scan_id.wrapping_add(1);
@@ -908,7 +998,6 @@ impl ProcfsCollector {
         let allowed = query
             .allowed_names
             .iter()
-            .take(200)
             .map(|name| name.to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
 
@@ -917,10 +1006,12 @@ impl ProcfsCollector {
         let mut total = 0usize;
         let mut anomaly_count = 0usize;
         let mut partial_process_count = 0usize;
+        let mut indeterminate_filter_count = 0usize;
         let mut remaining_nss_lookups = MAX_NSS_LOOKUPS_PER_COLLECTION;
         let mut failed_process_count = 0;
         let mut exited_during_scan_count = 0;
         let mut scan_failed = false;
+        let mut filter_incomplete = false;
         match fs::read_dir(&self.proc_root) {
             Ok(entries) => {
                 for entry in entries {
@@ -928,6 +1019,7 @@ impl ProcfsCollector {
                         Ok(entry) => entry,
                         Err(error) => {
                             source_partial = true;
+                            filter_incomplete = true;
                             push_process_warning(
                                 &mut warnings,
                                 &mut omitted_warning_count,
@@ -948,6 +1040,8 @@ impl ProcfsCollector {
                             let ProcessReadOutcome {
                                 mut process,
                                 sampled_at_ms,
+                                status_available,
+                                cmdline_available,
                                 warnings: read_warnings,
                             } = outcome;
                             apply_process_cpu_rate(
@@ -984,29 +1078,43 @@ impl ProcfsCollector {
                                 .memory_rss_kb
                                 .zip(total_memory_kb)
                                 .map(|(rss, total)| round2((rss as f64 / total as f64) * 100.0));
-                            if !process_matches_without_user(&process, query) {
-                                continue;
+                            match process_matches_without_user(
+                                &process,
+                                query,
+                                status_available,
+                                cmdline_available,
+                            ) {
+                                ProcessFilterDecision::Matches => {}
+                                ProcessFilterDecision::DoesNotMatch => continue,
+                                ProcessFilterDecision::Indeterminate(reason) => {
+                                    filter_incomplete = true;
+                                    indeterminate_filter_count =
+                                        indeterminate_filter_count.saturating_add(1);
+                                    push_process_warning(
+                                        &mut warnings,
+                                        &mut omitted_warning_count,
+                                        format!(
+                                            "process filter for process {} is indeterminate because {reason}; candidate omitted",
+                                            process.pid
+                                        ),
+                                    );
+                                    continue;
+                                }
                             }
 
                             let mut candidate_warnings = read_warnings;
                             if let Some(expected_user) = &query.user {
-                                let Some(uid) = process.uid else {
-                                    candidate_warnings.push(format!(
-                                        "user filter for process {} is indeterminate because UID is unavailable; candidate included",
-                                        process.pid
-                                    ));
-                                    record_process_candidate(
-                                        &mut candidates,
-                                        &mut bounded_anomalies,
-                                        &mut total,
-                                        &mut anomaly_count,
-                                        &mut partial_process_count,
+                                let Some(uid) = process.uid.filter(|_| status_available) else {
+                                    filter_incomplete = true;
+                                    indeterminate_filter_count =
+                                        indeterminate_filter_count.saturating_add(1);
+                                    push_process_warning(
                                         &mut warnings,
                                         &mut omitted_warning_count,
-                                        process,
-                                        candidate_warnings,
-                                        MAX_PROCESS_LIMIT,
-                                        MAX_PROCESS_LIST_ANOMALIES,
+                                        format!(
+                                            "user filter for process {} is indeterminate because UID is unavailable; candidate omitted",
+                                            process.pid
+                                        ),
                                     );
                                     continue;
                                 };
@@ -1014,18 +1122,28 @@ impl ProcfsCollector {
                                     self.resolve_process_user(uid, &mut remaining_nss_lookups);
                                 let matches = resolution.user == *expected_user;
                                 process.user = Some(resolution.user);
-                                if resolution.definitive && !matches {
+                                if !resolution.definitive {
+                                    filter_incomplete = true;
+                                    indeterminate_filter_count =
+                                        indeterminate_filter_count.saturating_add(1);
+                                    push_process_warning(
+                                        &mut warnings,
+                                        &mut omitted_warning_count,
+                                        format!(
+                                            "user filter for process {} is indeterminate; candidate omitted: {}",
+                                            process.pid,
+                                            resolution.warning.as_deref().unwrap_or(
+                                                "user resolution did not produce a definitive result"
+                                            )
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                if !matches {
                                     continue;
                                 }
                                 if let Some(warning) = resolution.warning {
-                                    if resolution.definitive {
-                                        candidate_warnings.push(warning);
-                                    } else {
-                                        candidate_warnings.push(format!(
-                                            "user filter for process {} is indeterminate; candidate included: {warning}",
-                                            process.pid
-                                        ));
-                                    }
+                                    candidate_warnings.push(warning);
                                 }
                             }
                             record_process_candidate(
@@ -1043,6 +1161,7 @@ impl ProcfsCollector {
                             );
                         }
                         Err(ProcessReadFailure::Exited) => {
+                            filter_incomplete = true;
                             remove_process_cpu_baseline(
                                 &mut self.process_cpu_baselines,
                                 &mut self.process_cpu_baseline_order,
@@ -1056,6 +1175,7 @@ impl ProcfsCollector {
                             exited_during_scan_count += 1;
                         }
                         Err(ProcessReadFailure::Failed(error)) => {
+                            filter_incomplete = true;
                             remove_process_cpu_baseline(
                                 &mut self.process_cpu_baselines,
                                 &mut self.process_cpu_baseline_order,
@@ -1078,6 +1198,7 @@ impl ProcfsCollector {
             }
             Err(error) => {
                 scan_failed = true;
+                filter_incomplete = true;
                 push_process_warning(
                     &mut warnings,
                     &mut omitted_warning_count,
@@ -1139,6 +1260,7 @@ impl ProcfsCollector {
         } else if source_partial
             || failed_process_count > 0
             || partial_process_count > 0
+            || indeterminate_filter_count > 0
             || exited_during_scan_count > 0
         {
             CollectionStatus::Partial
@@ -1165,6 +1287,12 @@ impl ProcfsCollector {
             anomaly_count,
             anomalies_truncated,
             omitted_anomaly_count,
+            indeterminate_filter_count,
+            filter_complete: !filter_incomplete
+                && !scan_failed
+                && failed_process_count == 0
+                && exited_during_scan_count == 0
+                && indeterminate_filter_count == 0,
             unauthorized,
         }
     }
@@ -1190,19 +1318,23 @@ impl ProcfsCollector {
         let mut info = parse_process_stat(pid, &stat, uptime, self.process_system_parameters)
             .map_err(ProcessReadFailure::Failed)?;
         let mut read_warnings = Vec::new();
-        match self
+        let status_available = match self
             .process_file_reader
             .read_to_string(&proc_dir.join("status"))
         {
-            Ok(status) => apply_process_status(&mut info, &status),
+            Ok(status) => {
+                apply_process_status(&mut info, &status);
+                true
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ProcessReadFailure::Exited)
             }
             Err(error) => {
-                read_warnings.push(format!("failed to read process {pid} status: {error}"))
+                read_warnings.push(format!("failed to read process {pid} status: {error}"));
+                false
             }
-        }
-        match self.process_file_reader.read(&proc_dir.join("cmdline")) {
+        };
+        let cmdline_available = match self.process_file_reader.read(&proc_dir.join("cmdline")) {
             Ok(bytes) => {
                 let command = bytes
                     .split(|byte| *byte == 0)
@@ -1212,14 +1344,18 @@ impl ProcfsCollector {
                     .join(" ");
                 info.command = (!command.is_empty())
                     .then(|| redact_sensitive_text(&command, MAX_CMDLINE_CHARS));
+                true
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ProcessReadFailure::Exited)
             }
-            Err(error) => read_warnings.push(format!(
-                "failed to read process {pid} command line: {error}"
-            )),
-        }
+            Err(error) => {
+                read_warnings.push(format!(
+                    "failed to read process {pid} command line: {error}"
+                ));
+                false
+            }
+        };
         if !allowed.is_empty() {
             info.authorized = Some(allowed.contains(&info.name.to_ascii_lowercase()));
             if info.authorized == Some(false) {
@@ -1238,6 +1374,8 @@ impl ProcfsCollector {
         Ok(ProcessReadOutcome {
             process: info,
             sampled_at_ms,
+            status_available,
+            cmdline_available,
             warnings: read_warnings,
         })
     }
@@ -1259,6 +1397,25 @@ impl ProcfsCollector {
             }
         }
         self.process_user_cache.remove(&uid);
+        if let Some(user) = self
+            .process_user_resolver
+            .resolve_local(uid)
+            .filter(|user| !user.is_empty())
+        {
+            let resolution = CachedUserResolution {
+                user,
+                warning: None,
+                cached_at_ms: self.process_clock.now_ms(),
+                positive: true,
+                definitive: true,
+            };
+            self.process_user_cache.insert(uid, resolution.clone());
+            enforce_process_user_cache_limit(
+                &mut self.process_user_cache,
+                MAX_PROCESS_USER_CACHE_ENTRIES,
+            );
+            return resolution;
+        }
         if *remaining_nss_lookups == 0 {
             return CachedUserResolution {
                 user: uid.to_string(),
@@ -1586,7 +1743,7 @@ pub fn collect_metrics(thresholds: &MetricsThresholds) -> MetricSnapshot {
 }
 
 #[must_use]
-pub fn collect_processes(query: &ProcessQuery) -> ProcessList {
+pub fn collect_processes(query: &ProcessQuery) -> Result<ProcessList> {
     let mut collector = ProcfsCollector::default();
     collector.collect_processes(query)
 }
@@ -2625,22 +2782,79 @@ fn push_process_warning(
     }
 }
 
-fn process_matches_without_user(process: &ProcessInfo, query: &ProcessQuery) -> bool {
+fn process_matches_without_user(
+    process: &ProcessInfo,
+    query: &ProcessQuery,
+    status_available: bool,
+    cmdline_available: bool,
+) -> ProcessFilterDecision {
     if query.pid.is_some_and(|pid| process.pid != pid) {
-        return false;
+        return ProcessFilterDecision::DoesNotMatch;
+    }
+    if query.ppid.is_some_and(|ppid| process.ppid != Some(ppid)) {
+        return ProcessFilterDecision::DoesNotMatch;
+    }
+    if let Some(state) = &query.state {
+        let Some(state) = normalized_linux_process_state(state) else {
+            return ProcessFilterDecision::DoesNotMatch;
+        };
+        if process.state != state.to_string() {
+            return ProcessFilterDecision::DoesNotMatch;
+        }
+    }
+    if let Some(anomaly_kind) = &query.anomaly_kind {
+        if anomaly_kind.trim().is_empty()
+            || !process
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.kind == *anomaly_kind)
+        {
+            return ProcessFilterDecision::DoesNotMatch;
+        }
+    }
+    if query
+        .authorized
+        .is_some_and(|authorized| process.authorized != Some(authorized))
+    {
+        return ProcessFilterDecision::DoesNotMatch;
+    }
+
+    let mut indeterminate_reason = None;
+    if let Some(uid) = query.uid {
+        if !status_available || process.uid.is_none() {
+            indeterminate_reason = Some("process status or UID is unavailable");
+        } else if process.uid != Some(uid) {
+            return ProcessFilterDecision::DoesNotMatch;
+        }
     }
     if let Some(name) = &query.name_contains {
         let needle = name.to_ascii_lowercase();
-        if !process.name.to_ascii_lowercase().contains(&needle)
-            && !process
-                .command
-                .as_ref()
-                .is_some_and(|command| command.to_ascii_lowercase().contains(&needle))
-        {
-            return false;
+        let name_matches = process.name.to_ascii_lowercase().contains(&needle);
+        let command_matches = process
+            .command
+            .as_ref()
+            .is_some_and(|command| command.to_ascii_lowercase().contains(&needle));
+        if !name_matches && !command_matches {
+            if !cmdline_available {
+                indeterminate_reason = Some("process command line is unavailable");
+            } else {
+                return ProcessFilterDecision::DoesNotMatch;
+            }
         }
     }
-    true
+    indeterminate_reason.map_or(
+        ProcessFilterDecision::Matches,
+        ProcessFilterDecision::Indeterminate,
+    )
+}
+
+fn normalized_linux_process_state(value: &str) -> Option<char> {
+    let mut chars = value.trim().chars();
+    let state = chars.next()?;
+    if chars.next().is_some() || !"RSDZTtWXxKPI".contains(state) {
+        return None;
+    }
+    Some(state)
 }
 
 fn load_passwd_users() -> BTreeMap<u32, String> {
@@ -2888,6 +3102,22 @@ mod tests {
         }
     }
 
+    struct LocalFixtureUserResolver {
+        local: BTreeMap<u32, String>,
+        calls: Mutex<Vec<u32>>,
+    }
+
+    impl ProcessUserResolver for LocalFixtureUserResolver {
+        fn resolve_local(&self, uid: u32) -> Option<String> {
+            self.local.get(&uid).cloned()
+        }
+
+        fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String> {
+            self.calls.lock().expect("resolver calls").push(uid);
+            Ok(None)
+        }
+    }
+
     struct ClockAdvancingUserResolver {
         clock: Arc<AdvancingClock>,
         delay_ms: u64,
@@ -2928,6 +3158,24 @@ mod tests {
         }
     }
 
+    struct CmdlineFailureReader;
+
+    impl ProcessFileReader for CmdlineFailureReader {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            fs::read_to_string(path)
+        }
+
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            if path.file_name().and_then(|name| name.to_str()) == Some("cmdline") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture command line failure",
+                ));
+            }
+            fs::read(path)
+        }
+    }
+
     fn process_stat(
         pid: u32,
         name: &str,
@@ -2948,8 +3196,22 @@ mod tests {
         start_time: u64,
         rss_pages: i64,
     ) -> String {
+        process_stat_with_ppid(pid, name, state, 1, utime, stime, start_time, rss_pages)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_stat_with_ppid(
+        pid: u32,
+        name: &str,
+        state: &str,
+        ppid: u32,
+        utime: u64,
+        stime: u64,
+        start_time: u64,
+        rss_pages: i64,
+    ) -> String {
         format!(
-            "{pid} ({name}) {state} 1 2 3 4 5 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_time} 409600 {rss_pages} 0 0\n"
+            "{pid} ({name}) {state} {ppid} 2 3 4 5 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_time} 409600 {rss_pages} 0 0\n"
         )
     }
 
@@ -3155,7 +3417,7 @@ mod tests {
             Some(1_000),
         );
 
-        let first = collector.collect_processes(&ProcessQuery::default());
+        let first = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(first.collection_status, CollectionStatus::Complete);
         let first = &first.processes[0];
         assert_eq!(first.start_time_jiffies, 1_000);
@@ -3176,7 +3438,7 @@ mod tests {
             42,
             None,
         );
-        let second = collector.collect_processes(&ProcessQuery::default());
+        let second = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(second.collection_status, CollectionStatus::Complete);
         let second = &second.processes[0];
         assert_eq!(second.cpu_usage_percent, Some(25.0));
@@ -3215,7 +3477,7 @@ mod tests {
             None,
         );
 
-        let first = collector.collect_processes(&ProcessQuery::default());
+        let first = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(first.meta.collected_at_ms, 1_000);
         wall_clock.set(9_000_000_000);
         monotonic_clock.set(12_000);
@@ -3226,7 +3488,7 @@ mod tests {
             42,
             None,
         );
-        let forward = collector.collect_processes(&ProcessQuery::default());
+        let forward = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(forward.meta.collected_at_ms, 9_000_000_000);
         assert_eq!(forward.processes[0].cpu_sample_interval_ms, Some(2_000));
         assert_eq!(forward.processes[0].cpu_usage_percent, Some(50.0));
@@ -3240,14 +3502,14 @@ mod tests {
             42,
             None,
         );
-        let backward = collector.collect_processes(&ProcessQuery::default());
+        let backward = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(backward.meta.collected_at_ms, 10);
         assert_eq!(backward.processes[0].cpu_sample_interval_ms, Some(2_000));
         assert_eq!(backward.processes[0].cpu_usage_percent, Some(50.0));
         assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 1);
 
         monotonic_clock.set(614_000);
-        let expired_baseline = collector.collect_processes(&ProcessQuery::default());
+        let expired_baseline = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(
             expired_baseline.processes[0].cpu_rate_status,
             Some(RateStatus::WarmingUp)
@@ -3255,7 +3517,7 @@ mod tests {
         assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 1);
 
         monotonic_clock.set(3_610_000);
-        collector.collect_processes(&ProcessQuery::default());
+        collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 2);
     }
 
@@ -3298,7 +3560,7 @@ mod tests {
             );
         }
 
-        collector.collect_processes(&ProcessQuery::default());
+        collector.collect_processes_for_test(&ProcessQuery::default());
         let first_samples = collector.process_cpu_baselines.clone();
         for pid in [1, 2] {
             assert!(
@@ -3315,7 +3577,7 @@ mod tests {
         }
         clock.advance(2_000);
 
-        let second = collector.collect_processes(&ProcessQuery::default());
+        let second = collector.collect_processes_for_test(&ProcessQuery::default());
         for process in &second.processes {
             let first_sample = first_samples[&process.pid].sampled_at_ms;
             let second_sample = collector.process_cpu_baselines[&process.pid].sampled_at_ms;
@@ -3415,7 +3677,7 @@ mod tests {
         );
         assert_eq!(
             collector
-                .collect_processes(&ProcessQuery::default())
+                .collect_processes_for_test(&ProcessQuery::default())
                 .processes[0]
                 .cpu_rate_status,
             Some(RateStatus::WarmingUp)
@@ -3429,7 +3691,7 @@ mod tests {
             0,
             None,
         );
-        let reused = collector.collect_processes(&ProcessQuery::default());
+        let reused = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(
             reused.processes[0].cpu_rate_status,
             Some(RateStatus::WarmingUp)
@@ -3444,7 +3706,7 @@ mod tests {
             0,
             None,
         );
-        let reset = collector.collect_processes(&ProcessQuery::default());
+        let reset = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(
             reset.processes[0].cpu_rate_status,
             Some(RateStatus::CounterReset)
@@ -3454,7 +3716,7 @@ mod tests {
         fs::remove_dir_all(proc_root.join("8")).expect("process exit");
         clock.set(4_000);
         assert!(collector
-            .collect_processes(&ProcessQuery::default())
+            .collect_processes_for_test(&ProcessQuery::default())
             .processes
             .is_empty());
         write_process_fixture(
@@ -3465,7 +3727,7 @@ mod tests {
             None,
         );
         clock.set(5_000);
-        let restarted = collector.collect_processes(&ProcessQuery::default());
+        let restarted = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(
             restarted.processes[0].cpu_rate_status,
             Some(RateStatus::WarmingUp)
@@ -3502,7 +3764,7 @@ mod tests {
             None,
         );
 
-        let first = collector.collect_processes(&ProcessQuery::default());
+        let first = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(first.processes[0].user.as_deref(), Some("alice"));
         assert_eq!(first.processes[1].user.as_deref(), Some("43"));
         assert!(first
@@ -3511,7 +3773,7 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("UID 43")));
         clock.set(2_000);
-        collector.collect_processes(&ProcessQuery::default());
+        collector.collect_processes_for_test(&ProcessQuery::default());
         let mut calls = resolver.calls.lock().expect("resolver calls").clone();
         calls.sort_unstable();
         assert_eq!(calls, vec![42, 43]);
@@ -3549,15 +3811,109 @@ mod tests {
             fail_all: None,
         });
 
-        let list = collector.collect_processes(&ProcessQuery::default());
+        let list = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(list.processes.len(), 1);
         assert_eq!(list.processes[0].pid, 10);
         assert_eq!(list.failed_process_count, 0);
         assert_eq!(list.partial_process_count, 1);
         assert_eq!(list.exited_during_scan_count, 1);
+        assert!(!list.filter_complete);
         assert_eq!(list.collection_status, CollectionStatus::Partial);
         assert_eq!(list.meta.warnings.len(), 1);
         assert!(list.meta.warnings[0].contains("process 10 status"));
+    }
+
+    #[test]
+    fn unavailable_status_makes_uid_and_user_filters_indeterminate() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(42, Ok(Some("alice".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            Arc::new(ManualClock::new(1_000)),
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        write_process_fixture(
+            &proc_root,
+            42,
+            &process_stat(42, "worker", 1, 0, 42, 1),
+            42,
+            None,
+        );
+        collector.process_file_reader = Arc::new(StatusFailureReader {
+            failures: BTreeMap::new(),
+            fail_all: Some(std::io::ErrorKind::PermissionDenied),
+        });
+
+        for query in [
+            ProcessQuery {
+                uid: Some(42),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                user: Some("alice".to_string()),
+                ..ProcessQuery::default()
+            },
+        ] {
+            let list = collector.collect_processes_for_test(&query);
+            assert_eq!(list.total, 0);
+            assert!(list.processes.is_empty());
+            assert_eq!(list.indeterminate_filter_count, 1);
+            assert!(!list.filter_complete);
+            assert_eq!(list.collection_status, CollectionStatus::Partial);
+            assert!(list
+                .meta
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("indeterminate")));
+        }
+        assert!(resolver.calls.lock().expect("resolver calls").is_empty());
+    }
+
+    #[test]
+    fn unavailable_cmdline_only_makes_name_filter_indeterminate_when_name_misses() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let mut collector = process_collector(
+            root.path(),
+            Arc::new(ManualClock::new(1_000)),
+            ProcessSystemParameters::default(),
+            Arc::new(FixtureUserResolver {
+                responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 1, 0, 7, 1),
+            0,
+            None,
+        );
+        collector.process_file_reader = Arc::new(CmdlineFailureReader);
+
+        let indeterminate = collector.collect_processes_for_test(&ProcessQuery {
+            name_contains: Some("--serve".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(indeterminate.total, 0);
+        assert_eq!(indeterminate.indeterminate_filter_count, 1);
+        assert!(!indeterminate.filter_complete);
+        assert_eq!(indeterminate.collection_status, CollectionStatus::Partial);
+
+        let name_match = collector.collect_processes_for_test(&ProcessQuery {
+            name_contains: Some("WORK".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(name_match.total, 1);
+        assert_eq!(name_match.processes[0].pid, 7);
+        assert_eq!(name_match.indeterminate_filter_count, 0);
+        assert!(name_match.filter_complete);
+        assert_eq!(name_match.collection_status, CollectionStatus::Partial);
     }
 
     #[test]
@@ -3585,7 +3941,7 @@ mod tests {
             Some(10),
         );
 
-        let list = collector.collect_processes(&ProcessQuery::default());
+        let list = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(list.collection_status, CollectionStatus::Partial);
         assert!(!list.scan_failed);
         assert_eq!(list.failed_process_count, 0);
@@ -3624,8 +3980,9 @@ mod tests {
             }),
         );
 
-        let list = collector.collect_processes(&ProcessQuery::default());
+        let list = collector.collect_processes_for_test(&ProcessQuery::default());
         assert!(list.scan_failed);
+        assert!(!list.filter_complete);
         assert_eq!(list.collection_status, CollectionStatus::Failed);
         assert_eq!(list.failed_process_count, 0);
         assert!(list.meta.warnings.len() <= MAX_PROCESS_WARNINGS);
@@ -3664,10 +4021,10 @@ mod tests {
         }
 
         let query = ProcessQuery {
-            limit: Some(1_000),
+            limit: Some(MAX_PROCESS_LIMIT),
             ..ProcessQuery::default()
         };
-        let list = collector.collect_processes(&query);
+        let list = collector.collect_processes_for_test(&query);
         assert_eq!(list.total, 505);
         assert!(list.truncated);
         assert_eq!(list.processes.len(), MAX_PROCESS_LIMIT);
@@ -3692,7 +4049,7 @@ mod tests {
             process.user.as_deref() == Some(process.uid.expect("uid").to_string().as_str())
         }));
 
-        let second = collector.collect_processes(&query);
+        let second = collector.collect_processes_for_test(&query);
         assert_eq!(
             resolver.calls.lock().expect("resolver calls").len(),
             2 * MAX_NSS_LOOKUPS_PER_COLLECTION
@@ -3739,7 +4096,7 @@ mod tests {
             None,
         );
 
-        let list = collector.collect_processes(&ProcessQuery {
+        let list = collector.collect_processes_for_test(&ProcessQuery {
             pid: Some(1_000),
             ..ProcessQuery::default()
         });
@@ -3755,7 +4112,247 @@ mod tests {
     }
 
     #[test]
-    fn user_filter_budget_keeps_indeterminate_candidates_and_marks_partial() {
+    fn process_filters_support_each_dimension_and_composable_and_semantics() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([
+                (100, Ok(Some("alice".to_string()))),
+                (200, Ok(Some("bob".to_string()))),
+                (300, Ok(Some("alice".to_string()))),
+            ]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        for (pid, name, state, ppid, uid) in [
+            (10, "AlphaWorker", "R", 1, 100),
+            (20, "beta", "Z", 10, 200),
+            (30, "gamma", "S", 10, 300),
+        ] {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat_with_ppid(pid, name, state, ppid, 1, 0, pid as u64, 1),
+                uid,
+                None,
+            );
+        }
+
+        let uid = collector.collect_processes_for_test(&ProcessQuery {
+            uid: Some(200),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(
+            uid.processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").as_slice(),
+            &[200]
+        );
+
+        let name = collector.collect_processes_for_test(&ProcessQuery {
+            name_contains: Some("ALPHA".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(name.processes[0].pid, 10);
+        let command = collector.collect_processes_for_test(&ProcessQuery {
+            name_contains: Some("--SERVE".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(command.total, 3);
+
+        let parent = collector.collect_processes_for_test(&ProcessQuery {
+            ppid: Some(10),
+            limit: Some(1),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(parent.total, 2);
+        assert_eq!(parent.processes.len(), 1);
+        assert_eq!(parent.anomaly_count, 1);
+
+        let state = collector.collect_processes_for_test(&ProcessQuery {
+            state: Some(" Z ".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(state.processes[0].pid, 20);
+        let anomaly = collector.collect_processes_for_test(&ProcessQuery {
+            anomaly_kind: Some("zombie_process".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(anomaly.processes[0].pid, 20);
+
+        let unauthorized = collector.collect_processes_for_test(&ProcessQuery {
+            authorized: Some(false),
+            allowed_names: vec!["AlphaWorker".to_string()],
+            ..ProcessQuery::default()
+        });
+        assert_eq!(
+            unauthorized
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+
+        let alice = collector.collect_processes_for_test(&ProcessQuery {
+            user: Some("alice".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(
+            alice
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+        let wrong_case = collector.collect_processes_for_test(&ProcessQuery {
+            user: Some("Alice".to_string()),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(wrong_case.total, 0);
+
+        let combined_query = ProcessQuery {
+            pid: Some(20),
+            ppid: Some(10),
+            uid: Some(200),
+            name_contains: Some("BETA".to_string()),
+            user: Some("bob".to_string()),
+            state: Some("Z".to_string()),
+            anomaly_kind: Some("zombie_process".to_string()),
+            authorized: Some(false),
+            allowed_names: vec!["AlphaWorker".to_string()],
+            limit: Some(1),
+        };
+        combined_query.validate().expect("combined query");
+        let combined = collector.collect_processes_for_test(&combined_query);
+        assert_eq!(combined.processes.len(), 1);
+        assert_eq!(combined.processes[0].pid, 20);
+        assert_eq!(combined.total, 1);
+        assert!(combined.filter_complete);
+    }
+
+    #[test]
+    fn process_query_validation_rejects_invalid_filters_and_limits() {
+        let invalid = [
+            ProcessQuery {
+                name_contains: Some("  ".to_string()),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                user: Some("\t".to_string()),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                anomaly_kind: Some(String::new()),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                name_contains: Some("n".repeat(129)),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                user: Some("u".repeat(65)),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                anomaly_kind: Some("a".repeat(65)),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                allowed_names: vec!["name".to_string(); 201],
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                allowed_names: vec![" ".to_string()],
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                allowed_names: vec!["n".repeat(129)],
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                authorized: Some(true),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                state: Some("Q".to_string()),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                state: Some("SS".to_string()),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                limit: Some(0),
+                ..ProcessQuery::default()
+            },
+            ProcessQuery {
+                limit: Some(MAX_PROCESS_LIMIT + 1),
+                ..ProcessQuery::default()
+            },
+        ];
+        for query in invalid {
+            assert!(matches!(
+                query.validate(),
+                Err(OsSenseError::Configuration(_))
+            ));
+        }
+        ProcessQuery {
+            state: Some(" t ".to_string()),
+            limit: Some(MAX_PROCESS_LIMIT),
+            ..ProcessQuery::default()
+        }
+        .validate()
+        .expect("valid Linux process state");
+
+        let mut collector = ProcfsCollector::default();
+        let error = collector
+            .collect_processes(&ProcessQuery {
+                limit: Some(0),
+                ..ProcessQuery::default()
+            })
+            .expect_err("public collector entry validates queries");
+        assert!(matches!(error, OsSenseError::Configuration(_)));
+    }
+
+    #[test]
+    fn local_and_cached_user_hits_do_not_consume_nss_budget() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(LocalFixtureUserResolver {
+            local: BTreeMap::from([(7, "local-user".to_string())]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        let mut budget = 0;
+        let local = collector.resolve_process_user(7, &mut budget);
+        assert_eq!(local.user, "local-user");
+        assert_eq!(budget, 0);
+        let cached = collector.resolve_process_user(7, &mut budget);
+        assert_eq!(cached.user, "local-user");
+        assert_eq!(budget, 0);
+        assert!(resolver.calls.lock().expect("resolver calls").is_empty());
+    }
+
+    #[test]
+    fn user_filter_budget_omits_indeterminate_candidates_and_marks_partial() {
         let root = tempfile::tempdir().expect("tempdir");
         let proc_root = root.path().join("proc");
         let clock = Arc::new(ManualClock::new(1_000));
@@ -3781,7 +4378,7 @@ mod tests {
             );
         }
 
-        let list = collector.collect_processes(&ProcessQuery {
+        let list = collector.collect_processes_for_test(&ProcessQuery {
             user: Some("target-user".to_string()),
             ..ProcessQuery::default()
         });
@@ -3790,16 +4387,19 @@ mod tests {
             resolver.calls.lock().expect("resolver calls").len(),
             MAX_NSS_LOOKUPS_PER_COLLECTION
         );
-        assert_eq!(list.total, 20 - MAX_NSS_LOOKUPS_PER_COLLECTION);
-        assert_eq!(list.partial_process_count, list.total);
+        assert_eq!(list.total, 0);
+        assert_eq!(list.partial_process_count, 0);
+        assert_eq!(
+            list.indeterminate_filter_count,
+            20 - MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+        assert!(!list.filter_complete);
         assert_eq!(list.collection_status, CollectionStatus::Partial);
-        assert!(list
-            .processes
-            .iter()
-            .all(|process| process.user.as_deref()
-                == process.uid.map(|uid| uid.to_string()).as_deref()));
+        assert!(list.processes.is_empty());
         assert!(list.meta.warnings.iter().any(|warning| {
-            warning.contains("user filter") && warning.contains("indeterminate")
+            warning.contains("user filter")
+                && warning.contains("indeterminate")
+                && warning.contains("omitted")
         }));
     }
 
@@ -3830,7 +4430,7 @@ mod tests {
                 Some(rss_kb),
             );
             assert!(collector
-                .collect_processes(&ProcessQuery::default())
+                .collect_processes_for_test(&ProcessQuery::default())
                 .anomalies
                 .is_empty());
         }
@@ -3838,8 +4438,9 @@ mod tests {
         clock.set(60_000);
         fs::write(process_root.join("stat"), "malformed process stat\n")
             .expect("malformed stat fixture");
-        let failed = collector.collect_processes(&ProcessQuery::default());
+        let failed = collector.collect_processes_for_test(&ProcessQuery::default());
         assert_eq!(failed.failed_process_count, 1);
+        assert!(!failed.filter_complete);
         assert!(!collector.process_anomaly_states.contains_key(&77));
 
         for (sampled_at_ms, rss_kb) in [(90_000, 180_000), (150_000, 260_000)] {
@@ -3851,7 +4452,7 @@ mod tests {
                 0,
                 Some(rss_kb),
             );
-            let recovered = collector.collect_processes(&ProcessQuery::default());
+            let recovered = collector.collect_processes_for_test(&ProcessQuery::default());
             assert!(recovered
                 .anomalies
                 .iter()
@@ -3891,7 +4492,7 @@ mod tests {
             );
         }
 
-        let list = collector.collect_processes(&ProcessQuery {
+        let list = collector.collect_processes_for_test(&ProcessQuery {
             limit: Some(1),
             ..ProcessQuery::default()
         });
@@ -3933,8 +4534,19 @@ mod tests {
         assert_eq!(list.anomaly_count, 0);
         assert!(!list.anomalies_truncated);
         assert_eq!(list.omitted_anomaly_count, 0);
+        assert_eq!(list.indeterminate_filter_count, 0);
+        assert!(list.filter_complete);
         assert!(!list.scan_failed);
         assert_eq!(list.collection_status, CollectionStatus::Partial);
+
+        let query: ProcessQuery =
+            serde_json::from_value(serde_json::json!({"pid": 1})).expect("legacy query");
+        assert_eq!(query.pid, Some(1));
+        assert_eq!(query.ppid, None);
+        assert_eq!(query.uid, None);
+        assert_eq!(query.state, None);
+        assert_eq!(query.anomaly_kind, None);
+        assert_eq!(query.authorized, None);
     }
 
     #[test]
@@ -4335,7 +4947,7 @@ mod tests {
                     ..ProcessQuery::default()
                 }
             };
-            let list = collector.collect_processes(&query);
+            let list = collector.collect_processes_for_test(&query);
             assert_eq!(list.meta.collected_at_ms, wall_ms);
             assert_eq!(list.processes.len(), 1);
             assert_eq!(list.processes[0].pid, 1);
@@ -4370,7 +4982,7 @@ mod tests {
             0,
             Some(220_000),
         );
-        let target = collector.collect_processes(&ProcessQuery {
+        let target = collector.collect_processes_for_test(&ProcessQuery {
             pid: Some(2),
             ..ProcessQuery::default()
         });
@@ -4388,7 +5000,7 @@ mod tests {
 
         fs::remove_dir_all(proc_root.join("2")).expect("remove exited process fixture");
         monotonic_clock.set(160_000);
-        collector.collect_processes(&ProcessQuery::default());
+        collector.collect_processes_for_test(&ProcessQuery::default());
         assert!(!collector.process_anomaly_states.contains_key(&2));
     }
 

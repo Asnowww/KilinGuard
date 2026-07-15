@@ -360,7 +360,15 @@ pub struct ProcessList {
     pub anomalies_truncated: bool,
     #[serde(default)]
     pub omitted_anomaly_count: usize,
+    #[serde(default)]
+    pub indeterminate_filter_count: usize,
+    #[serde(default = "default_filter_complete")]
+    pub filter_complete: bool,
     pub unauthorized: Vec<ProcessInfo>,
+}
+
+const fn default_filter_complete() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
