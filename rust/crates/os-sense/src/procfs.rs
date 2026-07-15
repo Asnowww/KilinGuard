@@ -13,8 +13,8 @@ use crate::model::{
     CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading,
     HwmonSensorReading, LoadAverage, LoongArchInfo, MemorySnapshot, MetricSnapshot,
     NetworkInterfaceSnapshot, NetworkMetricsSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly,
-    ProcessInfo, ProcessList, RateStatus, ResourceDimension, SensorAvailability,
-    TemperatureReading, ThermalSnapshot,
+    ProcessAnomalyEvidence, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
+    SensorAvailability, TemperatureReading, ThermalSnapshot,
 };
 use crate::redaction::redact_sensitive_text;
 
@@ -31,6 +31,15 @@ const POSITIVE_USER_CACHE_TTL_MS: u64 = 60 * 60 * 1_000;
 const NEGATIVE_USER_CACHE_TTL_MS: u64 = 30 * 1_000;
 const MAX_PROCESS_USER_CACHE_ENTRIES: usize = 4_096;
 const MAX_NSS_LOOKUPS_PER_COLLECTION: usize = 16;
+const MAX_PROCESS_LIST_ANOMALIES: usize = 128;
+const PROCESS_ANOMALY_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
+const MAX_PROCESS_ANOMALY_STATES: usize = 32_768;
+const PROCESS_PATTERN_MIN_SAMPLES: usize = 3;
+const MEMORY_LEAK_MIN_DURATION_MS: u64 = 60_000;
+const MEMORY_LEAK_MIN_ABSOLUTE_GROWTH_KB: u64 = 64 * 1_024;
+const MEMORY_LEAK_MIN_RELATIVE_GROWTH_PERCENT: f64 = 20.0;
+const CPU_BUSY_LOOP_MIN_DURATION_MS: u64 = 60_000;
+const CPU_BUSY_LOOP_MIN_USAGE_PERCENT: f64 = 90.0;
 const MAX_CMDLINE_CHARS: usize = 256;
 const MAX_HWMON_SENSORS: usize = 128;
 const DISK_SECTOR_BYTES: u64 = 512;
@@ -93,6 +102,32 @@ struct ProcessCpuBaseline {
     start_time_jiffies: u64,
     cpu_time_jiffies: u64,
     sampled_at_ms: u64,
+    scan_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryGrowthState {
+    started_at_ms: u64,
+    initial_rss_kb: u64,
+    latest_rss_kb: u64,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuBusyState {
+    started_at_ms: u64,
+    minimum_usage_percent: f64,
+    latest_usage_percent: f64,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessAnomalyState {
+    start_time_jiffies: u64,
+    sampled_at_ms: u64,
+    scan_id: u64,
+    memory_growth: Option<MemoryGrowthState>,
+    cpu_busy: Option<CpuBusyState>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,12 +136,18 @@ struct CachedUserResolution {
     warning: Option<String>,
     cached_at_ms: u64,
     positive: bool,
+    definitive: bool,
 }
 
 struct ProcessReadOutcome {
     process: ProcessInfo,
     sampled_at_ms: u64,
     warnings: Vec<String>,
+}
+
+struct ProcessCandidate {
+    process: ProcessInfo,
+    partial: bool,
 }
 
 trait ProcessFileReader: Send + Sync {
@@ -327,7 +368,11 @@ pub struct ProcfsCollector {
     metrics: MetricsByMode,
     process_system_parameters: ProcessSystemParameters,
     process_system_warnings: Vec<String>,
+    process_scan_id: u64,
     process_cpu_baselines: BTreeMap<u32, ProcessCpuBaseline>,
+    process_cpu_baseline_order: BTreeSet<(u64, u32)>,
+    process_anomaly_states: BTreeMap<u32, ProcessAnomalyState>,
+    process_anomaly_state_order: BTreeSet<(u64, u32)>,
     process_user_resolver: Arc<dyn ProcessUserResolver>,
     process_user_cache: BTreeMap<u32, CachedUserResolution>,
     process_file_reader: Arc<dyn ProcessFileReader>,
@@ -346,7 +391,11 @@ impl Default for ProcfsCollector {
             metrics: MetricsByMode::default(),
             process_system_parameters,
             process_system_warnings,
+            process_scan_id: 0,
             process_cpu_baselines: BTreeMap::new(),
+            process_cpu_baseline_order: BTreeSet::new(),
+            process_anomaly_states: BTreeMap::new(),
+            process_anomaly_state_order: BTreeSet::new(),
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
@@ -368,7 +417,11 @@ impl ProcfsCollector {
             metrics: MetricsByMode::default(),
             process_system_parameters,
             process_system_warnings,
+            process_scan_id: 0,
             process_cpu_baselines: BTreeMap::new(),
+            process_cpu_baseline_order: BTreeSet::new(),
+            process_anomaly_states: BTreeMap::new(),
+            process_anomaly_state_order: BTreeSet::new(),
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
@@ -393,7 +446,11 @@ impl ProcfsCollector {
             metrics: MetricsByMode::default(),
             process_system_parameters,
             process_system_warnings,
+            process_scan_id: 0,
             process_cpu_baselines: BTreeMap::new(),
+            process_cpu_baseline_order: BTreeSet::new(),
+            process_anomaly_states: BTreeMap::new(),
+            process_anomaly_state_order: BTreeSet::new(),
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
@@ -419,7 +476,11 @@ impl ProcfsCollector {
             metrics: MetricsByMode::default(),
             process_system_parameters,
             process_system_warnings: Vec::new(),
+            process_scan_id: 0,
             process_cpu_baselines: BTreeMap::new(),
+            process_cpu_baseline_order: BTreeSet::new(),
+            process_anomaly_states: BTreeMap::new(),
+            process_anomaly_state_order: BTreeSet::new(),
             process_user_resolver,
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
@@ -762,11 +823,28 @@ impl ProcfsCollector {
     pub fn collect_processes(&mut self, query: &ProcessQuery) -> ProcessList {
         let scan_started_at_ms = self.clock.now_ms();
         let scan_started_at_monotonic_ms = self.process_clock.now_ms();
+        self.process_scan_id = self.process_scan_id.wrapping_add(1);
+        if self.process_scan_id == 0 {
+            self.process_cpu_baselines.clear();
+            self.process_cpu_baseline_order.clear();
+            self.process_anomaly_states.clear();
+            self.process_anomaly_state_order.clear();
+            self.process_scan_id = 1;
+        }
+        let process_scan_id = self.process_scan_id;
         prune_process_cpu_baselines(
             &mut self.process_cpu_baselines,
+            &mut self.process_cpu_baseline_order,
             scan_started_at_monotonic_ms,
             PROCESS_BASELINE_TTL_MS,
             MAX_PROCESS_BASELINES,
+        );
+        prune_process_anomaly_states(
+            &mut self.process_anomaly_states,
+            &mut self.process_anomaly_state_order,
+            scan_started_at_monotonic_ms,
+            PROCESS_ANOMALY_STATE_TTL_MS,
+            MAX_PROCESS_ANOMALY_STATES,
         );
         let mut warnings = self.process_system_warnings.clone();
         let platform = self.platform_info(&mut warnings);
@@ -834,13 +912,15 @@ impl ProcfsCollector {
             .map(|name| name.to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
 
-        let mut processes = Vec::new();
-        let mut seen_pids = BTreeSet::new();
+        let mut candidates = BTreeMap::new();
+        let mut bounded_anomalies = BTreeMap::new();
+        let mut total = 0usize;
+        let mut anomaly_count = 0usize;
+        let mut partial_process_count = 0usize;
+        let mut remaining_nss_lookups = MAX_NSS_LOOKUPS_PER_COLLECTION;
         let mut failed_process_count = 0;
-        let mut partial_process_count = 0;
         let mut exited_during_scan_count = 0;
         let mut scan_failed = false;
-        let mut remaining_nss_lookups = MAX_NSS_LOOKUPS_PER_COLLECTION;
         match fs::read_dir(&self.proc_root) {
             Ok(entries) => {
                 for entry in entries {
@@ -863,9 +943,6 @@ impl ProcfsCollector {
                     else {
                         continue;
                     };
-                    if query.pid.is_some_and(|wanted| wanted != pid) {
-                        continue;
-                    }
                     match self.read_process(pid, uptime, &allowed) {
                         Ok(outcome) => {
                             let ProcessReadOutcome {
@@ -873,57 +950,122 @@ impl ProcfsCollector {
                                 sampled_at_ms,
                                 warnings: read_warnings,
                             } = outcome;
-                            seen_pids.insert(pid);
-                            let mut process_partial = !read_warnings.is_empty();
-                            for warning in read_warnings {
-                                push_process_warning(
-                                    &mut warnings,
-                                    &mut omitted_warning_count,
-                                    warning,
-                                );
-                            }
                             apply_process_cpu_rate(
                                 &mut process,
                                 self.process_cpu_baselines.get(&pid).copied(),
                                 sampled_at_ms,
                                 self.process_system_parameters.clock_ticks_per_second,
                             );
-                            self.process_cpu_baselines.insert(
+                            insert_process_cpu_baseline(
+                                &mut self.process_cpu_baselines,
+                                &mut self.process_cpu_baseline_order,
                                 pid,
                                 ProcessCpuBaseline {
                                     start_time_jiffies: process.start_time_jiffies,
                                     cpu_time_jiffies: process.cpu_time_jiffies,
                                     sampled_at_ms,
+                                    scan_id: process_scan_id,
                                 },
+                                MAX_PROCESS_BASELINES,
                             );
-                            if let Some(uid) = process.uid {
-                                let resolution =
-                                    self.resolve_process_user(uid, &mut remaining_nss_lookups);
-                                process.user = Some(resolution.user);
-                                if let Some(warning) = resolution.warning {
-                                    process_partial = true;
-                                    push_process_warning(
-                                        &mut warnings,
-                                        &mut omitted_warning_count,
-                                        warning,
-                                    );
-                                }
+                            let mut anomalies = update_bounded_process_anomaly_state(
+                                &mut self.process_anomaly_states,
+                                &mut self.process_anomaly_state_order,
+                                &process,
+                                sampled_at_ms,
+                                MAX_PROCESS_ANOMALY_STATES,
+                            );
+                            if let Some(state) = self.process_anomaly_states.get_mut(&pid) {
+                                state.scan_id = process_scan_id;
                             }
+                            anomalies.append(&mut process.anomalies);
+                            process.anomalies = anomalies;
                             process.memory_percent = process
                                 .memory_rss_kb
                                 .zip(total_memory_kb)
                                 .map(|(rss, total)| round2((rss as f64 / total as f64) * 100.0));
-                            if process_partial {
-                                partial_process_count += 1;
+                            if !process_matches_without_user(&process, query) {
+                                continue;
                             }
-                            if process_matches(&process, query) {
-                                processes.push(process);
+
+                            let mut candidate_warnings = read_warnings;
+                            if let Some(expected_user) = &query.user {
+                                let Some(uid) = process.uid else {
+                                    candidate_warnings.push(format!(
+                                        "user filter for process {} is indeterminate because UID is unavailable; candidate included",
+                                        process.pid
+                                    ));
+                                    record_process_candidate(
+                                        &mut candidates,
+                                        &mut bounded_anomalies,
+                                        &mut total,
+                                        &mut anomaly_count,
+                                        &mut partial_process_count,
+                                        &mut warnings,
+                                        &mut omitted_warning_count,
+                                        process,
+                                        candidate_warnings,
+                                        MAX_PROCESS_LIMIT,
+                                        MAX_PROCESS_LIST_ANOMALIES,
+                                    );
+                                    continue;
+                                };
+                                let resolution =
+                                    self.resolve_process_user(uid, &mut remaining_nss_lookups);
+                                let matches = resolution.user == *expected_user;
+                                process.user = Some(resolution.user);
+                                if resolution.definitive && !matches {
+                                    continue;
+                                }
+                                if let Some(warning) = resolution.warning {
+                                    if resolution.definitive {
+                                        candidate_warnings.push(warning);
+                                    } else {
+                                        candidate_warnings.push(format!(
+                                            "user filter for process {} is indeterminate; candidate included: {warning}",
+                                            process.pid
+                                        ));
+                                    }
+                                }
                             }
+                            record_process_candidate(
+                                &mut candidates,
+                                &mut bounded_anomalies,
+                                &mut total,
+                                &mut anomaly_count,
+                                &mut partial_process_count,
+                                &mut warnings,
+                                &mut omitted_warning_count,
+                                process,
+                                candidate_warnings,
+                                MAX_PROCESS_LIMIT,
+                                MAX_PROCESS_LIST_ANOMALIES,
+                            );
                         }
                         Err(ProcessReadFailure::Exited) => {
+                            remove_process_cpu_baseline(
+                                &mut self.process_cpu_baselines,
+                                &mut self.process_cpu_baseline_order,
+                                pid,
+                            );
+                            remove_process_anomaly_state(
+                                &mut self.process_anomaly_states,
+                                &mut self.process_anomaly_state_order,
+                                pid,
+                            );
                             exited_during_scan_count += 1;
                         }
                         Err(ProcessReadFailure::Failed(error)) => {
+                            remove_process_cpu_baseline(
+                                &mut self.process_cpu_baselines,
+                                &mut self.process_cpu_baseline_order,
+                                pid,
+                            );
+                            remove_process_anomaly_state(
+                                &mut self.process_anomaly_states,
+                                &mut self.process_anomaly_state_order,
+                                pid,
+                            );
                             failed_process_count += 1;
                             push_process_warning(
                                 &mut warnings,
@@ -943,28 +1085,49 @@ impl ProcfsCollector {
                 );
             }
         }
-        if let Some(pid) = query.pid {
-            if !seen_pids.contains(&pid) {
-                self.process_cpu_baselines.remove(&pid);
-            }
-        } else if !scan_failed {
-            self.process_cpu_baselines
-                .retain(|pid, _| seen_pids.contains(pid));
+        if !scan_failed {
+            retain_process_cpu_baselines_for_scan(
+                &mut self.process_cpu_baselines,
+                &mut self.process_cpu_baseline_order,
+                process_scan_id,
+            );
+            retain_process_anomaly_states_for_scan(
+                &mut self.process_anomaly_states,
+                &mut self.process_anomaly_state_order,
+                process_scan_id,
+            );
         }
-        enforce_process_cpu_baseline_limit(&mut self.process_cpu_baselines, MAX_PROCESS_BASELINES);
+        let anomalies = bounded_anomalies.into_values().collect::<Vec<_>>();
+        let omitted_anomaly_count = anomaly_count.saturating_sub(anomalies.len());
+        let anomalies_truncated = omitted_anomaly_count > 0;
 
-        processes.sort_by_key(|process| process.pid);
-        let total = processes.len();
         let limit = query
             .limit
             .unwrap_or(DEFAULT_PROCESS_LIMIT)
             .min(MAX_PROCESS_LIMIT);
-        let truncated = processes.len() > limit;
-        processes.truncate(limit);
+        let truncated = total > limit;
+        truncate_process_candidates(&mut candidates, limit);
 
-        let anomalies = processes
-            .iter()
-            .flat_map(|process| process.anomalies.clone())
+        if query.user.is_none() {
+            for candidate in candidates.values_mut() {
+                let Some(uid) = candidate.process.uid else {
+                    continue;
+                };
+                let resolution = self.resolve_process_user(uid, &mut remaining_nss_lookups);
+                candidate.process.user = Some(resolution.user);
+                if let Some(warning) = resolution.warning {
+                    if !candidate.partial {
+                        partial_process_count += 1;
+                        candidate.partial = true;
+                    }
+                    push_process_warning(&mut warnings, &mut omitted_warning_count, warning);
+                }
+            }
+        }
+
+        let processes = candidates
+            .into_iter()
+            .map(|(_, candidate)| candidate.process)
             .collect::<Vec<_>>();
         let unauthorized = processes
             .iter()
@@ -999,6 +1162,9 @@ impl ProcfsCollector {
             collection_status,
             processes,
             anomalies,
+            anomaly_count,
+            anomalies_truncated,
+            omitted_anomaly_count,
             unauthorized,
         }
     }
@@ -1054,8 +1220,6 @@ impl ProcfsCollector {
                 "failed to read process {pid} command line: {error}"
             )),
         }
-        info.anomalies =
-            detect_process_anomalies(&info, self.process_system_parameters.clock_ticks_per_second);
         if !allowed.is_empty() {
             info.authorized = Some(allowed.contains(&info.name.to_ascii_lowercase()));
             if info.authorized == Some(false) {
@@ -1067,6 +1231,7 @@ impl ProcfsCollector {
                         info.name
                     ),
                     score: 0.8,
+                    evidence: None,
                 });
             }
         }
@@ -1102,6 +1267,7 @@ impl ProcfsCollector {
                 )),
                 cached_at_ms: now_ms,
                 positive: false,
+                definitive: false,
             };
         }
         *remaining_nss_lookups -= 1;
@@ -1111,6 +1277,7 @@ impl ProcfsCollector {
                 warning: None,
                 cached_at_ms: self.process_clock.now_ms(),
                 positive: true,
+                definitive: true,
             },
             Ok(_) => CachedUserResolution {
                 user: uid.to_string(),
@@ -1119,6 +1286,7 @@ impl ProcfsCollector {
                 )),
                 cached_at_ms: self.process_clock.now_ms(),
                 positive: false,
+                definitive: true,
             },
             Err(error) => CachedUserResolution {
                 user: uid.to_string(),
@@ -1127,6 +1295,7 @@ impl ProcfsCollector {
                 )),
                 cached_at_ms: self.process_clock.now_ms(),
                 positive: false,
+                definitive: false,
             },
         };
         self.process_user_cache.insert(uid, resolution.clone());
@@ -2061,10 +2230,67 @@ fn apply_process_status(info: &mut ProcessInfo, status: &str) {
     }
 }
 
-fn detect_process_anomalies(
+fn update_process_anomaly_state(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
     info: &ProcessInfo,
-    clock_ticks_per_second: u64,
+    sampled_at_ms: u64,
 ) -> Vec<ProcessAnomaly> {
+    let state = states.entry(info.pid).or_insert(ProcessAnomalyState {
+        start_time_jiffies: info.start_time_jiffies,
+        sampled_at_ms,
+        scan_id: 0,
+        memory_growth: None,
+        cpu_busy: None,
+    });
+    if state.start_time_jiffies != info.start_time_jiffies {
+        *state = ProcessAnomalyState {
+            start_time_jiffies: info.start_time_jiffies,
+            sampled_at_ms,
+            scan_id: 0,
+            memory_growth: None,
+            cpu_busy: None,
+        };
+    }
+    state.sampled_at_ms = sampled_at_ms;
+
+    state.memory_growth = match (state.memory_growth, info.memory_rss_kb) {
+        (Some(previous), Some(rss_kb)) if rss_kb >= previous.latest_rss_kb => {
+            Some(MemoryGrowthState {
+                latest_rss_kb: rss_kb,
+                sample_count: previous.sample_count.saturating_add(1),
+                ..previous
+            })
+        }
+        (_, Some(rss_kb)) => Some(MemoryGrowthState {
+            started_at_ms: sampled_at_ms,
+            initial_rss_kb: rss_kb,
+            latest_rss_kb: rss_kb,
+            sample_count: 1,
+        }),
+        (_, None) => None,
+    };
+
+    let ready_high_cpu = info.cpu_usage_percent.filter(|usage| {
+        info.cpu_rate_status == Some(RateStatus::Ready)
+            && usage.is_finite()
+            && *usage >= CPU_BUSY_LOOP_MIN_USAGE_PERCENT
+    });
+    state.cpu_busy = match (state.cpu_busy, ready_high_cpu) {
+        (Some(previous), Some(usage)) => Some(CpuBusyState {
+            minimum_usage_percent: previous.minimum_usage_percent.min(usage),
+            latest_usage_percent: usage,
+            sample_count: previous.sample_count.saturating_add(1),
+            ..previous
+        }),
+        (_, Some(usage)) => Some(CpuBusyState {
+            started_at_ms: sampled_at_ms,
+            minimum_usage_percent: usage,
+            latest_usage_percent: usage,
+            sample_count: 1,
+        }),
+        (_, None) => None,
+    };
+
     let mut anomalies = Vec::new();
     if info.state == "Z" {
         anomalies.push(ProcessAnomaly {
@@ -2072,32 +2298,99 @@ fn detect_process_anomalies(
             kind: "zombie_process".to_string(),
             message: format!("process `{}` is in zombie state", info.name),
             score: 1.0,
+            evidence: Some(ProcessAnomalyEvidence::ProcessState {
+                state: "Z".to_string(),
+            }),
         });
     }
-    if info.memory_rss_kb.is_some_and(|rss| rss >= 1024 * 1024) {
-        anomalies.push(ProcessAnomaly {
-            pid: info.pid,
-            kind: "high_memory_process".to_string(),
-            message: format!("process `{}` RSS exceeds 1 GiB", info.name),
-            score: 0.6,
-        });
-    }
-    if let Some(uptime_seconds) = info.uptime_seconds {
-        if uptime_seconds > 0.0 {
-            let cpu_seconds = info.cpu_time_jiffies as f64 / clock_ticks_per_second.max(1) as f64;
-            if cpu_seconds / uptime_seconds > 0.9 && uptime_seconds > 60.0 {
-                anomalies.push(ProcessAnomaly {
-                    pid: info.pid,
-                    kind: "possible_cpu_spin".to_string(),
-                    message: format!(
-                        "process `{}` has high CPU time relative to uptime",
-                        info.name
-                    ),
-                    score: 0.5,
-                });
+
+    if let Some(memory) = state.memory_growth {
+        let observed_duration_ms = sampled_at_ms.saturating_sub(memory.started_at_ms);
+        let absolute_growth_kb = memory.latest_rss_kb.saturating_sub(memory.initial_rss_kb);
+        let relative_growth_percent = if memory.initial_rss_kb == 0 {
+            if memory.latest_rss_kb > 0 {
+                100.0
+            } else {
+                0.0
             }
+        } else {
+            round2(absolute_growth_kb as f64 * 100.0 / memory.initial_rss_kb as f64)
+        };
+        if memory.sample_count >= PROCESS_PATTERN_MIN_SAMPLES
+            && observed_duration_ms >= MEMORY_LEAK_MIN_DURATION_MS
+            && absolute_growth_kb >= MEMORY_LEAK_MIN_ABSOLUTE_GROWTH_KB
+            && relative_growth_percent >= MEMORY_LEAK_MIN_RELATIVE_GROWTH_PERCENT
+        {
+            anomalies.push(ProcessAnomaly {
+                pid: info.pid,
+                kind: "memory_leak_pattern".to_string(),
+                message: format!(
+                    "process `{}` RSS grew from {} kB to {} kB over {} ms across {} samples",
+                    info.name,
+                    memory.initial_rss_kb,
+                    memory.latest_rss_kb,
+                    observed_duration_ms,
+                    memory.sample_count
+                ),
+                score: 0.9,
+                evidence: Some(ProcessAnomalyEvidence::MemoryRss {
+                    sample_count: memory.sample_count,
+                    observed_duration_ms,
+                    initial_rss_kb: memory.initial_rss_kb,
+                    latest_rss_kb: memory.latest_rss_kb,
+                    absolute_growth_kb,
+                    relative_growth_percent,
+                    minimum_duration_ms: MEMORY_LEAK_MIN_DURATION_MS,
+                    minimum_absolute_growth_kb: MEMORY_LEAK_MIN_ABSOLUTE_GROWTH_KB,
+                    minimum_relative_growth_percent: MEMORY_LEAK_MIN_RELATIVE_GROWTH_PERCENT,
+                }),
+            });
         }
     }
+
+    if let Some(cpu) = state.cpu_busy {
+        let observed_duration_ms = sampled_at_ms.saturating_sub(cpu.started_at_ms);
+        if cpu.sample_count >= PROCESS_PATTERN_MIN_SAMPLES
+            && observed_duration_ms >= CPU_BUSY_LOOP_MIN_DURATION_MS
+        {
+            anomalies.push(ProcessAnomaly {
+                pid: info.pid,
+                kind: "cpu_busy_loop".to_string(),
+                message: format!(
+                    "process `{}` sustained at least {:.2}% CPU for {} ms across {} samples",
+                    info.name, cpu.minimum_usage_percent, observed_duration_ms, cpu.sample_count
+                ),
+                score: 0.9,
+                evidence: Some(ProcessAnomalyEvidence::CpuUsage {
+                    sample_count: cpu.sample_count,
+                    observed_duration_ms,
+                    minimum_usage_percent: cpu.minimum_usage_percent,
+                    latest_usage_percent: cpu.latest_usage_percent,
+                    minimum_duration_ms: CPU_BUSY_LOOP_MIN_DURATION_MS,
+                    threshold_percent: CPU_BUSY_LOOP_MIN_USAGE_PERCENT,
+                }),
+            });
+        }
+    }
+
+    anomalies
+}
+
+fn update_bounded_process_anomaly_state(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
+    order: &mut BTreeSet<(u64, u32)>,
+    info: &ProcessInfo,
+    sampled_at_ms: u64,
+    max_entries: usize,
+) -> Vec<ProcessAnomaly> {
+    if let Some(previous) = states.get(&info.pid) {
+        order.remove(&(previous.sampled_at_ms, info.pid));
+    }
+    let anomalies = update_process_anomaly_state(states, info, sampled_at_ms);
+    if let Some(state) = states.get(&info.pid) {
+        order.insert((state.sampled_at_ms, info.pid));
+    }
+    enforce_process_anomaly_state_limit(states, order, max_entries);
     anomalies
 }
 
@@ -2135,29 +2428,170 @@ fn apply_process_cpu_rate(
 
 fn prune_process_cpu_baselines(
     baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    order: &mut BTreeSet<(u64, u32)>,
     now_ms: u64,
     ttl_ms: u64,
     max_entries: usize,
 ) {
-    baselines.retain(|_, baseline| now_ms.saturating_sub(baseline.sampled_at_ms) < ttl_ms);
-    enforce_process_cpu_baseline_limit(baselines, max_entries);
+    while let Some((sampled_at_ms, pid)) = order.iter().next().copied() {
+        if now_ms.saturating_sub(sampled_at_ms) < ttl_ms {
+            break;
+        }
+        remove_process_cpu_baseline(baselines, order, pid);
+    }
+    enforce_process_cpu_baseline_limit(baselines, order, max_entries);
+}
+
+fn insert_process_cpu_baseline(
+    baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    order: &mut BTreeSet<(u64, u32)>,
+    pid: u32,
+    baseline: ProcessCpuBaseline,
+    max_entries: usize,
+) {
+    if let Some(previous) = baselines.get(&pid) {
+        order.remove(&(previous.sampled_at_ms, pid));
+    }
+    order.insert((baseline.sampled_at_ms, pid));
+    baselines.insert(pid, baseline);
+    enforce_process_cpu_baseline_limit(baselines, order, max_entries);
+}
+
+fn remove_process_cpu_baseline(
+    baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    order: &mut BTreeSet<(u64, u32)>,
+    pid: u32,
+) -> Option<ProcessCpuBaseline> {
+    let baseline = baselines.remove(&pid)?;
+    order.remove(&(baseline.sampled_at_ms, pid));
+    Some(baseline)
 }
 
 fn enforce_process_cpu_baseline_limit(
     baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    order: &mut BTreeSet<(u64, u32)>,
     max_entries: usize,
 ) {
-    let remove_count = baselines.len().saturating_sub(max_entries);
-    if remove_count == 0 {
-        return;
+    while baselines.len() > max_entries {
+        let Some((_, pid)) = order.iter().next().copied() else {
+            break;
+        };
+        remove_process_cpu_baseline(baselines, order, pid);
     }
-    let mut oldest = baselines
-        .iter()
-        .map(|(pid, baseline)| (baseline.sampled_at_ms, *pid))
-        .collect::<Vec<_>>();
-    oldest.sort_unstable();
-    for (_, pid) in oldest.into_iter().take(remove_count) {
-        baselines.remove(&pid);
+}
+
+fn retain_process_cpu_baselines_for_scan(
+    baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    order: &mut BTreeSet<(u64, u32)>,
+    scan_id: u64,
+) {
+    baselines.retain(|pid, baseline| {
+        let retain = baseline.scan_id == scan_id;
+        if !retain {
+            order.remove(&(baseline.sampled_at_ms, *pid));
+        }
+        retain
+    });
+}
+
+fn prune_process_anomaly_states(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
+    order: &mut BTreeSet<(u64, u32)>,
+    now_ms: u64,
+    ttl_ms: u64,
+    max_entries: usize,
+) {
+    while let Some((sampled_at_ms, pid)) = order.iter().next().copied() {
+        if now_ms.saturating_sub(sampled_at_ms) < ttl_ms {
+            break;
+        }
+        remove_process_anomaly_state(states, order, pid);
+    }
+    enforce_process_anomaly_state_limit(states, order, max_entries);
+}
+
+fn remove_process_anomaly_state(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
+    order: &mut BTreeSet<(u64, u32)>,
+    pid: u32,
+) -> Option<ProcessAnomalyState> {
+    let state = states.remove(&pid)?;
+    order.remove(&(state.sampled_at_ms, pid));
+    Some(state)
+}
+
+fn enforce_process_anomaly_state_limit(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
+    order: &mut BTreeSet<(u64, u32)>,
+    max_entries: usize,
+) {
+    while states.len() > max_entries {
+        let Some((_, pid)) = order.iter().next().copied() else {
+            break;
+        };
+        remove_process_anomaly_state(states, order, pid);
+    }
+}
+
+fn retain_process_anomaly_states_for_scan(
+    states: &mut BTreeMap<u32, ProcessAnomalyState>,
+    order: &mut BTreeSet<(u64, u32)>,
+    scan_id: u64,
+) {
+    states.retain(|pid, state| {
+        let retain = state.scan_id == scan_id;
+        if !retain {
+            order.remove(&(state.sampled_at_ms, *pid));
+        }
+        retain
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_process_candidate(
+    candidates: &mut BTreeMap<u32, ProcessCandidate>,
+    bounded_anomalies: &mut BTreeMap<(u32, usize), ProcessAnomaly>,
+    total: &mut usize,
+    anomaly_count: &mut usize,
+    partial_process_count: &mut usize,
+    warnings: &mut Vec<String>,
+    omitted_warning_count: &mut usize,
+    process: ProcessInfo,
+    process_warnings: Vec<String>,
+    max_candidates: usize,
+    max_anomalies: usize,
+) {
+    *total = total.saturating_add(1);
+    let partial = !process_warnings.is_empty();
+    if partial {
+        *partial_process_count = partial_process_count.saturating_add(1);
+        for warning in process_warnings {
+            push_process_warning(warnings, omitted_warning_count, warning);
+        }
+    }
+    for (index, anomaly) in process.anomalies.iter().cloned().enumerate() {
+        *anomaly_count = anomaly_count.saturating_add(1);
+        bounded_anomalies.insert((process.pid, index), anomaly);
+        while bounded_anomalies.len() > max_anomalies {
+            let Some(key) = bounded_anomalies.keys().next_back().copied() else {
+                break;
+            };
+            bounded_anomalies.remove(&key);
+        }
+    }
+    candidates.insert(process.pid, ProcessCandidate { process, partial });
+    truncate_process_candidates(candidates, max_candidates);
+}
+
+fn truncate_process_candidates(
+    candidates: &mut BTreeMap<u32, ProcessCandidate>,
+    max_candidates: usize,
+) {
+    while candidates.len() > max_candidates {
+        let Some(pid) = candidates.keys().next_back().copied() else {
+            break;
+        };
+        candidates.remove(&pid);
     }
 }
 
@@ -2191,7 +2625,10 @@ fn push_process_warning(
     }
 }
 
-fn process_matches(process: &ProcessInfo, query: &ProcessQuery) -> bool {
+fn process_matches_without_user(process: &ProcessInfo, query: &ProcessQuery) -> bool {
+    if query.pid.is_some_and(|pid| process.pid != pid) {
+        return false;
+    }
     if let Some(name) = &query.name_contains {
         let needle = name.to_ascii_lowercase();
         if !process.name.to_ascii_lowercase().contains(&needle)
@@ -2200,11 +2637,6 @@ fn process_matches(process: &ProcessInfo, query: &ProcessQuery) -> bool {
                 .as_ref()
                 .is_some_and(|command| command.to_ascii_lowercase().contains(&needle))
         {
-            return false;
-        }
-    }
-    if let Some(user) = &query.user {
-        if process.user.as_deref() != Some(user.as_str()) {
             return false;
         }
     }
@@ -2504,9 +2936,51 @@ mod tests {
         start_time: u64,
         rss_pages: i64,
     ) -> String {
+        process_stat_with_state(pid, name, "S", utime, stime, start_time, rss_pages)
+    }
+
+    fn process_stat_with_state(
+        pid: u32,
+        name: &str,
+        state: &str,
+        utime: u64,
+        stime: u64,
+        start_time: u64,
+        rss_pages: i64,
+    ) -> String {
         format!(
-            "{pid} ({name}) S 1 2 3 4 5 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_time} 409600 {rss_pages} 0 0\n"
+            "{pid} ({name}) {state} 1 2 3 4 5 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_time} 409600 {rss_pages} 0 0\n"
         )
+    }
+
+    fn process_info_for_anomaly(
+        pid: u32,
+        start_time_jiffies: u64,
+        state: &str,
+        rss_kb: Option<u64>,
+        cpu_usage_percent: Option<f64>,
+        cpu_rate_status: Option<RateStatus>,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: Some(1),
+            name: format!("process-{pid}"),
+            state: state.to_string(),
+            user: None,
+            uid: None,
+            cpu_time_jiffies: 0,
+            start_time_jiffies,
+            cpu_usage_percent,
+            cpu_sample_interval_ms: Some(30_000),
+            cpu_rate_status,
+            memory_rss_kb: rss_kb,
+            memory_percent: None,
+            virtual_memory_kb: None,
+            uptime_seconds: None,
+            command: None,
+            anomalies: Vec::new(),
+            authorized: None,
+        }
     }
 
     fn write_process_fixture(
@@ -2548,6 +3022,34 @@ mod tests {
             sys_root,
             clock.clone(),
             clock,
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+            system,
+            resolver,
+        )
+    }
+
+    fn process_collector_with_clocks(
+        root: &Path,
+        wall_clock: Arc<dyn Clock>,
+        process_clock: Arc<dyn MonotonicClock>,
+        system: ProcessSystemParameters,
+        resolver: Arc<dyn ProcessUserResolver>,
+    ) -> ProcfsCollector {
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+        fs::create_dir_all(&sys_root).expect("sys fixture");
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime fixture");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 1000000 kB\nMemAvailable: 500000 kB\n",
+        )
+        .expect("meminfo fixture");
+        ProcfsCollector::with_process_dependencies(
+            proc_root,
+            sys_root,
+            wall_clock,
+            process_clock,
             Arc::new(StaticPartitionUsage(DF_FIXTURE)),
             system,
             resolver,
@@ -2833,13 +3335,18 @@ mod tests {
             start_time_jiffies: 1,
             cpu_time_jiffies: 1,
             sampled_at_ms,
+            scan_id: 1,
         };
-        let mut baselines =
-            BTreeMap::from([(1, baseline(0)), (2, baseline(100)), (3, baseline(100))]);
+        let mut baselines = BTreeMap::new();
+        let mut order = BTreeSet::new();
+        for (pid, baseline) in [(1, baseline(0)), (2, baseline(100)), (3, baseline(100))] {
+            insert_process_cpu_baseline(&mut baselines, &mut order, pid, baseline, 3);
+        }
 
-        prune_process_cpu_baselines(&mut baselines, 500, 450, 1);
+        prune_process_cpu_baselines(&mut baselines, &mut order, 500, 450, 1);
 
         assert_eq!(baselines.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(order, BTreeSet::from([(100, 3)]));
     }
 
     #[test]
@@ -2877,6 +3384,7 @@ mod tests {
             warning: None,
             cached_at_ms,
             positive: true,
+            definitive: true,
         };
         let mut cache = BTreeMap::from([(1, cached(0)), (2, cached(10)), (3, cached(10))]);
         enforce_process_user_cache_limit(&mut cache, 1);
@@ -3168,13 +3676,13 @@ mod tests {
         assert_eq!(list.failed_process_count, 0);
         assert_eq!(
             list.partial_process_count,
-            505 - MAX_NSS_LOOKUPS_PER_COLLECTION
+            MAX_PROCESS_LIMIT - MAX_NSS_LOOKUPS_PER_COLLECTION
         );
         assert_eq!(list.collection_status, CollectionStatus::Partial);
         assert_eq!(list.meta.warnings.len(), MAX_PROCESS_WARNINGS);
         assert_eq!(
             list.omitted_warning_count,
-            505 - MAX_NSS_LOOKUPS_PER_COLLECTION - MAX_PROCESS_WARNINGS
+            MAX_PROCESS_LIMIT - MAX_NSS_LOOKUPS_PER_COLLECTION - MAX_PROCESS_WARNINGS
         );
         assert_eq!(
             resolver.calls.lock().expect("resolver calls").len(),
@@ -3191,8 +3699,210 @@ mod tests {
         );
         assert_eq!(
             second.partial_process_count,
-            505 - 2 * MAX_NSS_LOOKUPS_PER_COLLECTION
+            MAX_PROCESS_LIMIT - 2 * MAX_NSS_LOOKUPS_PER_COLLECTION
         );
+    }
+
+    #[test]
+    fn pid_filter_resolves_only_the_returned_process_user() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let target_uid = 10_000;
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: (1..=40)
+                .map(|uid| (uid, Ok(Some(format!("user-{uid}")))))
+                .chain([(target_uid, Ok(Some("target-user".to_string())))])
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        for pid in 1..=40 {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "unrelated", 1, 0, pid as u64, 1),
+                pid,
+                None,
+            );
+        }
+        write_process_fixture(
+            &proc_root,
+            1_000,
+            &process_stat(1_000, "target", 1, 0, 1_000, 1),
+            target_uid,
+            None,
+        );
+
+        let list = collector.collect_processes(&ProcessQuery {
+            pid: Some(1_000),
+            ..ProcessQuery::default()
+        });
+
+        assert_eq!(list.total, 1);
+        assert_eq!(list.processes[0].user.as_deref(), Some("target-user"));
+        assert_eq!(list.partial_process_count, 0);
+        assert_eq!(list.collection_status, CollectionStatus::Complete);
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").as_slice(),
+            &[target_uid]
+        );
+    }
+
+    #[test]
+    fn user_filter_budget_keeps_indeterminate_candidates_and_marks_partial() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: (1..=20)
+                .map(|uid| (uid, Ok(Some("resolved-other-user".to_string()))))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        for pid in 1..=20 {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 1, 0, pid as u64, 1),
+                pid,
+                None,
+            );
+        }
+
+        let list = collector.collect_processes(&ProcessQuery {
+            user: Some("target-user".to_string()),
+            ..ProcessQuery::default()
+        });
+
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").len(),
+            MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+        assert_eq!(list.total, 20 - MAX_NSS_LOOKUPS_PER_COLLECTION);
+        assert_eq!(list.partial_process_count, list.total);
+        assert_eq!(list.collection_status, CollectionStatus::Partial);
+        assert!(list
+            .processes
+            .iter()
+            .all(|process| process.user.as_deref()
+                == process.uid.map(|uid| uid.to_string()).as_deref()));
+        assert!(list.meta.warnings.iter().any(|warning| {
+            warning.contains("user filter") && warning.contains("indeterminate")
+        }));
+    }
+
+    #[test]
+    fn failed_process_read_breaks_anomaly_continuity() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let process_root = proc_root.join("77");
+        let clock = Arc::new(ManualClock::new(0));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+
+        for (sampled_at_ms, rss_kb) in [(0, 100_000), (30_000, 140_000)] {
+            clock.set(sampled_at_ms);
+            write_process_fixture(
+                &proc_root,
+                77,
+                &process_stat(77, "worker", sampled_at_ms / 10, 0, 700, 1),
+                0,
+                Some(rss_kb),
+            );
+            assert!(collector
+                .collect_processes(&ProcessQuery::default())
+                .anomalies
+                .is_empty());
+        }
+
+        clock.set(60_000);
+        fs::write(process_root.join("stat"), "malformed process stat\n")
+            .expect("malformed stat fixture");
+        let failed = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(failed.failed_process_count, 1);
+        assert!(!collector.process_anomaly_states.contains_key(&77));
+
+        for (sampled_at_ms, rss_kb) in [(90_000, 180_000), (150_000, 260_000)] {
+            clock.set(sampled_at_ms);
+            write_process_fixture(
+                &proc_root,
+                77,
+                &process_stat(77, "worker", sampled_at_ms / 10, 0, 700, 1),
+                0,
+                Some(rss_kb),
+            );
+            let recovered = collector.collect_processes(&ProcessQuery::default());
+            assert!(recovered
+                .anomalies
+                .iter()
+                .all(|anomaly| anomaly.kind != "memory_leak_pattern"));
+        }
+        assert_eq!(
+            collector.process_anomaly_states[&77]
+                .memory_growth
+                .expect("recovered memory state")
+                .sample_count,
+            2
+        );
+    }
+
+    #[test]
+    fn process_list_anomalies_cover_the_filtered_domain_with_a_hard_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+        for pid in 1..=130 {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat_with_state(pid, "zombie", "Z", 1, 0, pid as u64, 1),
+                0,
+                None,
+            );
+        }
+
+        let list = collector.collect_processes(&ProcessQuery {
+            limit: Some(1),
+            ..ProcessQuery::default()
+        });
+
+        assert_eq!(list.processes.len(), 1);
+        assert_eq!(list.processes[0].pid, 1);
+        assert_eq!(list.anomaly_count, 130);
+        assert_eq!(list.anomalies.len(), MAX_PROCESS_LIST_ANOMALIES);
+        assert!(list.anomalies_truncated);
+        assert_eq!(list.omitted_anomaly_count, 2);
+        assert_eq!(list.anomalies.last().map(|anomaly| anomaly.pid), Some(128));
     }
 
     #[test]
@@ -3220,6 +3930,9 @@ mod tests {
         assert_eq!(list.partial_process_count, 0);
         assert_eq!(list.exited_during_scan_count, 0);
         assert_eq!(list.omitted_warning_count, 0);
+        assert_eq!(list.anomaly_count, 0);
+        assert!(!list.anomalies_truncated);
+        assert_eq!(list.omitted_anomaly_count, 0);
         assert!(!list.scan_failed);
         assert_eq!(list.collection_status, CollectionStatus::Partial);
     }
@@ -3246,11 +3959,449 @@ mod tests {
             anomalies: Vec::new(),
             authorized: Some(false),
         };
-        info.anomalies = detect_process_anomalies(&info, FALLBACK_CLK_TCK);
+        info.anomalies = update_process_anomaly_state(&mut BTreeMap::new(), &info, 1_000);
         assert!(info
             .anomalies
             .iter()
             .any(|anomaly| anomaly.kind == "zombie_process"));
+        assert!(matches!(
+            info.anomalies[0].evidence,
+            Some(ProcessAnomalyEvidence::ProcessState { ref state }) if state == "Z"
+        ));
+    }
+
+    #[test]
+    fn sustained_samples_detect_memory_leak_and_cpu_busy_loop_with_evidence() {
+        let mut states = BTreeMap::new();
+        let samples = [
+            (0, 100_000, 95.0),
+            (30_000, 140_000, 100.0),
+            (60_000, 180_000, 125.0),
+        ];
+
+        for (index, (sampled_at_ms, rss_kb, cpu_percent)) in samples.into_iter().enumerate() {
+            let process = process_info_for_anomaly(
+                42,
+                1_000,
+                "S",
+                Some(rss_kb),
+                Some(cpu_percent),
+                Some(RateStatus::Ready),
+            );
+            let anomalies = update_process_anomaly_state(&mut states, &process, sampled_at_ms);
+            if index < 2 {
+                assert!(anomalies.is_empty(), "two samples must remain insufficient");
+                continue;
+            }
+
+            assert_eq!(
+                anomalies
+                    .iter()
+                    .map(|anomaly| anomaly.kind.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["memory_leak_pattern", "cpu_busy_loop"]
+            );
+            assert_eq!(anomalies[0].score, 0.9);
+            assert_eq!(
+                anomalies[0].message,
+                "process `process-42` RSS grew from 100000 kB to 180000 kB over 60000 ms across 3 samples"
+            );
+            assert!(matches!(
+                anomalies[0].evidence,
+                Some(ProcessAnomalyEvidence::MemoryRss {
+                    sample_count: 3,
+                    observed_duration_ms: 60_000,
+                    absolute_growth_kb: 80_000,
+                    relative_growth_percent: 80.0,
+                    ..
+                })
+            ));
+            assert_eq!(anomalies[1].score, 0.9);
+            assert_eq!(
+                anomalies[1].message,
+                "process `process-42` sustained at least 95.00% CPU for 60000 ms across 3 samples"
+            );
+            assert!(matches!(
+                anomalies[1].evidence,
+                Some(ProcessAnomalyEvidence::CpuUsage {
+                    sample_count: 3,
+                    observed_duration_ms: 60_000,
+                    minimum_usage_percent: 95.0,
+                    latest_usage_percent: 125.0,
+                    ..
+                })
+            ));
+            assert!(anomalies.iter().all(|anomaly| {
+                anomaly.kind != "high_memory_process" && anomaly.kind != "possible_cpu_spin"
+            }));
+        }
+    }
+
+    #[test]
+    fn process_pattern_state_resets_on_invalid_samples_and_pid_reuse() {
+        let mut memory_states = BTreeMap::new();
+        for (sampled_at_ms, rss_kb) in [(0, Some(100_000)), (30_000, Some(140_000))] {
+            let process =
+                process_info_for_anomaly(7, 100, "S", rss_kb, None, Some(RateStatus::WarmingUp));
+            assert!(
+                update_process_anomaly_state(&mut memory_states, &process, sampled_at_ms)
+                    .is_empty()
+            );
+        }
+        let declined =
+            process_info_for_anomaly(7, 100, "S", Some(90_000), None, Some(RateStatus::WarmingUp));
+        assert!(update_process_anomaly_state(&mut memory_states, &declined, 60_000).is_empty());
+        assert_eq!(
+            memory_states[&7]
+                .memory_growth
+                .expect("memory state after decline")
+                .sample_count,
+            1
+        );
+        let missing =
+            process_info_for_anomaly(7, 100, "S", None, None, Some(RateStatus::WarmingUp));
+        update_process_anomaly_state(&mut memory_states, &missing, 90_000);
+        assert!(memory_states[&7].memory_growth.is_none());
+
+        let mut cpu_states = BTreeMap::new();
+        for sampled_at_ms in [0, 30_000] {
+            let process = process_info_for_anomaly(
+                9,
+                200,
+                "S",
+                Some(1_000),
+                Some(100.0),
+                Some(RateStatus::Ready),
+            );
+            assert!(
+                update_process_anomaly_state(&mut cpu_states, &process, sampled_at_ms)
+                    .iter()
+                    .all(|anomaly| anomaly.kind != "cpu_busy_loop")
+            );
+        }
+        let low = process_info_for_anomaly(
+            9,
+            200,
+            "S",
+            Some(1_000),
+            Some(10.0),
+            Some(RateStatus::Ready),
+        );
+        update_process_anomaly_state(&mut cpu_states, &low, 60_000);
+        assert!(cpu_states[&9].cpu_busy.is_none());
+
+        for (sampled_at_ms, status) in [
+            (90_000, RateStatus::Ready),
+            (120_000, RateStatus::Ready),
+            (150_000, RateStatus::WarmingUp),
+            (180_000, RateStatus::Ready),
+            (210_000, RateStatus::Ready),
+            (240_000, RateStatus::CounterReset),
+        ] {
+            let process =
+                process_info_for_anomaly(9, 200, "S", Some(1_000), Some(100.0), Some(status));
+            assert!(
+                update_process_anomaly_state(&mut cpu_states, &process, sampled_at_ms)
+                    .iter()
+                    .all(|anomaly| anomaly.kind != "cpu_busy_loop")
+            );
+        }
+        assert!(cpu_states[&9].cpu_busy.is_none());
+
+        let reused = process_info_for_anomaly(
+            9,
+            201,
+            "S",
+            Some(500_000),
+            Some(100.0),
+            Some(RateStatus::Ready),
+        );
+        let anomalies = update_process_anomaly_state(&mut cpu_states, &reused, 300_000);
+        assert!(anomalies.is_empty());
+        assert_eq!(cpu_states[&9].start_time_jiffies, 201);
+        assert_eq!(
+            cpu_states[&9]
+                .cpu_busy
+                .expect("reused CPU state")
+                .sample_count,
+            1
+        );
+        assert_eq!(
+            cpu_states[&9]
+                .memory_growth
+                .expect("reused memory state")
+                .sample_count,
+            1
+        );
+    }
+
+    #[test]
+    fn process_anomaly_state_ttl_and_cap_are_stable() {
+        let mut states = BTreeMap::new();
+        let mut order = BTreeSet::new();
+        for (pid, sampled_at_ms) in [(1, 100), (2, 200), (3, 200)] {
+            let process = process_info_for_anomaly(
+                pid,
+                pid as u64,
+                "S",
+                Some(1_000),
+                None,
+                Some(RateStatus::WarmingUp),
+            );
+            update_bounded_process_anomaly_state(
+                &mut states,
+                &mut order,
+                &process,
+                sampled_at_ms,
+                3,
+            );
+        }
+
+        enforce_process_anomaly_state_limit(&mut states, &mut order, 2);
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+        let process =
+            process_info_for_anomaly(4, 4, "S", Some(1_000), None, Some(RateStatus::WarmingUp));
+        update_bounded_process_anomaly_state(&mut states, &mut order, &process, 200, 2);
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), vec![3, 4]);
+
+        prune_process_anomaly_states(
+            &mut states,
+            &mut order,
+            200 + PROCESS_ANOMALY_STATE_TTL_MS,
+            PROCESS_ANOMALY_STATE_TTL_MS,
+            2,
+        );
+        assert!(states.is_empty(), "states expire at the exact TTL boundary");
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn process_scan_buffers_and_states_enforce_small_caps_after_each_insert() {
+        let mut candidates = BTreeMap::new();
+        let mut anomalies = BTreeMap::new();
+        let mut total = 0;
+        let mut anomaly_count = 0;
+        let mut partial_process_count = 0;
+        let mut warnings = Vec::new();
+        let mut omitted_warning_count = 0;
+        for pid in (1..=6).rev() {
+            let mut process = process_info_for_anomaly(
+                pid,
+                pid as u64,
+                "Z",
+                Some(1_000),
+                None,
+                Some(RateStatus::WarmingUp),
+            );
+            process.anomalies = vec![ProcessAnomaly {
+                pid,
+                kind: "zombie_process".to_string(),
+                message: "fixture".to_string(),
+                score: 1.0,
+                evidence: None,
+            }];
+            record_process_candidate(
+                &mut candidates,
+                &mut anomalies,
+                &mut total,
+                &mut anomaly_count,
+                &mut partial_process_count,
+                &mut warnings,
+                &mut omitted_warning_count,
+                process,
+                Vec::new(),
+                3,
+                2,
+            );
+            assert!(candidates.len() <= 3);
+            assert!(anomalies.len() <= 2);
+        }
+        assert_eq!(total, 6);
+        assert_eq!(anomaly_count, 6);
+        assert_eq!(anomaly_count - anomalies.len(), 4);
+        assert_eq!(
+            candidates.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            anomalies.keys().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let mut baselines = BTreeMap::new();
+        let mut baseline_order = BTreeSet::new();
+        for pid in (1..=256).rev() {
+            insert_process_cpu_baseline(
+                &mut baselines,
+                &mut baseline_order,
+                pid,
+                ProcessCpuBaseline {
+                    start_time_jiffies: pid as u64,
+                    cpu_time_jiffies: 1,
+                    sampled_at_ms: 100,
+                    scan_id: 1,
+                },
+                7,
+            );
+            assert!(baselines.len() <= 7);
+            assert_eq!(baselines.len(), baseline_order.len());
+            assert_eq!(
+                baseline_order,
+                baselines
+                    .iter()
+                    .map(|(pid, baseline)| (baseline.sampled_at_ms, *pid))
+                    .collect()
+            );
+        }
+        assert_eq!(
+            baselines.keys().copied().collect::<Vec<_>>(),
+            (250..=256).collect::<Vec<_>>()
+        );
+
+        let mut states = BTreeMap::new();
+        let mut state_order = BTreeSet::new();
+        for pid in (1..=256).rev() {
+            let process = process_info_for_anomaly(
+                pid,
+                pid as u64,
+                "S",
+                Some(1_000),
+                None,
+                Some(RateStatus::WarmingUp),
+            );
+            update_bounded_process_anomaly_state(&mut states, &mut state_order, &process, 100, 7);
+            assert!(states.len() <= 7);
+            assert_eq!(states.len(), state_order.len());
+            assert_eq!(
+                state_order,
+                states
+                    .iter()
+                    .map(|(pid, state)| (state.sampled_at_ms, *pid))
+                    .collect()
+            );
+        }
+        assert_eq!(
+            states.keys().copied().collect::<Vec<_>>(),
+            (250..=256).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn process_patterns_use_monotonic_time_and_survive_filtering_and_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let wall_clock = Arc::new(ManualClock::new(1_000));
+        let monotonic_clock = Arc::new(ManualClock::new(10_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector_with_clocks(
+            root.path(),
+            wall_clock.clone(),
+            monotonic_clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+        write_process_fixture(
+            &proc_root,
+            1,
+            &process_stat(1, "stable", 0, 0, 100, 10),
+            0,
+            Some(1_000),
+        );
+
+        let walls = [1_000, 9_000_000_000, 10, 500];
+        let rss_samples = [100_000, 140_000, 180_000, 200_000];
+        for (index, (&wall_ms, &rss_kb)) in walls.iter().zip(&rss_samples).enumerate() {
+            wall_clock.set(wall_ms);
+            monotonic_clock.set(10_000 + index as u64 * 30_000);
+            write_process_fixture(
+                &proc_root,
+                2,
+                &process_stat(2, "target", index as u64 * 3_000, 0, 200, 10),
+                0,
+                Some(rss_kb),
+            );
+            let query = if index < 3 {
+                ProcessQuery {
+                    pid: Some(1),
+                    limit: Some(1),
+                    ..ProcessQuery::default()
+                }
+            } else {
+                ProcessQuery {
+                    limit: Some(1),
+                    ..ProcessQuery::default()
+                }
+            };
+            let list = collector.collect_processes(&query);
+            assert_eq!(list.meta.collected_at_ms, wall_ms);
+            assert_eq!(list.processes.len(), 1);
+            assert_eq!(list.processes[0].pid, 1);
+            if index == 3 {
+                assert_eq!(list.anomaly_count, 2);
+                assert!(!list.anomalies_truncated);
+                assert_eq!(list.omitted_anomaly_count, 0);
+                assert!(list.anomalies.iter().all(|anomaly| anomaly.pid == 2));
+                assert!(list
+                    .anomalies
+                    .iter()
+                    .any(|anomaly| anomaly.kind == "memory_leak_pattern"));
+                assert!(list
+                    .anomalies
+                    .iter()
+                    .any(|anomaly| anomaly.kind == "cpu_busy_loop"));
+            }
+        }
+        assert!(collector.process_anomaly_states[&2]
+            .memory_growth
+            .is_some_and(|state| state.sample_count == 4));
+        assert!(collector.process_anomaly_states[&2]
+            .cpu_busy
+            .is_some_and(|state| state.sample_count == 3));
+
+        wall_clock.set(25);
+        monotonic_clock.set(130_000);
+        write_process_fixture(
+            &proc_root,
+            2,
+            &process_stat(2, "target", 12_000, 0, 200, 10),
+            0,
+            Some(220_000),
+        );
+        let target = collector.collect_processes(&ProcessQuery {
+            pid: Some(2),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(target.meta.collected_at_ms, 25);
+        assert_eq!(target.processes.len(), 1);
+        assert_eq!(target.processes[0].pid, 2);
+        assert!(target
+            .anomalies
+            .iter()
+            .any(|anomaly| { anomaly.pid == 2 && anomaly.kind == "memory_leak_pattern" }));
+        assert!(target
+            .anomalies
+            .iter()
+            .any(|anomaly| anomaly.pid == 2 && anomaly.kind == "cpu_busy_loop"));
+
+        fs::remove_dir_all(proc_root.join("2")).expect("remove exited process fixture");
+        monotonic_clock.set(160_000);
+        collector.collect_processes(&ProcessQuery::default());
+        assert!(!collector.process_anomaly_states.contains_key(&2));
+    }
+
+    #[test]
+    fn legacy_process_anomaly_json_defaults_evidence() {
+        let anomaly: ProcessAnomaly = serde_json::from_value(serde_json::json!({
+            "pid": 9,
+            "kind": "zombie_process",
+            "message": "legacy",
+            "score": 1.0
+        }))
+        .expect("legacy anomaly");
+        assert_eq!(anomaly.evidence, None);
     }
 
     #[test]

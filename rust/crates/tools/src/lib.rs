@@ -1389,7 +1389,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_process_list",
-            description: "List OS processes with PID, name, state, sampled CPU and memory usage, cumulative CPU time, RSS, uptime, user, filters, anomaly markers, and optional unauthorized-process baseline comparison.",
+            description: "List OS processes with PID, name, state, sampled CPU and memory usage, cumulative CPU time, RSS, uptime, user, filters, and structured zombie, sustained RSS-growth, sustained high-CPU, or unauthorized-process anomaly markers.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -11096,6 +11096,13 @@ printf 'pwsh:%s' "$1"
                 .unwrap_or_else(|| panic!("missing tool spec {name}"));
             assert_eq!(spec.required_permission, PermissionMode::ReadOnly);
         }
+        let process_spec = specs
+            .iter()
+            .find(|spec| spec.name == "os_process_list")
+            .expect("process tool spec");
+        assert!(process_spec.description.contains("zombie"));
+        assert!(process_spec.description.contains("sustained RSS-growth"));
+        assert!(process_spec.description.contains("sustained high-CPU"));
     }
 
     #[test]
@@ -11201,6 +11208,9 @@ printf 'pwsh:%s' "$1"
         let first: Value = serde_json::from_str(&first).expect("first JSON");
         assert_eq!(first["processes"][0]["cpu_rate_status"], "warming_up");
         assert!(first["processes"][0]["cpu_usage_percent"].is_null());
+        assert_eq!(first["anomaly_count"], 0);
+        assert_eq!(first["anomalies_truncated"], false);
+        assert_eq!(first["omitted_anomaly_count"], 0);
 
         clock.0.store(3_000, Ordering::SeqCst);
         fs::write(

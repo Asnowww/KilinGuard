@@ -354,6 +354,12 @@ pub struct ProcessList {
     pub collection_status: CollectionStatus,
     pub processes: Vec<ProcessInfo>,
     pub anomalies: Vec<ProcessAnomaly>,
+    #[serde(default)]
+    pub anomaly_count: usize,
+    #[serde(default)]
+    pub anomalies_truncated: bool,
+    #[serde(default)]
+    pub omitted_anomaly_count: usize,
     pub unauthorized: Vec<ProcessInfo>,
 }
 
@@ -391,6 +397,35 @@ pub struct ProcessAnomaly {
     pub kind: String,
     pub message: String,
     pub score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessAnomalyEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "metric", rename_all = "snake_case")]
+pub enum ProcessAnomalyEvidence {
+    ProcessState {
+        state: String,
+    },
+    MemoryRss {
+        sample_count: usize,
+        observed_duration_ms: u64,
+        initial_rss_kb: u64,
+        latest_rss_kb: u64,
+        absolute_growth_kb: u64,
+        relative_growth_percent: f64,
+        minimum_duration_ms: u64,
+        minimum_absolute_growth_kb: u64,
+        minimum_relative_growth_percent: f64,
+    },
+    CpuUsage {
+        sample_count: usize,
+        observed_duration_ms: u64,
+        minimum_usage_percent: f64,
+        latest_usage_percent: f64,
+        minimum_duration_ms: u64,
+        threshold_percent: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -26,9 +26,9 @@ pub use model::{
     CpuCoreSnapshot, CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
     FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogPattern,
     LogQueryResult, MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
-    NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessInfo,
-    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
-    TemperatureReading, ThermalSnapshot,
+    NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo,
+    ProcessAnomalyEvidence, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
+    SensorAvailability, ServiceSnapshot, ServiceUnit, TemperatureReading, ThermalSnapshot,
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{
