@@ -1389,7 +1389,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_process_list",
-            description: "List OS processes with composable PID, parent PID, UID, user, name or command, Linux state, anomaly kind, and authorization filters, plus sampled CPU and memory usage and structured anomaly markers.",
+            description: "List OS processes with composable PID, parent PID, UID, user, name or command, Linux state, anomaly kind, and authorization filters. Authorization uses the fixed Kylin/Linux process baseline configured at runtime; allowed_names adds compatible request-local name rules. Results include sampled CPU and memory usage, bounded unauthorized summaries, and structured anomaly markers.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -11203,7 +11203,7 @@ printf 'pwsh:%s' "$1"
         .expect("process status");
         fs::write(process.join("cmdline"), b"worker\0").expect("process cmdline");
         let clock = Arc::new(ProcessClock(AtomicU64::new(1_000)));
-        let collector = os_sense::ProcfsCollector::with_process_dependencies(
+        let mut collector = os_sense::ProcfsCollector::with_process_dependencies(
             proc_root,
             sys_root,
             clock.clone(),
@@ -11215,6 +11215,17 @@ printf 'pwsh:%s' "$1"
             },
             Arc::new(UserResolver),
         );
+        collector
+            .set_process_baseline(Some(os_sense::ProcessBaseline {
+                version: os_sense::PROCESS_BASELINE_VERSION,
+                id: "tool-test".to_string(),
+                entries: vec![os_sense::ProcessBaselineEntry {
+                    name: "worker".to_string(),
+                    uid: Some(0),
+                    path: None,
+                }],
+            }))
+            .expect("process baseline");
         let mut runtime = os_sense::OsSenseRuntime::with_parts(
             collector,
             os_sense::OsSenseStore::in_memory().expect("store"),
@@ -11263,7 +11274,6 @@ printf 'pwsh:%s' "$1"
                 user: Some("root".to_string()),
                 state: Some("S".to_string()),
                 authorized: Some(true),
-                allowed_names: vec!["worker".to_string()],
                 limit: Some(1),
                 ..os_sense::ProcessQuery::default()
             },
@@ -11272,6 +11282,16 @@ printf 'pwsh:%s' "$1"
         let filtered: Value = serde_json::from_str(&filtered).expect("filtered JSON");
         assert_eq!(filtered["total"], 1);
         assert_eq!(filtered["processes"][0]["pid"], 77);
+
+        let bypass = super::run_os_process_list_with_runtime(
+            &mut runtime,
+            &os_sense::ProcessQuery {
+                allowed_names: vec!["worker".to_string()],
+                ..os_sense::ProcessQuery::default()
+            },
+        )
+        .expect_err("tool cannot override configured baseline");
+        assert!(bypass.contains("allowed_names cannot be used"));
 
         let invalid = super::run_os_process_list_with_runtime(
             &mut runtime,

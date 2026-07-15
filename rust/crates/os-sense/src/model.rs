@@ -364,6 +364,15 @@ pub struct ProcessList {
     pub indeterminate_filter_count: usize,
     #[serde(default = "default_filter_complete")]
     pub filter_complete: bool,
+    #[serde(default)]
+    pub authorization_indeterminate_count: usize,
+    #[serde(default)]
+    pub unauthorized_total: usize,
+    #[serde(default)]
+    pub unauthorized_truncated: bool,
+    #[serde(default)]
+    pub omitted_unauthorized_count: usize,
+    #[serde(default)]
     pub unauthorized: Vec<ProcessInfo>,
 }
 
@@ -395,8 +404,28 @@ pub struct ProcessInfo {
     pub virtual_memory_kb: Option<u64>,
     pub uptime_seconds: Option<f64>,
     pub command: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
     pub anomalies: Vec<ProcessAnomaly>,
     pub authorized: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBaseline {
+    pub version: u32,
+    pub id: String,
+    pub entries: Vec<ProcessBaselineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBaselineEntry {
+    pub name: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,6 +462,13 @@ pub enum ProcessAnomalyEvidence {
         latest_usage_percent: f64,
         minimum_duration_ms: u64,
         threshold_percent: f64,
+    },
+    Authorization {
+        baseline_id: String,
+        baseline_version: u32,
+        name: String,
+        uid: Option<u32>,
+        executable_path: Option<String>,
     },
 }
 

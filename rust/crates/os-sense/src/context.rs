@@ -265,7 +265,7 @@ fn build_health_summary(
             "processes: {} listed, {} anomalies, {} unauthorized",
             processes.total,
             processes.anomalies.len(),
-            processes.unauthorized.len()
+            processes.unauthorized_total
         ));
     }
     if let Some(logs) = logs {

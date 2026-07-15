@@ -1,16 +1,22 @@
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::context::{build_alert_context, collect_context_with, ContextRequest};
-use crate::error::Result;
+use crate::error::{OsSenseError, Result};
 use crate::model::{
     ActiveAlert, ActiveAlertDimension, ActiveAlertSnapshot, AlertContext, CollectionMode,
-    CorruptSampleDetail, MetricSnapshot, OsContext, ProcessList, ResourceDimension,
+    CorruptSampleDetail, MetricSnapshot, OsContext, ProcessBaseline, ProcessList,
+    ResourceDimension,
 };
-use crate::procfs::{now_ms, MetricsThresholds, ProcessQuery, ProcfsCollector};
+use crate::procfs::{
+    now_ms, MetricsThresholds, ProcessQuery, ProcfsCollector, MAX_PROCESS_BASELINE_JSON_BYTES,
+    OS_PROCESS_BASELINE_FILE_ENV,
+};
 use crate::scheduler::{CollectionScheduler, SchedulerConfig};
 use crate::storage::OsSenseStore;
 
@@ -334,11 +340,14 @@ impl OsSenseRuntime {
     }
 
     pub fn with_parts(
-        collector: ProcfsCollector,
+        mut collector: ProcfsCollector,
         store: OsSenseStore,
         config: OsSenseRuntimeConfig,
         start_ms: u64,
     ) -> Result<Self> {
+        if let Some(baseline) = load_process_baseline_from_environment()? {
+            collector.set_process_baseline(Some(baseline))?;
+        }
         store.delete_metrics_before(start_ms.saturating_sub(RETENTION_MS))?;
         config.thresholds.validate()?;
         let scheduler = CollectionScheduler::new(config.scheduler.clone(), start_ms)?;
@@ -463,6 +472,120 @@ impl OsSenseRuntime {
     }
 }
 
+fn load_process_baseline_from_environment() -> Result<Option<ProcessBaseline>> {
+    let Some(path) = std::env::var_os(OS_PROCESS_BASELINE_FILE_ENV) else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Err(OsSenseError::Configuration(format!(
+            "{OS_PROCESS_BASELINE_FILE_ENV} must name a baseline JSON file"
+        )));
+    }
+    load_process_baseline_file(Path::new(&path)).map(Some)
+}
+
+fn load_process_baseline_file(path: &Path) -> Result<ProcessBaseline> {
+    validate_process_baseline_file_path(path)?;
+    let mut file = open_process_baseline_file(path)?;
+    let mut bytes = Vec::with_capacity(MAX_PROCESS_BASELINE_JSON_BYTES.min(8 * 1_024));
+    file.by_ref()
+        .take((MAX_PROCESS_BASELINE_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            OsSenseError::Configuration(format!(
+                "failed to read process baseline file {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_PROCESS_BASELINE_JSON_BYTES {
+        return Err(OsSenseError::Configuration(format!(
+            "process baseline file {} exceeds {MAX_PROCESS_BASELINE_JSON_BYTES} bytes",
+            path.display()
+        )));
+    }
+    ProcessBaseline::from_json_bytes(&bytes).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "invalid process baseline file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn validate_process_baseline_file_path(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let valid = path.to_str().is_some_and(|path| {
+        path.starts_with('/')
+            && !path.contains('\0')
+            && !path.split('/').any(|component| component == "..")
+    });
+    #[cfg(not(unix))]
+    let valid = path.is_absolute();
+    if !valid {
+        return Err(OsSenseError::Configuration(format!(
+            "process baseline file path {} must be an absolute Linux path without '..'",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_process_baseline_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            OsSenseError::Configuration(format!(
+                "failed to securely open process baseline file {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to inspect process baseline file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(OsSenseError::Configuration(format!(
+            "process baseline file {} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(OsSenseError::Configuration(format!(
+            "process baseline file {} must not be group- or world-writable",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_process_baseline_file(path: &Path) -> Result<File> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to inspect process baseline file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(OsSenseError::Configuration(format!(
+            "process baseline file {} must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    OpenOptions::new().read(true).open(path).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to securely open process baseline file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 #[must_use]
 pub fn default_database_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CLAW_OS_SENSE_DB").filter(|value| !value.is_empty()) {
@@ -492,13 +615,27 @@ pub fn current_time_ms() -> u64 {
 mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::error::OsSenseError;
     use crate::model::Alert;
     use crate::procfs::{Clock, PartitionUsageProvider};
 
     use super::*;
+
+    static PROCESS_BASELINE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvironmentGuard(Option<std::ffi::OsString>);
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var(OS_PROCESS_BASELINE_FILE_ENV, value);
+            } else {
+                std::env::remove_var(OS_PROCESS_BASELINE_FILE_ENV);
+            }
+        }
+    }
 
     struct ManualClock(AtomicU64);
 
@@ -577,6 +714,111 @@ mod tests {
             .expect("thermal temp");
 
         ProcfsCollector::with_dependencies(proc_root, sys_root, clock, partition_usage)
+    }
+
+    #[test]
+    fn runtime_loads_process_baseline_file_once_and_fails_closed() {
+        let _lock = PROCESS_BASELINE_ENV_LOCK.lock().expect("baseline env lock");
+        let _guard = EnvironmentGuard(std::env::var_os(OS_PROCESS_BASELINE_FILE_ENV));
+        let root = tempfile::tempdir().expect("tempdir");
+        let baseline_path = root.path().join("process-baseline.json");
+        fs::write(
+            &baseline_path,
+            r#"{"version":1,"id":"runtime","entries":[{"name":"worker","uid":42}]}"#,
+        )
+        .expect("baseline file");
+        std::env::set_var(OS_PROCESS_BASELINE_FILE_ENV, &baseline_path);
+
+        let clock = Arc::new(ManualClock::new(1_000));
+        let collector = fixture_collector(root.path(), clock);
+        let proc_root = root.path().join("proc");
+        let process_root = proc_root.join("7");
+        fs::create_dir_all(&process_root).expect("process fixture");
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime");
+        fs::write(
+            process_root.join("stat"),
+            "7 (worker) S 1 2 3 4 5 0 0 0 0 0 1 0 0 0 20 0 1 0 10 409600 1 0 0\n",
+        )
+        .expect("process stat");
+        fs::write(
+            process_root.join("status"),
+            "Name:\tworker\nUid:\t42\t42\t42\t42\nVmRSS:\t10 kB\n",
+        )
+        .expect("process status");
+        fs::write(process_root.join("cmdline"), b"worker\0").expect("process cmdline");
+        let mut runtime = OsSenseRuntime::with_parts(
+            collector,
+            OsSenseStore::in_memory().expect("store"),
+            OsSenseRuntimeConfig::default(),
+            1_000,
+        )
+        .expect("runtime with baseline");
+        fs::remove_file(&baseline_path).expect("remove baseline after initialization");
+        std::env::remove_var(OS_PROCESS_BASELINE_FILE_ENV);
+
+        let context_error = runtime
+            .collect_context_on_demand(&ContextRequest {
+                include_metrics: Some(false),
+                include_processes: Some(true),
+                include_logs: Some(false),
+                include_network: Some(false),
+                include_services: Some(false),
+                process_allowed_names: vec!["worker".to_string()],
+                ..ContextRequest::default()
+            })
+            .expect_err("context cannot override configured baseline");
+        assert!(matches!(context_error, OsSenseError::Configuration(_)));
+        let list = runtime
+            .collect_processes(&ProcessQuery::default())
+            .expect("process collection");
+        assert_eq!(list.processes[0].authorized, Some(true));
+
+        fs::write(
+            &baseline_path,
+            r#"{"version":99,"id":"secret-content","entries":[]}"#,
+        )
+        .expect("invalid baseline");
+        let error = load_process_baseline_file(&baseline_path).expect_err("bad version");
+        assert!(matches!(error, OsSenseError::Configuration(_)));
+        assert!(error
+            .to_string()
+            .contains(&baseline_path.display().to_string()));
+        assert!(!error.to_string().contains("secret-content"));
+    }
+
+    #[test]
+    fn process_baseline_loader_rejects_relative_and_non_regular_files() {
+        assert!(matches!(
+            load_process_baseline_file(Path::new("relative-baseline.json")),
+            Err(OsSenseError::Configuration(_))
+        ));
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            load_process_baseline_file(root.path()),
+            Err(OsSenseError::Configuration(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            let baseline = root.path().join("baseline.json");
+            fs::write(&baseline, r#"{"version":1,"id":"secure","entries":[]}"#).expect("baseline");
+            fs::set_permissions(&baseline, fs::Permissions::from_mode(0o600))
+                .expect("secure permissions");
+            let link = root.path().join("baseline-link.json");
+            symlink(&baseline, &link).expect("baseline symlink");
+            assert!(matches!(
+                load_process_baseline_file(&link),
+                Err(OsSenseError::Configuration(_))
+            ));
+            fs::set_permissions(&baseline, fs::Permissions::from_mode(0o666))
+                .expect("writable permissions");
+            assert!(matches!(
+                load_process_baseline_file(&baseline),
+                Err(OsSenseError::Configuration(_))
+            ));
+        }
     }
 
     struct TogglePartitionUsage {

@@ -13,8 +13,8 @@ use crate::model::{
     CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot, FanReading,
     HwmonSensorReading, LoadAverage, LoongArchInfo, MemorySnapshot, MetricSnapshot,
     NetworkInterfaceSnapshot, NetworkMetricsSnapshot, OsSampleMeta, PlatformInfo, ProcessAnomaly,
-    ProcessAnomalyEvidence, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
-    SensorAvailability, TemperatureReading, ThermalSnapshot,
+    ProcessAnomalyEvidence, ProcessBaseline, ProcessInfo, ProcessList, RateStatus,
+    ResourceDimension, SensorAvailability, TemperatureReading, ThermalSnapshot,
 };
 use crate::redaction::redact_sensitive_text;
 
@@ -32,6 +32,7 @@ const NEGATIVE_USER_CACHE_TTL_MS: u64 = 30 * 1_000;
 const MAX_PROCESS_USER_CACHE_ENTRIES: usize = 4_096;
 const MAX_NSS_LOOKUPS_PER_COLLECTION: usize = 16;
 const MAX_PROCESS_LIST_ANOMALIES: usize = 128;
+const MAX_UNAUTHORIZED_PROCESS_SUMMARY: usize = 128;
 const PROCESS_ANOMALY_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
 const MAX_PROCESS_ANOMALY_STATES: usize = 32_768;
 const PROCESS_PATTERN_MIN_SAMPLES: usize = 3;
@@ -41,8 +42,15 @@ const MEMORY_LEAK_MIN_RELATIVE_GROWTH_PERCENT: f64 = 20.0;
 const CPU_BUSY_LOOP_MIN_DURATION_MS: u64 = 60_000;
 const CPU_BUSY_LOOP_MIN_USAGE_PERCENT: f64 = 90.0;
 const MAX_CMDLINE_CHARS: usize = 256;
+const MAX_EXECUTABLE_PATH_BYTES: usize = 4_096;
 const MAX_HWMON_SENSORS: usize = 128;
 const DISK_SECTOR_BYTES: u64 = 512;
+pub const PROCESS_BASELINE_VERSION: u32 = 1;
+pub const MAX_PROCESS_BASELINE_ENTRIES: usize = 200;
+pub const MAX_PROCESS_BASELINE_JSON_BYTES: usize = 64 * 1_024;
+pub const OS_PROCESS_BASELINE_FILE_ENV: &str = "CLAW_OS_PROCESS_BASELINE_FILE";
+const MAX_PROCESS_BASELINE_ID_CHARS: usize = 64;
+const MAX_PROCESS_BASELINE_NAME_CHARS: usize = 128;
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -152,6 +160,18 @@ struct ProcessReadOutcome {
     warnings: Vec<String>,
 }
 
+struct EffectiveProcessBaseline<'a> {
+    configured: Option<&'a ProcessBaseline>,
+    legacy_names: &'a BTreeSet<String>,
+}
+
+enum ProcessAuthorizationDecision {
+    Inactive,
+    Authorized,
+    Unauthorized,
+    Indeterminate(String),
+}
+
 enum ProcessFilterDecision {
     Matches,
     DoesNotMatch,
@@ -166,6 +186,7 @@ struct ProcessCandidate {
 trait ProcessFileReader: Send + Sync {
     fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +199,10 @@ impl ProcessFileReader for SystemProcessFileReader {
 
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         fs::read(path)
+    }
+
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        fs::read_link(path)
     }
 }
 
@@ -345,6 +370,73 @@ impl MetricsThresholds {
     }
 }
 
+impl ProcessBaseline {
+    pub fn from_json_bytes(value: &[u8]) -> Result<Self> {
+        if value.len() > MAX_PROCESS_BASELINE_JSON_BYTES {
+            return Err(OsSenseError::Configuration(format!(
+                "process baseline JSON must not exceed {MAX_PROCESS_BASELINE_JSON_BYTES} bytes"
+            )));
+        }
+        let baseline = serde_json::from_slice::<Self>(value).map_err(|error| {
+            OsSenseError::Configuration(format!("invalid process baseline JSON: {error}"))
+        })?;
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != PROCESS_BASELINE_VERSION {
+            return Err(OsSenseError::Configuration(format!(
+                "unsupported process baseline version {}; expected {PROCESS_BASELINE_VERSION}",
+                self.version
+            )));
+        }
+        if self.id.trim().is_empty()
+            || self.id.chars().count() > MAX_PROCESS_BASELINE_ID_CHARS
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(OsSenseError::Configuration(format!(
+                "process baseline id must contain 1 to {MAX_PROCESS_BASELINE_ID_CHARS} ASCII letters, digits, '.', '_', or '-'"
+            )));
+        }
+        if self.entries.len() > MAX_PROCESS_BASELINE_ENTRIES {
+            return Err(OsSenseError::Configuration(format!(
+                "process baseline must not contain more than {MAX_PROCESS_BASELINE_ENTRIES} entries"
+            )));
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.name.trim().is_empty()
+                || !entry.name.is_ascii()
+                || entry.name.contains('\0')
+                || entry.name.chars().count() > MAX_PROCESS_BASELINE_NAME_CHARS
+            {
+                return Err(OsSenseError::Configuration(format!(
+                    "process baseline entries[{index}].name must contain 1 to {MAX_PROCESS_BASELINE_NAME_CHARS} ASCII characters without NUL"
+                )));
+            }
+            if let Some(path) = &entry.path {
+                if !is_valid_absolute_linux_path(path) {
+                    return Err(OsSenseError::Configuration(format!(
+                        "process baseline entries[{index}].path must be an absolute Linux path without '..' or NUL and at most {MAX_EXECUTABLE_PATH_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            OsSenseError::Configuration(format!("failed to encode process baseline: {error}"))
+        })?;
+        if encoded.len() > MAX_PROCESS_BASELINE_JSON_BYTES {
+            return Err(OsSenseError::Configuration(format!(
+                "process baseline JSON must not exceed {MAX_PROCESS_BASELINE_JSON_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProcessQuery {
@@ -362,6 +454,10 @@ pub struct ProcessQuery {
 
 impl ProcessQuery {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_collection(false)
+    }
+
+    fn validate_for_collection(&self, configured_baseline_active: bool) -> Result<()> {
         for (name, value, max_chars) in [
             ("name_contains", self.name_contains.as_deref(), 128),
             ("user", self.user.as_deref(), 64),
@@ -397,9 +493,17 @@ impl ProcessQuery {
                 )));
             }
         }
-        if self.authorized.is_some() && self.allowed_names.is_empty() {
+        if configured_baseline_active && !self.allowed_names.is_empty() {
             return Err(OsSenseError::Configuration(
-                "process query authorized requires a non-empty allowed_names baseline".to_string(),
+                "process query allowed_names cannot be used when a configured process baseline is active"
+                    .to_string(),
+            ));
+        }
+        if self.authorized.is_some() && self.allowed_names.is_empty() && !configured_baseline_active
+        {
+            return Err(OsSenseError::Configuration(
+                "process query authorized requires a configured process baseline or non-empty allowed_names baseline"
+                    .to_string(),
             ));
         }
         if let Some(state) = &self.state {
@@ -455,6 +559,7 @@ pub struct ProcfsCollector {
     process_user_resolver: Arc<dyn ProcessUserResolver>,
     process_user_cache: BTreeMap<u32, CachedUserResolution>,
     process_file_reader: Arc<dyn ProcessFileReader>,
+    process_baseline: Option<ProcessBaseline>,
 }
 
 impl Default for ProcfsCollector {
@@ -478,6 +583,7 @@ impl Default for ProcfsCollector {
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
+            process_baseline: None,
         }
     }
 }
@@ -504,6 +610,7 @@ impl ProcfsCollector {
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
+            process_baseline: None,
         }
     }
 
@@ -533,6 +640,7 @@ impl ProcfsCollector {
             process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
+            process_baseline: None,
         }
     }
 
@@ -563,7 +671,16 @@ impl ProcfsCollector {
             process_user_resolver,
             process_user_cache: BTreeMap::new(),
             process_file_reader: Arc::new(SystemProcessFileReader),
+            process_baseline: None,
         }
+    }
+
+    pub fn set_process_baseline(&mut self, baseline: Option<ProcessBaseline>) -> Result<()> {
+        if let Some(baseline) = &baseline {
+            baseline.validate()?;
+        }
+        self.process_baseline = baseline;
+        Ok(())
     }
 
     pub fn collect_metrics(&mut self, thresholds: &MetricsThresholds) -> MetricSnapshot {
@@ -900,7 +1017,7 @@ impl ProcfsCollector {
     }
 
     pub fn collect_processes(&mut self, query: &ProcessQuery) -> Result<ProcessList> {
-        query.validate()?;
+        query.validate_for_collection(self.process_baseline.is_some())?;
         Ok(self.collect_processes_unchecked(query))
     }
 
@@ -995,16 +1112,24 @@ impl ProcfsCollector {
                 None
             }
         };
-        let allowed = query
+        let configured_baseline = self.process_baseline.clone();
+        let legacy_allowed_names = query
             .allowed_names
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
+        let effective_baseline = EffectiveProcessBaseline {
+            configured: configured_baseline.as_ref(),
+            legacy_names: &legacy_allowed_names,
+        };
 
         let mut candidates = BTreeMap::new();
         let mut bounded_anomalies = BTreeMap::new();
+        let mut bounded_unauthorized = BTreeMap::new();
         let mut total = 0usize;
         let mut anomaly_count = 0usize;
+        let mut unauthorized_total = 0usize;
+        let mut authorization_indeterminate_count = 0usize;
         let mut partial_process_count = 0usize;
         let mut indeterminate_filter_count = 0usize;
         let mut remaining_nss_lookups = MAX_NSS_LOOKUPS_PER_COLLECTION;
@@ -1035,7 +1160,7 @@ impl ProcfsCollector {
                     else {
                         continue;
                     };
-                    match self.read_process(pid, uptime, &allowed) {
+                    match self.read_process(pid, uptime) {
                         Ok(outcome) => {
                             let ProcessReadOutcome {
                                 mut process,
@@ -1078,6 +1203,40 @@ impl ProcfsCollector {
                                 .memory_rss_kb
                                 .zip(total_memory_kb)
                                 .map(|(rss, total)| round2((rss as f64 / total as f64) * 100.0));
+                            match evaluate_process_authorization(
+                                self.process_file_reader.as_ref(),
+                                &self.proc_root,
+                                &mut process,
+                                status_available,
+                                &effective_baseline,
+                                self.process_system_parameters,
+                            ) {
+                                ProcessAuthorizationDecision::Inactive => {}
+                                ProcessAuthorizationDecision::Authorized => {
+                                    process.authorized = Some(true);
+                                }
+                                ProcessAuthorizationDecision::Unauthorized => {
+                                    process.authorized = Some(false);
+                                    process.anomalies.push(unauthorized_process_anomaly(
+                                        &process,
+                                        &effective_baseline,
+                                    ));
+                                }
+                                ProcessAuthorizationDecision::Indeterminate(reason) => {
+                                    process.authorized = None;
+                                    filter_incomplete = true;
+                                    authorization_indeterminate_count =
+                                        authorization_indeterminate_count.saturating_add(1);
+                                    push_process_warning(
+                                        &mut warnings,
+                                        &mut omitted_warning_count,
+                                        format!(
+                                            "authorization for process {} is indeterminate; {reason}",
+                                            process.pid
+                                        ),
+                                    );
+                                }
+                            }
                             match process_matches_without_user(
                                 &process,
                                 query,
@@ -1149,8 +1308,10 @@ impl ProcfsCollector {
                             record_process_candidate(
                                 &mut candidates,
                                 &mut bounded_anomalies,
+                                &mut bounded_unauthorized,
                                 &mut total,
                                 &mut anomaly_count,
+                                &mut unauthorized_total,
                                 &mut partial_process_count,
                                 &mut warnings,
                                 &mut omitted_warning_count,
@@ -1158,6 +1319,7 @@ impl ProcfsCollector {
                                 candidate_warnings,
                                 MAX_PROCESS_LIMIT,
                                 MAX_PROCESS_LIST_ANOMALIES,
+                                MAX_UNAUTHORIZED_PROCESS_SUMMARY,
                             );
                         }
                         Err(ProcessReadFailure::Exited) => {
@@ -1250,17 +1412,16 @@ impl ProcfsCollector {
             .into_iter()
             .map(|(_, candidate)| candidate.process)
             .collect::<Vec<_>>();
-        let unauthorized = processes
-            .iter()
-            .filter(|process| process.authorized == Some(false))
-            .cloned()
-            .collect::<Vec<_>>();
+        let unauthorized = bounded_unauthorized.into_values().collect::<Vec<_>>();
+        let omitted_unauthorized_count = unauthorized_total.saturating_sub(unauthorized.len());
+        let unauthorized_truncated = omitted_unauthorized_count > 0;
         let collection_status = if scan_failed {
             CollectionStatus::Failed
         } else if source_partial
             || failed_process_count > 0
             || partial_process_count > 0
             || indeterminate_filter_count > 0
+            || authorization_indeterminate_count > 0
             || exited_during_scan_count > 0
         {
             CollectionStatus::Partial
@@ -1292,7 +1453,12 @@ impl ProcfsCollector {
                 && !scan_failed
                 && failed_process_count == 0
                 && exited_during_scan_count == 0
-                && indeterminate_filter_count == 0,
+                && indeterminate_filter_count == 0
+                && authorization_indeterminate_count == 0,
+            authorization_indeterminate_count,
+            unauthorized_total,
+            unauthorized_truncated,
+            omitted_unauthorized_count,
             unauthorized,
         }
     }
@@ -1301,7 +1467,6 @@ impl ProcfsCollector {
         &self,
         pid: u32,
         uptime: Option<f64>,
-        allowed: &BTreeSet<String>,
     ) -> std::result::Result<ProcessReadOutcome, ProcessReadFailure> {
         let proc_dir = self.proc_root.join(pid.to_string());
         let stat = self
@@ -1356,21 +1521,6 @@ impl ProcfsCollector {
                 false
             }
         };
-        if !allowed.is_empty() {
-            info.authorized = Some(allowed.contains(&info.name.to_ascii_lowercase()));
-            if info.authorized == Some(false) {
-                info.anomalies.push(ProcessAnomaly {
-                    pid,
-                    kind: "unauthorized_process".to_string(),
-                    message: format!(
-                        "process `{}` is not present in the provided baseline",
-                        info.name
-                    ),
-                    score: 0.8,
-                    evidence: None,
-                });
-            }
-        }
         Ok(ProcessReadOutcome {
             process: info,
             sampled_at_ms,
@@ -2356,6 +2506,7 @@ fn parse_process_stat(
         virtual_memory_kb,
         uptime_seconds,
         command: None,
+        executable_path: None,
         anomalies: Vec::new(),
         authorized: None,
     })
@@ -2708,8 +2859,10 @@ fn retain_process_anomaly_states_for_scan(
 fn record_process_candidate(
     candidates: &mut BTreeMap<u32, ProcessCandidate>,
     bounded_anomalies: &mut BTreeMap<(u32, usize), ProcessAnomaly>,
+    bounded_unauthorized: &mut BTreeMap<u32, ProcessInfo>,
     total: &mut usize,
     anomaly_count: &mut usize,
+    unauthorized_total: &mut usize,
     partial_process_count: &mut usize,
     warnings: &mut Vec<String>,
     omitted_warning_count: &mut usize,
@@ -2717,6 +2870,7 @@ fn record_process_candidate(
     process_warnings: Vec<String>,
     max_candidates: usize,
     max_anomalies: usize,
+    max_unauthorized: usize,
 ) {
     *total = total.saturating_add(1);
     let partial = !process_warnings.is_empty();
@@ -2736,6 +2890,13 @@ fn record_process_candidate(
             bounded_anomalies.remove(&key);
         }
     }
+    if process.authorized == Some(false) {
+        *unauthorized_total = unauthorized_total.saturating_add(1);
+        let mut summary = process.clone();
+        summary.command = None;
+        bounded_unauthorized.insert(process.pid, summary);
+        truncate_processes_by_pid(bounded_unauthorized, max_unauthorized);
+    }
     candidates.insert(process.pid, ProcessCandidate { process, partial });
     truncate_process_candidates(candidates, max_candidates);
 }
@@ -2749,6 +2910,15 @@ fn truncate_process_candidates(
             break;
         };
         candidates.remove(&pid);
+    }
+}
+
+fn truncate_processes_by_pid(processes: &mut BTreeMap<u32, ProcessInfo>, max_processes: usize) {
+    while processes.len() > max_processes {
+        let Some(pid) = processes.keys().next_back().copied() else {
+            break;
+        };
+        processes.remove(&pid);
     }
 }
 
@@ -2812,14 +2982,14 @@ fn process_matches_without_user(
             return ProcessFilterDecision::DoesNotMatch;
         }
     }
-    if query
-        .authorized
-        .is_some_and(|authorized| process.authorized != Some(authorized))
-    {
-        return ProcessFilterDecision::DoesNotMatch;
-    }
-
     let mut indeterminate_reason = None;
+    if let Some(authorized) = query.authorized {
+        match process.authorized {
+            Some(actual) if actual == authorized => {}
+            Some(_) => return ProcessFilterDecision::DoesNotMatch,
+            None => indeterminate_reason = Some("process authorization is unavailable"),
+        }
+    }
     if let Some(uid) = query.uid {
         if !status_available || process.uid.is_none() {
             indeterminate_reason = Some("process status or UID is unavailable");
@@ -2846,6 +3016,164 @@ fn process_matches_without_user(
         ProcessFilterDecision::Matches,
         ProcessFilterDecision::Indeterminate,
     )
+}
+
+fn evaluate_process_authorization(
+    reader: &dyn ProcessFileReader,
+    proc_root: &Path,
+    process: &mut ProcessInfo,
+    status_available: bool,
+    baseline: &EffectiveProcessBaseline<'_>,
+    system: ProcessSystemParameters,
+) -> ProcessAuthorizationDecision {
+    if baseline.configured.is_none() && baseline.legacy_names.is_empty() {
+        return ProcessAuthorizationDecision::Inactive;
+    }
+    if baseline
+        .legacy_names
+        .contains(&process.name.to_ascii_lowercase())
+    {
+        return ProcessAuthorizationDecision::Authorized;
+    }
+
+    let Some(configured) = baseline.configured else {
+        return ProcessAuthorizationDecision::Unauthorized;
+    };
+    let mut uid_indeterminate = false;
+    let mut expected_paths = Vec::new();
+    for entry in &configured.entries {
+        if !entry.name.eq_ignore_ascii_case(&process.name) {
+            continue;
+        }
+        if let Some(expected_uid) = entry.uid {
+            if !status_available || process.uid.is_none() {
+                uid_indeterminate = true;
+                continue;
+            }
+            if process.uid != Some(expected_uid) {
+                continue;
+            }
+        }
+        if let Some(path) = &entry.path {
+            expected_paths.push(path.as_str());
+        } else {
+            return ProcessAuthorizationDecision::Authorized;
+        }
+    }
+
+    if expected_paths.is_empty() {
+        return if uid_indeterminate {
+            ProcessAuthorizationDecision::Indeterminate(
+                "a matching baseline entry requires an unavailable UID".to_string(),
+            )
+        } else {
+            ProcessAuthorizationDecision::Unauthorized
+        };
+    }
+
+    match read_process_executable_path(reader, proc_root, process, system) {
+        Ok(path) => {
+            process.executable_path = Some(path.clone());
+            if expected_paths.iter().any(|expected| *expected == path) {
+                ProcessAuthorizationDecision::Authorized
+            } else if uid_indeterminate {
+                ProcessAuthorizationDecision::Indeterminate(
+                    "a matching baseline entry requires an unavailable UID".to_string(),
+                )
+            } else {
+                ProcessAuthorizationDecision::Unauthorized
+            }
+        }
+        Err(reason) => ProcessAuthorizationDecision::Indeterminate(reason),
+    }
+}
+
+fn read_process_executable_path(
+    reader: &dyn ProcessFileReader,
+    proc_root: &Path,
+    process: &ProcessInfo,
+    system: ProcessSystemParameters,
+) -> std::result::Result<String, String> {
+    let process_root = proc_root.join(process.pid.to_string());
+    let executable = process_root.join("exe");
+    let first_target = read_executable_target(reader, &executable)?;
+    let stat = reader
+        .read_to_string(&process_root.join("stat"))
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "the process exited while its executable identity was being verified".to_string()
+            } else {
+                format!("/proc/<pid>/stat could not be re-read: {error}")
+            }
+        })?;
+    let identity = parse_process_stat(process.pid, &stat, None, system)
+        .map_err(|error| format!("/proc/<pid>/stat identity could not be verified: {error}"))?;
+    if identity.start_time_jiffies != process.start_time_jiffies || identity.name != process.name {
+        return Err("process identity changed while /proc/<pid>/exe was being read".to_string());
+    }
+    let second_target = read_executable_target(reader, &executable)?;
+    if first_target != second_target {
+        return Err("process executable target changed during identity verification".to_string());
+    }
+    Ok(first_target)
+}
+
+fn read_executable_target(
+    reader: &dyn ProcessFileReader,
+    executable: &Path,
+) -> std::result::Result<String, String> {
+    let target = reader.read_link(executable).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "the process exited before /proc/<pid>/exe could be read".to_string()
+        } else {
+            format!("/proc/<pid>/exe could not be read: {error}")
+        }
+    })?;
+    let target = target
+        .to_str()
+        .ok_or_else(|| "/proc/<pid>/exe is not valid UTF-8".to_string())?;
+    if target.ends_with(" (deleted)") {
+        return Err("/proc/<pid>/exe refers to a deleted executable".to_string());
+    }
+    if !is_valid_absolute_linux_path(target) {
+        return Err(format!(
+            "/proc/<pid>/exe is not a valid absolute Linux path of at most {MAX_EXECUTABLE_PATH_BYTES} bytes"
+        ));
+    }
+    Ok(target.to_string())
+}
+
+fn unauthorized_process_anomaly(
+    process: &ProcessInfo,
+    baseline: &EffectiveProcessBaseline<'_>,
+) -> ProcessAnomaly {
+    let (baseline_id, baseline_version) = baseline.configured.map_or(
+        ("query.allowed_names", PROCESS_BASELINE_VERSION),
+        |baseline| (baseline.id.as_str(), baseline.version),
+    );
+    ProcessAnomaly {
+        pid: process.pid,
+        kind: "unauthorized_process".to_string(),
+        message: format!(
+            "process `{}` does not match active baseline `{baseline_id}` version {baseline_version}",
+            process.name
+        ),
+        score: 0.8,
+        evidence: Some(ProcessAnomalyEvidence::Authorization {
+            baseline_id: baseline_id.to_string(),
+            baseline_version,
+            name: process.name.clone(),
+            uid: process.uid,
+            executable_path: process.executable_path.clone(),
+        }),
+    }
+}
+
+fn is_valid_absolute_linux_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains('\0')
+        && path.as_bytes().len() <= MAX_EXECUTABLE_PATH_BYTES
+        && !path.split('/').any(|component| component == "..")
 }
 
 fn normalized_linux_process_state(value: &str) -> Option<char> {
@@ -2918,6 +3246,8 @@ fn path_exists(path: &Path) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    use crate::model::ProcessBaselineEntry;
 
     use super::*;
 
@@ -3156,6 +3486,10 @@ mod tests {
         fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             fs::read(path)
         }
+
+        fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+            fs::read_link(path)
+        }
     }
 
     struct CmdlineFailureReader;
@@ -3173,6 +3507,75 @@ mod tests {
                 ));
             }
             fs::read(path)
+        }
+
+        fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+            fs::read_link(path)
+        }
+    }
+
+    #[derive(Clone)]
+    enum ExecutablePathFixture {
+        Path(&'static str),
+        Error(std::io::ErrorKind),
+    }
+
+    struct ExecutablePathReader {
+        fixtures: BTreeMap<u32, Vec<ExecutablePathFixture>>,
+        stat_after_first_link: BTreeMap<u32, String>,
+        calls: Mutex<Vec<u32>>,
+    }
+
+    impl ProcessFileReader for ExecutablePathReader {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            if path.file_name().and_then(|name| name.to_str()) == Some("stat") {
+                let pid = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<u32>().ok());
+                if let Some(stat) = pid.and_then(|pid| {
+                    self.calls
+                        .lock()
+                        .expect("executable calls")
+                        .contains(&pid)
+                        .then(|| self.stat_after_first_link.get(&pid))
+                        .flatten()
+                }) {
+                    return Ok(stat.clone());
+                }
+            }
+            fs::read_to_string(path)
+        }
+
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            fs::read(path)
+        }
+
+        fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+            let pid = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u32>().ok())
+                .expect("fixture executable PID");
+            let mut calls = self.calls.lock().expect("executable calls");
+            let index = calls.iter().filter(|called| **called == pid).count();
+            calls.push(pid);
+            let fixture = self
+                .fixtures
+                .get(&pid)
+                .and_then(|fixtures| fixtures.get(index).or_else(|| fixtures.last()));
+            match fixture {
+                Some(ExecutablePathFixture::Path(path)) => Ok(PathBuf::from(path)),
+                Some(ExecutablePathFixture::Error(kind)) => {
+                    Err(std::io::Error::new(*kind, "fixture executable failure"))
+                }
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing executable fixture",
+                )),
+            }
         }
     }
 
@@ -3240,6 +3643,7 @@ mod tests {
             virtual_memory_kb: None,
             uptime_seconds: None,
             command: None,
+            executable_path: None,
             anomalies: Vec::new(),
             authorized: None,
         }
@@ -4328,6 +4732,318 @@ mod tests {
     }
 
     #[test]
+    fn process_baseline_validation_is_versioned_strict_and_bounded() {
+        let valid = ProcessBaseline::from_json_bytes(
+            br#"{"version":1,"id":"kylin-prod","entries":[{"name":"worker","uid":42,"path":"/usr/bin/worker"}]}"#,
+        )
+        .expect("valid baseline");
+        assert_eq!(valid.entries.len(), 1);
+        ProcessBaseline {
+            version: PROCESS_BASELINE_VERSION,
+            id: "deny-all".to_string(),
+            entries: Vec::new(),
+        }
+        .validate()
+        .expect("explicit empty baseline");
+
+        for value in [
+            br#"{"version":2,"id":"bad-version","entries":[]}"#.as_slice(),
+            br#"{"version":1,"id":"unknown","entries":[],"extra":true}"#.as_slice(),
+            br#"{"version":1,"id":"relative","entries":[{"name":"worker","path":"usr/bin/worker"}]}"#.as_slice(),
+            br#"{"version":1,"id":"parent","entries":[{"name":"worker","path":"/usr/../bin/worker"}]}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                ProcessBaseline::from_json_bytes(value),
+                Err(OsSenseError::Configuration(_))
+            ));
+        }
+        let too_many = ProcessBaseline {
+            version: PROCESS_BASELINE_VERSION,
+            id: "too-many".to_string(),
+            entries: vec![
+                ProcessBaselineEntry {
+                    name: "worker".to_string(),
+                    uid: None,
+                    path: None,
+                };
+                MAX_PROCESS_BASELINE_ENTRIES + 1
+            ],
+        };
+        assert!(too_many.validate().is_err());
+        assert!(
+            ProcessBaseline::from_json_bytes(&vec![b' '; MAX_PROCESS_BASELINE_JSON_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn structured_baseline_matches_and_rejects_legacy_override() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let mut collector = process_collector(
+            root.path(),
+            Arc::new(ManualClock::new(1_000)),
+            ProcessSystemParameters::default(),
+            Arc::new(FixtureUserResolver {
+                responses: BTreeMap::new(),
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        for (pid, name, uid) in [
+            (1, "Worker", 100),
+            (2, "Worker", 101),
+            (3, "Worker", 100),
+            (4, "helper", 200),
+            (5, "legacy", 300),
+        ] {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, name, 1, 0, pid as u64, 1),
+                uid,
+                None,
+            );
+        }
+        let reader = Arc::new(ExecutablePathReader {
+            fixtures: BTreeMap::from([
+                (1, vec![ExecutablePathFixture::Path("/usr/bin/worker")]),
+                (3, vec![ExecutablePathFixture::Path("/opt/worker")]),
+            ]),
+            stat_after_first_link: BTreeMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        collector.process_file_reader = reader.clone();
+
+        let without_baseline = collector.collect_processes_for_test(&ProcessQuery::default());
+        assert!(without_baseline
+            .processes
+            .iter()
+            .all(|process| process.authorized.is_none()));
+        assert_eq!(without_baseline.unauthorized_total, 0);
+        let legacy = collector.collect_processes_for_test(&ProcessQuery {
+            allowed_names: vec!["legacy".to_string()],
+            ..ProcessQuery::default()
+        });
+        assert_eq!(legacy.processes[4].authorized, Some(true));
+
+        collector
+            .set_process_baseline(Some(ProcessBaseline {
+                version: PROCESS_BASELINE_VERSION,
+                id: "kylin-prod".to_string(),
+                entries: vec![
+                    ProcessBaselineEntry {
+                        name: "worker".to_string(),
+                        uid: Some(100),
+                        path: Some("/usr/bin/worker".to_string()),
+                    },
+                    ProcessBaselineEntry {
+                        name: "helper".to_string(),
+                        uid: Some(200),
+                        path: None,
+                    },
+                ],
+            }))
+            .expect("configured baseline");
+        assert!(matches!(
+            collector.collect_processes(&ProcessQuery {
+                allowed_names: vec!["legacy".to_string()],
+                ..ProcessQuery::default()
+            }),
+            Err(OsSenseError::Configuration(_))
+        ));
+        let list = collector.collect_processes_for_test(&ProcessQuery::default());
+
+        assert_eq!(
+            list.processes
+                .iter()
+                .map(|process| (process.pid, process.authorized))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some(true)),
+                (2, Some(false)),
+                (3, Some(false)),
+                (4, Some(true)),
+                (5, Some(false)),
+            ]
+        );
+        assert_eq!(
+            list.processes[0].executable_path.as_deref(),
+            Some("/usr/bin/worker")
+        );
+        assert_eq!(list.unauthorized_total, 3);
+        assert_eq!(
+            list.unauthorized
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 5]
+        );
+        assert!(list
+            .unauthorized
+            .iter()
+            .all(|process| process.command.is_none()));
+        assert_eq!(
+            reader.calls.lock().expect("executable calls").as_slice(),
+            &[1, 1, 3, 3]
+        );
+        assert!(matches!(
+            list.unauthorized[0]
+                .anomalies
+                .iter()
+                .find(|anomaly| anomaly.kind == "unauthorized_process")
+                .and_then(|anomaly| anomaly.evidence.as_ref()),
+            Some(ProcessAnomalyEvidence::Authorization {
+                baseline_id,
+                baseline_version: PROCESS_BASELINE_VERSION,
+                name,
+                uid: Some(101),
+                executable_path: None,
+            }) if baseline_id == "kylin-prod" && name == "Worker"
+        ));
+        collector
+            .set_process_baseline(Some(ProcessBaseline {
+                version: PROCESS_BASELINE_VERSION,
+                id: "deny-all".to_string(),
+                entries: Vec::new(),
+            }))
+            .expect("empty configured baseline");
+        assert!(matches!(
+            collector.collect_processes(&ProcessQuery {
+                allowed_names: vec!["worker".to_string()],
+                ..ProcessQuery::default()
+            }),
+            Err(OsSenseError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn authorization_failures_are_indeterminate_and_summary_is_hard_bounded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let mut collector = process_collector(
+            root.path(),
+            Arc::new(ManualClock::new(1_000)),
+            ProcessSystemParameters::default(),
+            Arc::new(FixtureUserResolver {
+                responses: BTreeMap::new(),
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        for pid in 1..=6 {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 1, 0, pid as u64, 1),
+                42,
+                None,
+            );
+        }
+        fs::write(proc_root.join("3/status"), "Name:\tworker\n").expect("missing UID status");
+        collector.process_file_reader = Arc::new(ExecutablePathReader {
+            fixtures: BTreeMap::from([
+                (
+                    1,
+                    vec![ExecutablePathFixture::Error(
+                        std::io::ErrorKind::PermissionDenied,
+                    )],
+                ),
+                (
+                    2,
+                    vec![ExecutablePathFixture::Error(std::io::ErrorKind::NotFound)],
+                ),
+                (
+                    4,
+                    vec![ExecutablePathFixture::Path("/usr/bin/worker (deleted)")],
+                ),
+                (5, vec![ExecutablePathFixture::Path("/usr/bin/worker")]),
+                (
+                    6,
+                    vec![
+                        ExecutablePathFixture::Path("/usr/bin/worker"),
+                        ExecutablePathFixture::Path("/opt/worker"),
+                    ],
+                ),
+            ]),
+            stat_after_first_link: BTreeMap::from([(5, process_stat(5, "worker", 1, 0, 999, 1))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        collector
+            .set_process_baseline(Some(ProcessBaseline {
+                version: PROCESS_BASELINE_VERSION,
+                id: "strict".to_string(),
+                entries: vec![ProcessBaselineEntry {
+                    name: "worker".to_string(),
+                    uid: Some(42),
+                    path: Some("/usr/bin/worker".to_string()),
+                }],
+            }))
+            .expect("strict baseline");
+        let indeterminate = collector.collect_processes_for_test(&ProcessQuery {
+            authorized: Some(false),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(indeterminate.authorization_indeterminate_count, 6);
+        assert_eq!(indeterminate.indeterminate_filter_count, 6);
+        assert_eq!(indeterminate.unauthorized_total, 0);
+        assert!(!indeterminate.filter_complete);
+        assert_eq!(indeterminate.collection_status, CollectionStatus::Partial);
+
+        let large_root = tempfile::tempdir().expect("large tempdir");
+        let large_proc = large_root.path().join("proc");
+        let mut large = process_collector(
+            large_root.path(),
+            Arc::new(ManualClock::new(1_000)),
+            ProcessSystemParameters::default(),
+            Arc::new(LocalFixtureUserResolver {
+                local: BTreeMap::from([(0, "root".to_string())]),
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        for pid in 1..=140 {
+            write_process_fixture(
+                &large_proc,
+                pid,
+                &process_stat(pid, "worker", 1, 0, pid as u64, 1),
+                0,
+                None,
+            );
+        }
+        large
+            .set_process_baseline(Some(ProcessBaseline {
+                version: PROCESS_BASELINE_VERSION,
+                id: "deny-all".to_string(),
+                entries: Vec::new(),
+            }))
+            .expect("deny-all baseline");
+        let bounded = large.collect_processes_for_test(&ProcessQuery {
+            limit: Some(1),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(bounded.processes.len(), 1);
+        assert_eq!(bounded.unauthorized_total, 140);
+        assert_eq!(bounded.unauthorized.len(), MAX_UNAUTHORIZED_PROCESS_SUMMARY);
+        assert!(bounded.unauthorized_truncated);
+        assert_eq!(bounded.omitted_unauthorized_count, 12);
+        assert_eq!(
+            bounded.unauthorized.first().map(|process| process.pid),
+            Some(1)
+        );
+        assert_eq!(
+            bounded.unauthorized.last().map(|process| process.pid),
+            Some(128)
+        );
+        let filtered = large.collect_processes_for_test(&ProcessQuery {
+            pid: Some(140),
+            user: Some("root".to_string()),
+            limit: Some(1),
+            ..ProcessQuery::default()
+        });
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.unauthorized_total, 1);
+        assert_eq!(filtered.unauthorized[0].pid, 140);
+    }
+
+    #[test]
     fn local_and_cached_user_hits_do_not_consume_nss_budget() {
         let root = tempfile::tempdir().expect("tempdir");
         let clock = Arc::new(ManualClock::new(1_000));
@@ -4517,6 +5233,7 @@ mod tests {
         assert_eq!(process.cpu_rate_status, None);
         assert_eq!(process.memory_percent, None);
         assert_eq!(process.uid, None);
+        assert_eq!(process.executable_path, None);
 
         let list: ProcessList = serde_json::from_value(serde_json::json!({
             "meta": basic_meta("procfs", Vec::new()),
@@ -4535,6 +5252,10 @@ mod tests {
         assert!(!list.anomalies_truncated);
         assert_eq!(list.omitted_anomaly_count, 0);
         assert_eq!(list.indeterminate_filter_count, 0);
+        assert_eq!(list.authorization_indeterminate_count, 0);
+        assert_eq!(list.unauthorized_total, 0);
+        assert!(!list.unauthorized_truncated);
+        assert_eq!(list.omitted_unauthorized_count, 0);
         assert!(list.filter_complete);
         assert!(!list.scan_failed);
         assert_eq!(list.collection_status, CollectionStatus::Partial);
@@ -4568,6 +5289,7 @@ mod tests {
             virtual_memory_kb: None,
             uptime_seconds: None,
             command: None,
+            executable_path: None,
             anomalies: Vec::new(),
             authorized: Some(false),
         };
@@ -4791,8 +5513,10 @@ mod tests {
     fn process_scan_buffers_and_states_enforce_small_caps_after_each_insert() {
         let mut candidates = BTreeMap::new();
         let mut anomalies = BTreeMap::new();
+        let mut unauthorized = BTreeMap::new();
         let mut total = 0;
         let mut anomaly_count = 0;
+        let mut unauthorized_total = 0;
         let mut partial_process_count = 0;
         let mut warnings = Vec::new();
         let mut omitted_warning_count = 0;
@@ -4815,14 +5539,17 @@ mod tests {
             record_process_candidate(
                 &mut candidates,
                 &mut anomalies,
+                &mut unauthorized,
                 &mut total,
                 &mut anomaly_count,
+                &mut unauthorized_total,
                 &mut partial_process_count,
                 &mut warnings,
                 &mut omitted_warning_count,
                 process,
                 Vec::new(),
                 3,
+                2,
                 2,
             );
             assert!(candidates.len() <= 3);
