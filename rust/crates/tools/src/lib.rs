@@ -1419,10 +1419,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "maxItems": 4,
                         "items": { "type": "string", "enum": ["journalctl", "journal", "syslog", "dmesg", "auth", "auth.log"] }
                     },
-                    "keyword": { "type": "string", "maxLength": 128 },
-                    "since": { "type": "string", "maxLength": 64 },
-                    "until": { "type": "string", "maxLength": 64 },
-                    "severity": { "type": "string", "enum": ["emergency", "emerg", "alert", "critical", "crit", "error", "err", "warning", "warn", "notice", "info", "debug"] },
+                    "keyword": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "since": { "type": "string", "format": "date-time", "maxLength": 64 },
+                    "until": { "type": "string", "format": "date-time", "maxLength": 64 },
+                    "severity": {
+                        "type": "string",
+                        "description": "Accepts canonical syslog severities and listed aliases; includes the selected level and all more severe levels.",
+                        "enum": ["emergency", "emerg", "alert", "critical", "crit", "error", "err", "warning", "warn", "notice", "info", "debug"]
+                    },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
                     "summarize": { "type": "boolean" }
                 },
@@ -11146,6 +11150,38 @@ printf 'pwsh:%s' "$1"
                 "auth.log"
             ])
         );
+        assert_eq!(
+            log_spec.input_schema["properties"]["keyword"]["minLength"],
+            1
+        );
+        assert_eq!(
+            log_spec.input_schema["properties"]["keyword"]["maxLength"],
+            128
+        );
+        for field in ["since", "until"] {
+            assert_eq!(
+                log_spec.input_schema["properties"][field]["format"],
+                "date-time"
+            );
+            assert_eq!(log_spec.input_schema["properties"][field]["maxLength"], 64);
+        }
+        assert_eq!(
+            log_spec.input_schema["properties"]["severity"]["enum"],
+            json!([
+                "emergency",
+                "emerg",
+                "alert",
+                "critical",
+                "crit",
+                "error",
+                "err",
+                "warning",
+                "warn",
+                "notice",
+                "info",
+                "debug"
+            ])
+        );
     }
 
     #[test]
@@ -11156,6 +11192,13 @@ printf 'pwsh:%s' "$1"
         })
         .expect_err("unknown source must fail");
         assert!(error.contains("unsupported log source"));
+
+        let error = super::run_os_log_query(os_sense::LogQuery {
+            since: Some("2026-07-15T12:00:00".to_string()),
+            ..os_sense::LogQuery::default()
+        })
+        .expect_err("timestamp without an offset must fail");
+        assert!(error.contains("RFC3339"));
     }
 
     #[test]

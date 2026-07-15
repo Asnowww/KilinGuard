@@ -482,6 +482,10 @@ pub struct LogQueryResult {
     pub source_statuses: Vec<LogSourceStatus>,
     #[serde(default)]
     pub omitted_warning_count: usize,
+    #[serde(default)]
+    pub indeterminate_filter_count: usize,
+    #[serde(default = "default_filter_complete")]
+    pub filter_complete: bool,
     pub entries: Vec<LogEntry>,
     pub patterns: Vec<LogPattern>,
     pub summary: Option<LogSummary>,
@@ -496,6 +500,10 @@ pub struct LogSourceStatus {
     pub error: Option<String>,
     /// Number of bounded entries collected from this source before query filters.
     pub entry_count: usize,
+    #[serde(default)]
+    pub matched_entry_count: usize,
+    #[serde(default)]
+    pub indeterminate_filter_count: usize,
     pub truncated: bool,
 }
 

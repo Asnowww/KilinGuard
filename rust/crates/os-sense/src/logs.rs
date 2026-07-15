@@ -2,8 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{
+    DateTime, Datelike, FixedOffset, Local, LocalResult, NaiveDateTime, SecondsFormat, TimeZone,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::command::{run_limited_command, LimitedCommandOutput};
@@ -23,6 +26,7 @@ const MAX_LOG_RAW_LINE_BYTES: usize = 4 * 1024;
 const MAX_LOG_WARNINGS: usize = 32;
 const MAX_LOG_ERROR_CHARS: usize = 256;
 const MAX_LOG_SOURCES: usize = 4;
+const MAX_SYSLOG_TIMESTAMP_DISTANCE_MS: u64 = 183 * 24 * 60 * 60 * 1_000;
 const SYSLOG_PATHS: [&str; 2] = ["/var/log/messages", "/var/log/syslog"];
 const AUTH_LOG_PATHS: [&str; 2] = ["/var/log/secure", "/var/log/auth.log"];
 
@@ -60,27 +64,6 @@ impl LogQuery {
             )));
         }
         normalize_sources(&self.sources)?;
-        for (name, value, max_chars) in [
-            ("keyword", self.keyword.as_deref(), 128),
-            ("since", self.since.as_deref(), 64),
-            ("until", self.until.as_deref(), 64),
-        ] {
-            if let Some(value) = value {
-                if value.contains('\0') || value.chars().count() > max_chars {
-                    return Err(OsSenseError::Configuration(format!(
-                        "log query {name} must not contain NUL or exceed {max_chars} characters"
-                    )));
-                }
-            }
-        }
-        if let Some(severity) = &self.severity {
-            if priority_for_severity(severity).is_none() {
-                return Err(OsSenseError::Configuration(format!(
-                    "unsupported log severity `{}`",
-                    bounded_error(severity)
-                )));
-            }
-        }
         if let Some(limit) = self.limit {
             if !(1..=MAX_LOG_LIMIT).contains(&limit) {
                 return Err(OsSenseError::Configuration(format!(
@@ -88,8 +71,93 @@ impl LogQuery {
                 )));
             }
         }
+        ValidatedLogFilter::from_query(self)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedLogFilter {
+    keyword_ascii_lower: Option<String>,
+    since: Option<DateTime<FixedOffset>>,
+    until: Option<DateTime<FixedOffset>>,
+    maximum_severity_rank: Option<u8>,
+}
+
+impl ValidatedLogFilter {
+    fn from_query(query: &LogQuery) -> Result<Self> {
+        let keyword_ascii_lower = match query.keyword.as_deref() {
+            Some(keyword) => {
+                validate_nonblank_bounded("keyword", keyword, 128)?;
+                Some(keyword.trim().to_ascii_lowercase())
+            }
+            None => None,
+        };
+        let since = parse_query_timestamp("since", query.since.as_deref())?;
+        let until = parse_query_timestamp("until", query.until.as_deref())?;
+        if since
+            .as_ref()
+            .zip(until.as_ref())
+            .is_some_and(|(since, until)| since > until)
+        {
+            return Err(OsSenseError::Configuration(
+                "log query since must not be later than until".to_string(),
+            ));
+        }
+        let maximum_severity_rank = match query.severity.as_deref() {
+            Some(severity) => {
+                validate_nonblank_bounded("severity", severity, 16)?;
+                Some(
+                    priority_for_severity(severity)
+                        .map(severity_rank)
+                        .ok_or_else(|| {
+                            OsSenseError::Configuration(format!(
+                                "unsupported log severity `{}`",
+                                bounded_error(severity)
+                            ))
+                        })?,
+                )
+            }
+            None => None,
+        };
+        Ok(Self {
+            keyword_ascii_lower,
+            since,
+            until,
+            maximum_severity_rank,
+        })
+    }
+
+    fn has_time_range(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+}
+
+struct FilteredLogEntries {
+    entries: Vec<LogEntry>,
+    indeterminate_count: usize,
+}
+
+fn validate_nonblank_bounded(name: &str, value: &str, max_chars: usize) -> Result<()> {
+    if value.trim().is_empty() || value.contains('\0') || value.chars().count() > max_chars {
+        return Err(OsSenseError::Configuration(format!(
+            "log query {name} must be nonblank, contain no NUL, and not exceed {max_chars} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_query_timestamp(name: &str, value: Option<&str>) -> Result<Option<DateTime<FixedOffset>>> {
+    value
+        .map(|value| {
+            validate_nonblank_bounded(name, value, 64)?;
+            DateTime::parse_from_rfc3339(value).map_err(|_| {
+                OsSenseError::Configuration(format!(
+                    "log query {name} must be an RFC3339 timestamp with an explicit offset"
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -122,6 +190,43 @@ struct SourceCollection {
 struct TailBytes {
     bytes: Vec<u8>,
     truncated: bool,
+}
+
+enum LocalTimestampResolution {
+    Single(DateTime<FixedOffset>),
+    Ambiguous,
+    Nonexistent,
+}
+
+trait LogTimeZone {
+    fn collection_year(&self, collected_at_ms: i64) -> Option<i32>;
+    fn resolve_local(&self, local: &NaiveDateTime) -> LocalTimestampResolution;
+}
+
+struct SystemLogTimeZone;
+
+impl LogTimeZone for SystemLogTimeZone {
+    fn collection_year(&self, collected_at_ms: i64) -> Option<i32> {
+        Local
+            .timestamp_millis_opt(collected_at_ms)
+            .single()
+            .map(|timestamp| timestamp.year())
+    }
+
+    fn resolve_local(&self, local: &NaiveDateTime) -> LocalTimestampResolution {
+        match Local.from_local_datetime(local) {
+            LocalResult::Single(timestamp) => {
+                LocalTimestampResolution::Single(timestamp.fixed_offset())
+            }
+            LocalResult::Ambiguous(_, _) => LocalTimestampResolution::Ambiguous,
+            LocalResult::None => LocalTimestampResolution::Nonexistent,
+        }
+    }
+}
+
+struct LogTimestampContext<'a> {
+    collected_at_ms: i64,
+    timezone: &'a dyn LogTimeZone,
 }
 
 trait LogCommandRunner {
@@ -172,24 +277,88 @@ fn query_logs_with(
     command_runner: &dyn LogCommandRunner,
     file_reader: &dyn LogFileReader,
 ) -> Result<LogQueryResult> {
+    query_logs_with_at(query, command_runner, file_reader, current_unix_time_ms())
+}
+
+fn query_logs_with_at(
+    query: &LogQuery,
+    command_runner: &dyn LogCommandRunner,
+    file_reader: &dyn LogFileReader,
+    collected_at_ms: i64,
+) -> Result<LogQueryResult> {
+    query_logs_with_at_and_timezone(
+        query,
+        command_runner,
+        file_reader,
+        collected_at_ms,
+        &SystemLogTimeZone,
+    )
+}
+
+fn query_logs_with_at_and_timezone(
+    query: &LogQuery,
+    command_runner: &dyn LogCommandRunner,
+    file_reader: &dyn LogFileReader,
+    collected_at_ms: i64,
+    timezone: &dyn LogTimeZone,
+) -> Result<LogQueryResult> {
     query.validate()?;
+    let filter = ValidatedLogFilter::from_query(query)?;
     let sources = normalize_sources(&query.sources)?;
+    let timestamp_context = LogTimestampContext {
+        collected_at_ms,
+        timezone,
+    };
     let limit = effective_log_limit(query.limit);
     let mut warnings = Vec::new();
     let mut omitted_warning_count = 0usize;
+    let mut indeterminate_filter_count = 0usize;
     let mut entries_by_source = Vec::with_capacity(sources.len());
     let mut source_statuses = Vec::with_capacity(sources.len());
     for source in sources {
-        let collected = match source {
-            LogicalLogSource::Journalctl => read_journalctl(query, command_runner),
-            LogicalLogSource::Syslog => read_log_files(source, &SYSLOG_PATHS, query, file_reader),
-            LogicalLogSource::Dmesg => read_dmesg(query, command_runner),
-            LogicalLogSource::Auth => read_log_files(source, &AUTH_LOG_PATHS, query, file_reader),
+        let mut collected = match source {
+            LogicalLogSource::Journalctl => {
+                read_journalctl(query, command_runner, &timestamp_context)
+            }
+            LogicalLogSource::Syslog => read_log_files(
+                source,
+                &SYSLOG_PATHS,
+                query,
+                file_reader,
+                &timestamp_context,
+            ),
+            LogicalLogSource::Dmesg => read_dmesg(query, command_runner, &timestamp_context),
+            LogicalLogSource::Auth => read_log_files(
+                source,
+                &AUTH_LOG_PATHS,
+                query,
+                file_reader,
+                &timestamp_context,
+            ),
         };
         for warning in collected.warnings {
             push_log_warning(&mut warnings, &mut omitted_warning_count, warning);
         }
-        entries_by_source.push(filter_entries(collected.entries, query));
+        let filtered = filter_entries(collected.entries, &filter);
+        collected.status.matched_entry_count = filtered.entries.len();
+        collected.status.indeterminate_filter_count = filtered.indeterminate_count;
+        indeterminate_filter_count =
+            indeterminate_filter_count.saturating_add(filtered.indeterminate_count);
+        if filtered.indeterminate_count > 0 {
+            if collected.status.status == CollectionStatus::Complete {
+                collected.status.status = CollectionStatus::Partial;
+            }
+            push_log_warning(
+                &mut warnings,
+                &mut omitted_warning_count,
+                format!(
+                    "{} omitted {} entries because active filters could not be evaluated",
+                    source.name(),
+                    filtered.indeterminate_count
+                ),
+            );
+        }
+        entries_by_source.push(filtered.entries);
         source_statuses.push(collected.status);
     }
 
@@ -224,6 +393,8 @@ fn query_logs_with(
         collection_status,
         source_statuses,
         omitted_warning_count,
+        indeterminate_filter_count,
+        filter_complete: indeterminate_filter_count == 0,
         entries,
         patterns,
         summary,
@@ -283,7 +454,11 @@ fn normalize_sources(sources: &[String]) -> Result<Vec<LogicalLogSource>> {
     Ok(normalized)
 }
 
-fn read_journalctl(query: &LogQuery, runner: &dyn LogCommandRunner) -> SourceCollection {
+fn read_journalctl(
+    query: &LogQuery,
+    runner: &dyn LogCommandRunner,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> SourceCollection {
     let limit = effective_log_limit(query.limit);
     let requested_limit = limit.saturating_add(1).to_string();
     let mut args = vec![
@@ -311,10 +486,15 @@ fn read_journalctl(query: &LogQuery, runner: &dyn LogCommandRunner) -> SourceCol
         args,
         runner,
         limit,
+        timestamp_context,
     )
 }
 
-fn read_dmesg(query: &LogQuery, runner: &dyn LogCommandRunner) -> SourceCollection {
+fn read_dmesg(
+    query: &LogQuery,
+    runner: &dyn LogCommandRunner,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> SourceCollection {
     let mut args = vec!["--time-format".to_string(), "iso".to_string()];
     if let Some(priority) = query.severity.as_deref().and_then(dmesg_level_for_severity) {
         args.push("--level".to_string());
@@ -326,6 +506,7 @@ fn read_dmesg(query: &LogQuery, runner: &dyn LogCommandRunner) -> SourceCollecti
         args,
         runner,
         effective_log_limit(query.limit),
+        timestamp_context,
     )
 }
 
@@ -334,13 +515,18 @@ fn read_log_files(
     paths: &[&str],
     query: &LogQuery,
     reader: &dyn LogFileReader,
+    timestamp_context: &LogTimestampContext<'_>,
 ) -> SourceCollection {
     let mut failures = Vec::new();
     for path in paths {
         match reader.read_tail(Path::new(path), MAX_LOG_FILE_BYTES) {
             Ok(tail) => {
-                let (entries, line_truncated) =
-                    parse_log_bytes(path, &tail.bytes, effective_log_limit(query.limit));
+                let (entries, line_truncated) = parse_log_bytes(
+                    path,
+                    &tail.bytes,
+                    effective_log_limit(query.limit),
+                    timestamp_context,
+                );
                 let truncated = tail.truncated || line_truncated;
                 let mut warnings = failures;
                 if truncated {
@@ -358,6 +544,8 @@ fn read_log_files(
                         },
                         error: None,
                         entry_count: entries.len(),
+                        matched_entry_count: 0,
+                        indeterminate_filter_count: 0,
                         truncated,
                     },
                     entries,
@@ -379,6 +567,8 @@ fn read_log_files(
             status: CollectionStatus::Failed,
             error: Some(error.clone()),
             entry_count: 0,
+            matched_entry_count: 0,
+            indeterminate_filter_count: 0,
             truncated: false,
         },
         entries: Vec::new(),
@@ -392,6 +582,7 @@ fn read_command_source(
     args: Vec<String>,
     runner: &dyn LogCommandRunner,
     limit: usize,
+    timestamp_context: &LogTimestampContext<'_>,
 ) -> SourceCollection {
     match runner.run(
         program,
@@ -402,7 +593,7 @@ fn read_command_source(
     ) {
         Ok(output) if output.success && !output.timed_out => {
             let (entries, line_truncated) =
-                parse_log_bytes(program, output.stdout.as_bytes(), limit);
+                parse_log_bytes(program, output.stdout.as_bytes(), limit, timestamp_context);
             let truncated = output.stdout_truncated || output.stderr_truncated || line_truncated;
             let warnings = truncated
                 .then(|| format!("{program} output was bounded or truncated"))
@@ -420,6 +611,8 @@ fn read_command_source(
                     },
                     error: None,
                     entry_count: entries.len(),
+                    matched_entry_count: 0,
+                    indeterminate_filter_count: 0,
                     truncated,
                 },
                 entries,
@@ -440,6 +633,8 @@ fn read_command_source(
                     status: CollectionStatus::Failed,
                     error: Some(error.clone()),
                     entry_count: 0,
+                    matched_entry_count: 0,
+                    indeterminate_filter_count: 0,
                     truncated: output.stdout_truncated || output.stderr_truncated,
                 },
                 entries: Vec::new(),
@@ -459,6 +654,8 @@ fn read_command_source(
                     status: CollectionStatus::Failed,
                     error: Some(error.clone()),
                     entry_count: 0,
+                    matched_entry_count: 0,
+                    indeterminate_filter_count: 0,
                     truncated: false,
                 },
                 entries: Vec::new(),
@@ -468,7 +665,12 @@ fn read_command_source(
     }
 }
 
-fn parse_log_bytes(source: &str, bytes: &[u8], limit: usize) -> (Vec<LogEntry>, bool) {
+fn parse_log_bytes(
+    source: &str,
+    bytes: &[u8],
+    limit: usize,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> (Vec<LogEntry>, bool) {
     let mut entries = VecDeque::with_capacity(limit.min(bytes.len()));
     let mut truncated = false;
     for line in bytes
@@ -482,7 +684,11 @@ fn parse_log_bytes(source: &str, bytes: &[u8], limit: usize) -> (Vec<LogEntry>, 
             line
         };
         let line = String::from_utf8_lossy(bounded);
-        entries.push_back(parse_log_line(source, &line));
+        entries.push_back(parse_log_line_with_context(
+            source,
+            &line,
+            timestamp_context,
+        ));
         if entries.len() > limit {
             entries.pop_front();
             truncated = true;
@@ -508,9 +714,25 @@ fn redact_log_text(value: &str, max_chars: usize) -> String {
     redact_sensitive_text(value, max_chars.saturating_sub(TRUNCATION_MARKER_CHARS))
 }
 
+#[cfg(test)]
 fn parse_log_line(source: &str, line: &str) -> LogEntry {
+    parse_log_line_with_context(
+        source,
+        line,
+        &LogTimestampContext {
+            collected_at_ms: current_unix_time_ms(),
+            timezone: &SystemLogTimeZone,
+        },
+    )
+}
+
+fn parse_log_line_with_context(
+    source: &str,
+    line: &str,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> LogEntry {
     let severity = infer_severity(line);
-    let timestamp = infer_timestamp(source, line);
+    let timestamp = infer_timestamp(source, line, timestamp_context);
     LogEntry {
         source: source.to_string(),
         timestamp,
@@ -520,31 +742,72 @@ fn parse_log_line(source: &str, line: &str) -> LogEntry {
     }
 }
 
-fn filter_entries(entries: Vec<LogEntry>, query: &LogQuery) -> Vec<LogEntry> {
-    entries
-        .into_iter()
-        .filter(|entry| {
-            if let Some(keyword) = &query.keyword {
-                if !entry
-                    .message
-                    .to_ascii_lowercase()
-                    .contains(&keyword.to_ascii_lowercase())
-                {
-                    return false;
+fn filter_entries(entries: Vec<LogEntry>, filter: &ValidatedLogFilter) -> FilteredLogEntries {
+    let mut filtered = Vec::with_capacity(entries.len());
+    let mut indeterminate_count = 0usize;
+    for entry in entries {
+        if filter
+            .keyword_ascii_lower
+            .as_ref()
+            .is_some_and(|keyword| !entry_contains_ascii_keyword(&entry, keyword))
+        {
+            continue;
+        }
+        let mut indeterminate = false;
+        if filter.has_time_range() {
+            match entry
+                .timestamp
+                .as_deref()
+                .and_then(|value| parse_iso_timestamp(value, true, true))
+            {
+                Some(timestamp) => {
+                    if filter
+                        .since
+                        .as_ref()
+                        .is_some_and(|since| &timestamp < since)
+                        || filter
+                            .until
+                            .as_ref()
+                            .is_some_and(|until| &timestamp > until)
+                    {
+                        continue;
+                    }
                 }
+                None => indeterminate = true,
             }
-            if let Some(severity) = &query.severity {
-                let wanted = severity.to_ascii_lowercase();
-                if !entry.severity.as_ref().is_some_and(|actual| {
-                    actual.eq_ignore_ascii_case(&wanted)
-                        || severity_rank(actual) <= severity_rank(&wanted)
-                }) {
-                    return false;
-                }
+        }
+        if let Some(maximum_rank) = filter.maximum_severity_rank {
+            match entry.severity.as_deref().and_then(known_severity_rank) {
+                Some(actual_rank) if actual_rank > maximum_rank => continue,
+                Some(_) => {}
+                None => indeterminate = true,
             }
-            true
-        })
-        .collect()
+        }
+        if indeterminate {
+            indeterminate_count = indeterminate_count.saturating_add(1);
+        } else {
+            filtered.push(entry);
+        }
+    }
+    FilteredLogEntries {
+        entries: filtered,
+        indeterminate_count,
+    }
+}
+
+fn entry_contains_ascii_keyword(entry: &LogEntry, keyword_ascii_lower: &str) -> bool {
+    entry
+        .message
+        .to_ascii_lowercase()
+        .contains(keyword_ascii_lower)
+        || entry
+            .unit
+            .as_deref()
+            .is_some_and(|unit| unit.to_ascii_lowercase().contains(keyword_ascii_lower))
+        || entry
+            .source
+            .to_ascii_lowercase()
+            .contains(keyword_ascii_lower)
 }
 
 fn detect_log_patterns(entries: &[LogEntry]) -> Vec<LogPattern> {
@@ -658,29 +921,117 @@ fn read_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<TailBytes> {
     Ok(TailBytes { bytes, truncated })
 }
 
-fn infer_timestamp(source: &str, line: &str) -> Option<String> {
+fn current_unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn parse_iso_timestamp(
+    value: &str,
+    allow_compact_offset: bool,
+    allow_comma_fraction: bool,
+) -> Option<DateTime<FixedOffset>> {
+    let mut normalized = value.to_string();
+    if allow_comma_fraction {
+        if let Some(comma) = normalized.find(',') {
+            normalized.replace_range(comma..=comma, ".");
+        }
+    }
+    if allow_compact_offset && normalized.len() >= 5 {
+        let offset_start = normalized.len() - 5;
+        let offset = normalized.as_bytes().get(offset_start..)?;
+        if offset
+            .first()
+            .is_some_and(|sign| matches!(*sign, b'+' | b'-'))
+            && offset[1..].iter().all(u8::is_ascii_digit)
+        {
+            normalized.insert(normalized.len() - 2, ':');
+        }
+    }
+    DateTime::parse_from_rfc3339(&normalized).ok()
+}
+
+fn infer_timestamp(
+    source: &str,
+    line: &str,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> Option<String> {
     if source == "journalctl" {
-        let timestamp = line
-            .split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
-        return (!timestamp.is_empty()).then_some(timestamp);
+        let timestamp = line.split_whitespace().next()?;
+        return parse_iso_timestamp(timestamp, true, false)
+            .map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, false));
     }
     if source == "dmesg" {
-        return line.find(']').map(|idx| {
-            line[..=idx]
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string()
-        });
+        let end = line.find(']')?;
+        let timestamp = line[..end].trim().trim_start_matches('[');
+        return parse_iso_timestamp(timestamp, true, true)
+            .map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, false));
     }
     let mut parts = line.split_whitespace();
-    let month = parts.next()?;
-    let day = parts.next()?;
+    let month = syslog_month(parts.next()?)?;
+    let day = parts.next()?.parse::<u32>().ok()?;
     let time = parts.next()?;
-    Some(format!("{month} {day} {time}"))
+    infer_syslog_timestamp(month, day, time, timestamp_context)
+}
+
+fn infer_syslog_timestamp(
+    month: u32,
+    day: u32,
+    time: &str,
+    timestamp_context: &LogTimestampContext<'_>,
+) -> Option<String> {
+    let collection_year = timestamp_context
+        .timezone
+        .collection_year(timestamp_context.collected_at_ms)?;
+    let mut candidates = Vec::with_capacity(3);
+    for year in [
+        collection_year.checked_sub(1)?,
+        collection_year,
+        collection_year.checked_add(1)?,
+    ] {
+        let Ok(local) = NaiveDateTime::parse_from_str(
+            &format!("{year:04}-{month:02}-{day:02} {time}"),
+            "%Y-%m-%d %H:%M:%S",
+        ) else {
+            continue;
+        };
+        if let LocalTimestampResolution::Single(timestamp) =
+            timestamp_context.timezone.resolve_local(&local)
+        {
+            candidates.push((
+                timestamp
+                    .timestamp_millis()
+                    .abs_diff(timestamp_context.collected_at_ms),
+                timestamp,
+            ));
+        }
+    }
+    let (distance_ms, timestamp) = candidates
+        .into_iter()
+        .min_by_key(|(distance, timestamp)| (*distance, timestamp.timestamp_millis()))?;
+    (distance_ms <= MAX_SYSLOG_TIMESTAMP_DISTANCE_MS)
+        .then(|| timestamp.to_rfc3339_opts(SecondsFormat::Secs, false))
+}
+
+fn syslog_month(value: &str) -> Option<u32> {
+    match value.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
 }
 
 fn infer_unit(line: &str) -> Option<String> {
@@ -699,6 +1050,7 @@ fn infer_severity(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     [
         ("emerg", "emergency"),
+        ("alert", "alert"),
         ("panic", "critical"),
         ("crit", "critical"),
         ("fatal", "critical"),
@@ -731,29 +1083,33 @@ fn priority_for_severity(severity: &str) -> Option<&'static str> {
 
 fn dmesg_level_for_severity(severity: &str) -> Option<&'static str> {
     match severity.to_ascii_lowercase().as_str() {
-        "emergency" | "emerg" => Some("emerg"),
-        "alert" => Some("alert"),
-        "critical" | "crit" => Some("crit"),
-        "error" | "err" => Some("err"),
-        "warning" | "warn" => Some("warn"),
-        "notice" => Some("notice"),
-        "info" => Some("info"),
-        "debug" => Some("debug"),
+        "emergency" | "emerg" => Some("emerg+"),
+        "alert" => Some("alert+"),
+        "critical" | "crit" => Some("crit+"),
+        "error" | "err" => Some("err+"),
+        "warning" | "warn" => Some("warn+"),
+        "notice" => Some("notice+"),
+        "info" => Some("info+"),
+        "debug" => Some("debug+"),
         _ => None,
     }
 }
 
 fn severity_rank(severity: &str) -> u8 {
+    known_severity_rank(severity).unwrap_or(8)
+}
+
+fn known_severity_rank(severity: &str) -> Option<u8> {
     match severity.to_ascii_lowercase().as_str() {
-        "emergency" | "emerg" => 0,
-        "alert" => 1,
-        "critical" | "crit" => 2,
-        "error" | "err" => 3,
-        "warning" | "warn" => 4,
-        "notice" => 5,
-        "info" => 6,
-        "debug" => 7,
-        _ => 8,
+        "emergency" | "emerg" => Some(0),
+        "alert" => Some(1),
+        "critical" | "crit" => Some(2),
+        "error" | "err" => Some(3),
+        "warning" | "warn" => Some(4),
+        "notice" => Some(5),
+        "info" => Some(6),
+        "debug" => Some(7),
+        _ => None,
     }
 }
 
@@ -921,6 +1277,64 @@ mod tests {
         }
     }
 
+    struct FixedLogTimeZone(FixedOffset);
+
+    impl LogTimeZone for FixedLogTimeZone {
+        fn collection_year(&self, collected_at_ms: i64) -> Option<i32> {
+            DateTime::from_timestamp_millis(collected_at_ms)
+                .map(|timestamp| timestamp.with_timezone(&self.0).year())
+        }
+
+        fn resolve_local(&self, local: &NaiveDateTime) -> LocalTimestampResolution {
+            match self.0.from_local_datetime(local) {
+                LocalResult::Single(timestamp) => LocalTimestampResolution::Single(timestamp),
+                LocalResult::Ambiguous(_, _) => LocalTimestampResolution::Ambiguous,
+                LocalResult::None => LocalTimestampResolution::Nonexistent,
+            }
+        }
+    }
+
+    enum ControlledLocalResolution {
+        Ambiguous,
+        Nonexistent,
+        OnlyYear(i32),
+    }
+
+    struct ControlledLogTimeZone {
+        collection_year: i32,
+        offset: FixedOffset,
+        resolution: ControlledLocalResolution,
+    }
+
+    impl LogTimeZone for ControlledLogTimeZone {
+        fn collection_year(&self, _collected_at_ms: i64) -> Option<i32> {
+            Some(self.collection_year)
+        }
+
+        fn resolve_local(&self, local: &NaiveDateTime) -> LocalTimestampResolution {
+            match self.resolution {
+                ControlledLocalResolution::Ambiguous => LocalTimestampResolution::Ambiguous,
+                ControlledLocalResolution::Nonexistent => LocalTimestampResolution::Nonexistent,
+                ControlledLocalResolution::OnlyYear(year) if local.year() == year => {
+                    match self.offset.from_local_datetime(local) {
+                        LocalResult::Single(timestamp) => {
+                            LocalTimestampResolution::Single(timestamp)
+                        }
+                        LocalResult::Ambiguous(_, _) => LocalTimestampResolution::Ambiguous,
+                        LocalResult::None => LocalTimestampResolution::Nonexistent,
+                    }
+                }
+                ControlledLocalResolution::OnlyYear(_) => LocalTimestampResolution::Nonexistent,
+            }
+        }
+    }
+
+    fn test_timestamp_ms(value: &str) -> i64 {
+        DateTime::parse_from_rfc3339(value)
+            .expect("test RFC3339 timestamp")
+            .timestamp_millis()
+    }
+
     #[test]
     fn infers_log_severity_and_unit() {
         let entry = parse_log_line(
@@ -963,6 +1377,418 @@ mod tests {
         let summary = summarize_logs(&entries);
         assert_eq!(summary.kind, "rule_based_llm_ready_summary");
         assert!(summary.text.contains("1 log entries"));
+    }
+
+    #[test]
+    fn validates_keyword_time_and_severity_filters_strictly() {
+        let invalid = vec![
+            LogQuery {
+                keyword: Some("   ".to_string()),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                keyword: Some("x".repeat(129)),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                since: Some("2026-07-15T12:00:00".to_string()),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                since: Some("2026-02-30T12:00:00Z".to_string()),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                since: Some("2026-07-15T12:00:01Z".to_string()),
+                until: Some("2026-07-15T12:00:00Z".to_string()),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                severity: Some(" ".to_string()),
+                ..LogQuery::default()
+            },
+            LogQuery {
+                severity: Some("verbose".to_string()),
+                ..LogQuery::default()
+            },
+        ];
+        for query in invalid {
+            assert!(matches!(
+                query.validate(),
+                Err(OsSenseError::Configuration(_))
+            ));
+        }
+        for severity in ["warning", "warn", "error", "err", "critical", "crit"] {
+            LogQuery {
+                severity: Some(severity.to_string()),
+                ..LogQuery::default()
+            }
+            .validate()
+            .expect("supported severity or alias");
+        }
+    }
+
+    #[test]
+    fn keyword_matching_is_ascii_case_insensitive_across_controlled_fields() {
+        let cases = [
+            (
+                "needle",
+                LogEntry {
+                    source: "journalctl".to_string(),
+                    timestamp: None,
+                    severity: None,
+                    unit: None,
+                    message: "contains NEEDLE in message".to_string(),
+                },
+            ),
+            (
+                "sshd.service",
+                LogEntry {
+                    source: "journalctl".to_string(),
+                    timestamp: None,
+                    severity: None,
+                    unit: Some("SSHD.Service".to_string()),
+                    message: "unit match".to_string(),
+                },
+            ),
+            (
+                "AUTH.LOG",
+                LogEntry {
+                    source: "/var/log/auth.log".to_string(),
+                    timestamp: None,
+                    severity: None,
+                    unit: None,
+                    message: "source match".to_string(),
+                },
+            ),
+        ];
+        for (keyword, entry) in cases {
+            let filter = ValidatedLogFilter::from_query(&LogQuery {
+                keyword: Some(keyword.to_string()),
+                ..LogQuery::default()
+            })
+            .expect("keyword filter");
+            let result = filter_entries(vec![entry], &filter);
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.indeterminate_count, 0);
+        }
+    }
+
+    #[test]
+    fn rfc3339_time_filter_handles_offsets_and_inclusive_boundaries() {
+        assert_eq!(
+            DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000000001+02:00")
+                .expect("offset timestamp"),
+            DateTime::parse_from_rfc3339("2025-12-31T22:00:00.000000001Z").expect("UTC timestamp")
+        );
+        let filter = ValidatedLogFilter::from_query(&LogQuery {
+            since: Some("2026-01-01T00:00:00+02:00".to_string()),
+            until: Some("2025-12-31T22:00:01Z".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("cross-timezone range");
+        let entries = [
+            Some("2025-12-31T21:59:59Z"),
+            Some("2025-12-31T22:00:00Z"),
+            Some("2025-12-31T22:00:01Z"),
+            Some("2025-12-31T22:00:02Z"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, timestamp)| LogEntry {
+            source: "journalctl".to_string(),
+            timestamp: timestamp.map(str::to_string),
+            severity: Some("info".to_string()),
+            unit: None,
+            message: format!("event {index}"),
+        })
+        .collect::<Vec<_>>();
+
+        let result = filter_entries(entries, &filter);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["event 1", "event 2"]
+        );
+        assert_eq!(result.indeterminate_count, 1);
+    }
+
+    #[test]
+    fn syslog_timestamp_uses_the_collection_year() {
+        let timezone = FixedLogTimeZone(FixedOffset::east_opt(8 * 60 * 60).expect("offset"));
+        let context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2026-07-15T12:40:00+08:00"),
+            timezone: &timezone,
+        };
+        let entry = parse_log_line_with_context(
+            "/var/log/messages",
+            "Jul 15 12:34:56 host service: info",
+            &context,
+        );
+        assert_eq!(
+            entry.timestamp.as_deref(),
+            Some("2026-07-15T12:34:56+08:00")
+        );
+
+        let year_boundary_context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2026-01-01T00:00:10+08:00"),
+            timezone: &timezone,
+        };
+        let previous_year = parse_log_line_with_context(
+            "/var/log/messages",
+            "Dec 31 23:59:59 host service: info",
+            &year_boundary_context,
+        );
+        assert_eq!(
+            previous_year.timestamp.as_deref(),
+            Some("2025-12-31T23:59:59+08:00")
+        );
+
+        let next_year_context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2025-12-31T23:59:50+08:00"),
+            timezone: &timezone,
+        };
+        let next_year = parse_log_line_with_context(
+            "/var/log/messages",
+            "Jan 1 00:00:00 host service: info",
+            &next_year_context,
+        );
+        assert_eq!(
+            next_year.timestamp.as_deref(),
+            Some("2026-01-01T00:00:00+08:00")
+        );
+    }
+
+    #[test]
+    fn syslog_ambiguous_nonexistent_and_too_distant_times_are_indeterminate() {
+        let collection_time = test_timestamp_ms("2026-07-15T00:00:00Z");
+        let filter = ValidatedLogFilter::from_query(&LogQuery {
+            since: Some("2026-01-01T00:00:00Z".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("time filter");
+        for resolution in [
+            ControlledLocalResolution::Ambiguous,
+            ControlledLocalResolution::Nonexistent,
+            ControlledLocalResolution::OnlyYear(2025),
+        ] {
+            let timezone = ControlledLogTimeZone {
+                collection_year: 2026,
+                offset: FixedOffset::east_opt(0).expect("UTC offset"),
+                resolution,
+            };
+            let entry = parse_log_line_with_context(
+                "/var/log/messages",
+                "Jan 1 00:00:00 host service: info",
+                &LogTimestampContext {
+                    collected_at_ms: collection_time,
+                    timezone: &timezone,
+                },
+            );
+            assert!(entry.timestamp.is_none());
+            let filtered = filter_entries(vec![entry], &filter);
+            assert!(filtered.entries.is_empty());
+            assert_eq!(filtered.indeterminate_count, 1);
+        }
+    }
+
+    #[test]
+    fn warning_filter_includes_more_severe_levels_and_omits_unknown() {
+        let filter = ValidatedLogFilter::from_query(&LogQuery {
+            severity: Some("warning".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("warning filter");
+        let entries = [
+            Some("emergency"),
+            Some("error"),
+            Some("warning"),
+            Some("notice"),
+            Some("info"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, severity)| LogEntry {
+            source: "journalctl".to_string(),
+            timestamp: None,
+            severity: severity.map(str::to_string),
+            unit: None,
+            message: format!("event {index}"),
+        })
+        .collect::<Vec<_>>();
+
+        let result = filter_entries(entries, &filter);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .filter_map(|entry| entry.severity.as_deref())
+                .collect::<Vec<_>>(),
+            ["emergency", "error", "warning"]
+        );
+        assert_eq!(result.indeterminate_count, 1);
+    }
+
+    #[test]
+    fn four_sources_apply_the_same_keyword_time_and_severity_filters() {
+        let commands = FixtureCommandRunner::default()
+            .with_output(
+                "journalctl",
+                command_output("2026-07-15T12:00:00+00:00 host app.service: ERROR AuditTarget\n"),
+            )
+            .with_output(
+                "dmesg",
+                command_output("[2026-07-15T12:00:00Z] ERROR audittarget\n"),
+            );
+        let files = FixtureLogFileReader::default()
+            .with_tail(
+                "/var/log/messages",
+                b"Jul 15 12:00:00 host service: ERROR AUDITTARGET\n".to_vec(),
+                false,
+            )
+            .with_tail(
+                "/var/log/secure",
+                b"Jul 15 12:00:00 host sshd: ERROR AuditTarget\n".to_vec(),
+                false,
+            );
+        let query = LogQuery {
+            keyword: Some("aUdItTaRgEt".to_string()),
+            since: Some("2026-07-15T12:00:00Z".to_string()),
+            until: Some("2026-07-15T12:00:00Z".to_string()),
+            severity: Some("warning".to_string()),
+            limit: Some(10),
+            ..LogQuery::default()
+        };
+
+        let timezone = FixedLogTimeZone(FixedOffset::east_opt(0).expect("UTC offset"));
+        let result = query_logs_with_at_and_timezone(
+            &query,
+            &commands,
+            &files,
+            test_timestamp_ms("2026-07-15T12:30:00Z"),
+            &timezone,
+        )
+        .expect("four-source filtered query");
+
+        assert_eq!(result.entries.len(), 4);
+        assert_eq!(result.collection_status, CollectionStatus::Complete);
+        assert!(result.filter_complete);
+        assert_eq!(result.indeterminate_filter_count, 0);
+        assert!(result.source_statuses.iter().all(
+            |status| status.matched_entry_count == 1 && status.indeterminate_filter_count == 0
+        ));
+    }
+
+    #[test]
+    fn active_filters_report_indeterminate_entries_as_partial() {
+        let time_commands = FixtureCommandRunner::default().with_output(
+            "journalctl",
+            command_output("timestamp-unavailable event\n2026-07-15T12:00:00Z valid event\n"),
+        );
+        let time_result = query_logs_with_at(
+            &LogQuery {
+                sources: vec!["journalctl".to_string()],
+                since: Some("2026-07-15T12:00:00Z".to_string()),
+                until: Some("2026-07-15T12:00:00Z".to_string()),
+                ..LogQuery::default()
+            },
+            &time_commands,
+            &FixtureLogFileReader::default(),
+            test_timestamp_ms("2026-07-15T12:30:00Z"),
+        )
+        .expect("time filter");
+        assert_eq!(time_result.entries.len(), 1);
+        assert_eq!(time_result.indeterminate_filter_count, 1);
+        assert!(!time_result.filter_complete);
+        assert_eq!(time_result.collection_status, CollectionStatus::Partial);
+        assert_eq!(time_result.source_statuses[0].matched_entry_count, 1);
+        assert_eq!(time_result.source_statuses[0].indeterminate_filter_count, 1);
+
+        let severity_commands = FixtureCommandRunner::default().with_output(
+            "journalctl",
+            command_output(
+                "2026-07-15T12:00:00Z unknown-level event\n2026-07-15T12:00:01Z warning event\n",
+            ),
+        );
+        let severity_result = query_logs_with(
+            &LogQuery {
+                sources: vec!["journalctl".to_string()],
+                severity: Some("warning".to_string()),
+                ..LogQuery::default()
+            },
+            &severity_commands,
+            &FixtureLogFileReader::default(),
+        )
+        .expect("severity filter");
+        assert_eq!(severity_result.entries.len(), 1);
+        assert_eq!(severity_result.indeterminate_filter_count, 1);
+        assert!(!severity_result.filter_complete);
+        assert_eq!(severity_result.collection_status, CollectionStatus::Partial);
+    }
+
+    #[test]
+    fn three_state_and_does_not_count_unknown_when_another_filter_is_false() {
+        let keyword_false_before_unknown_time = ValidatedLogFilter::from_query(&LogQuery {
+            keyword: Some("required".to_string()),
+            since: Some("2026-07-15T12:00:00Z".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("keyword and time filter");
+        let result = filter_entries(
+            vec![LogEntry {
+                source: "journalctl".to_string(),
+                timestamp: None,
+                severity: Some("warning".to_string()),
+                unit: None,
+                message: "definite keyword mismatch".to_string(),
+            }],
+            &keyword_false_before_unknown_time,
+        );
+        assert!(result.entries.is_empty());
+        assert_eq!(result.indeterminate_count, 0);
+
+        let unknown_time_before_false_severity = ValidatedLogFilter::from_query(&LogQuery {
+            since: Some("2026-07-15T12:00:00Z".to_string()),
+            severity: Some("warning".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("time and severity filter");
+        let result = filter_entries(
+            vec![LogEntry {
+                source: "journalctl".to_string(),
+                timestamp: None,
+                severity: Some("info".to_string()),
+                unit: None,
+                message: "unknown time but definite severity mismatch".to_string(),
+            }],
+            &unknown_time_before_false_severity,
+        );
+        assert!(result.entries.is_empty());
+        assert_eq!(result.indeterminate_count, 0);
+
+        let false_time_before_unknown_severity = ValidatedLogFilter::from_query(&LogQuery {
+            since: Some("2026-07-15T12:00:00Z".to_string()),
+            severity: Some("warning".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("time and severity filter");
+        let result = filter_entries(
+            vec![LogEntry {
+                source: "journalctl".to_string(),
+                timestamp: Some("2026-07-15T11:59:59Z".to_string()),
+                severity: None,
+                unit: None,
+                message: "definite time mismatch but unknown severity".to_string(),
+            }],
+            &false_time_before_unknown_severity,
+        );
+        assert!(result.entries.is_empty());
+        assert_eq!(result.indeterminate_count, 0);
     }
 
     #[test]
@@ -1045,25 +1871,26 @@ mod tests {
     #[test]
     fn round_robin_merge_prevents_later_sources_from_starving() {
         let journal = (0..8)
-            .map(|index| format!("2026-01-01 10:00:0{index} journal event {index}\n"))
+            .map(|index| format!("2026-01-01 journal target event {index}\n"))
             .collect::<String>();
         let commands = FixtureCommandRunner::default()
             .with_output("journalctl", command_output(journal))
-            .with_output("dmesg", command_output("[2026-01-01] dmesg event\n"));
+            .with_output("dmesg", command_output("dmesg target event\n"));
         let files = FixtureLogFileReader::default()
             .with_tail(
                 "/var/log/messages",
-                b"Jan 1 10:00:00 syslog event\n".to_vec(),
+                b"Jan 1 10:00:00 ignored\nJan 1 10:00:01 syslog target event\n".to_vec(),
                 false,
             )
             .with_tail(
                 "/var/log/secure",
-                b"Jan 1 10:00:00 auth event\n".to_vec(),
+                b"Jan 1 10:00:00 ignored\nJan 1 10:00:01 sshd target event\n".to_vec(),
                 false,
             );
 
         let result = query_logs_with(
             &LogQuery {
+                keyword: Some("TARGET".to_string()),
                 limit: Some(8),
                 ..LogQuery::default()
             },
@@ -1080,7 +1907,15 @@ mod tests {
             "dmesg",
             "/var/log/secure",
         ] {
-            assert!(result.entries.iter().any(|entry| entry.source == source));
+            assert!(
+                result.entries.iter().any(|entry| entry.source == source),
+                "missing {source} from {:?}",
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| (&entry.source, &entry.message))
+                    .collect::<Vec<_>>()
+            );
         }
         assert_eq!(
             result
@@ -1101,6 +1936,14 @@ mod tests {
                 .source_statuses
                 .iter()
                 .map(|status| status.entry_count)
+                .collect::<Vec<_>>(),
+            [8, 2, 1, 2]
+        );
+        assert_eq!(
+            result
+                .source_statuses
+                .iter()
+                .map(|status| status.matched_entry_count)
                 .collect::<Vec<_>>(),
             [8, 1, 1, 1]
         );
@@ -1135,12 +1978,14 @@ mod tests {
 
     #[test]
     fn journalctl_uses_fixed_time_and_priority_arguments() {
-        let commands = FixtureCommandRunner::default()
-            .with_output("journalctl", command_output("2026-01-01 event\n"));
+        let commands = FixtureCommandRunner::default().with_output(
+            "journalctl",
+            command_output("2026-01-01T00:00:00Z warning event\n"),
+        );
         let query = LogQuery {
             sources: vec!["journalctl".to_string()],
-            since: Some("2026-01-01 00:00:00".to_string()),
-            until: Some("2026-01-02 00:00:00".to_string()),
+            since: Some("2026-01-01T00:00:00Z".to_string()),
+            until: Some("2026-01-02T00:00:00Z".to_string()),
             severity: Some("warning".to_string()),
             limit: Some(5),
             ..LogQuery::default()
@@ -1157,9 +2002,9 @@ mod tests {
                 "-n",
                 "6",
                 "--since",
-                "2026-01-01 00:00:00",
+                "2026-01-01T00:00:00Z",
                 "--until",
-                "2026-01-02 00:00:00",
+                "2026-01-02T00:00:00Z",
                 "-p",
                 "warning",
             ]
@@ -1199,6 +2044,11 @@ mod tests {
     fn dmesg_uses_util_linux_level_names() {
         let commands = FixtureCommandRunner::default()
             .with_output("dmesg", command_output("[2026-01-01] event\n"));
+        let timezone = FixedLogTimeZone(FixedOffset::east_opt(0).expect("UTC offset"));
+        let timestamp_context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2026-01-01T00:00:00Z"),
+            timezone: &timezone,
+        };
         for severity in ["warning", "warn", "error", "err", "critical", "crit"] {
             read_dmesg(
                 &LogQuery {
@@ -1206,6 +2056,7 @@ mod tests {
                     ..LogQuery::default()
                 },
                 &commands,
+                &timestamp_context,
             );
         }
 
@@ -1216,14 +2067,39 @@ mod tests {
                 .map(|call| call.args)
                 .collect::<Vec<_>>(),
             vec![
-                vec!["--time-format", "iso", "--level", "warn"],
-                vec!["--time-format", "iso", "--level", "warn"],
-                vec!["--time-format", "iso", "--level", "err"],
-                vec!["--time-format", "iso", "--level", "err"],
-                vec!["--time-format", "iso", "--level", "crit"],
-                vec!["--time-format", "iso", "--level", "crit"],
+                vec!["--time-format", "iso", "--level", "warn+"],
+                vec!["--time-format", "iso", "--level", "warn+"],
+                vec!["--time-format", "iso", "--level", "err+"],
+                vec!["--time-format", "iso", "--level", "err+"],
+                vec!["--time-format", "iso", "--level", "crit+"],
+                vec!["--time-format", "iso", "--level", "crit+"],
             ]
         );
+    }
+
+    #[test]
+    fn parses_real_util_linux_dmesg_iso_timestamp_without_losing_fraction() {
+        let timezone = FixedLogTimeZone(FixedOffset::east_opt(0).expect("UTC offset"));
+        let context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2026-07-15T12:35:00Z"),
+            timezone: &timezone,
+        };
+        let entry = parse_log_line_with_context(
+            "dmesg",
+            "[2026-07-15T12:34:56,123456+0000] kernel: warning event",
+            &context,
+        );
+        assert_eq!(
+            entry.timestamp.as_deref(),
+            Some("2026-07-15T12:34:56.123456+00:00")
+        );
+        let filter = ValidatedLogFilter::from_query(&LogQuery {
+            since: Some("2026-07-15T12:34:56.123455Z".to_string()),
+            until: Some("2026-07-15T12:34:56.123457Z".to_string()),
+            ..LogQuery::default()
+        })
+        .expect("sub-millisecond filter");
+        assert_eq!(filter_entries(vec![entry], &filter).entries.len(), 1);
     }
 
     #[test]
@@ -1317,7 +2193,17 @@ mod tests {
         let input = (0..700)
             .map(|index| format!("Jan 1 10:00:00 line {index}\n"))
             .collect::<String>();
-        let (entries, truncated) = parse_log_bytes("syslog", input.as_bytes(), MAX_LOG_LIMIT);
+        let timezone = FixedLogTimeZone(FixedOffset::east_opt(0).expect("UTC offset"));
+        let timestamp_context = LogTimestampContext {
+            collected_at_ms: test_timestamp_ms("2026-01-01T10:00:00Z"),
+            timezone: &timezone,
+        };
+        let (entries, truncated) = parse_log_bytes(
+            "syslog",
+            input.as_bytes(),
+            MAX_LOG_LIMIT,
+            &timestamp_context,
+        );
         assert_eq!(entries.len(), MAX_LOG_LIMIT);
         assert!(truncated);
         assert!(entries[0].message.ends_with("line 200"));
@@ -1328,13 +2214,25 @@ mod tests {
         let value = serde_json::json!({
             "meta": basic_meta("logs", Vec::new()),
             "truncated": false,
+            "source_statuses": [{
+                "logical_source": "journalctl",
+                "actual_source": "journalctl",
+                "available": true,
+                "status": "complete",
+                "error": null,
+                "entry_count": 1,
+                "truncated": false
+            }],
             "entries": [],
             "patterns": [],
             "summary": null
         });
         let result: LogQueryResult = serde_json::from_value(value).expect("legacy log result");
         assert_eq!(result.collection_status, CollectionStatus::Partial);
-        assert!(result.source_statuses.is_empty());
+        assert_eq!(result.source_statuses[0].matched_entry_count, 0);
+        assert_eq!(result.source_statuses[0].indeterminate_filter_count, 0);
         assert_eq!(result.omitted_warning_count, 0);
+        assert_eq!(result.indeterminate_filter_count, 0);
+        assert!(result.filter_complete);
     }
 }
