@@ -253,6 +253,8 @@ pub struct ThermalSnapshot {
     pub thermal_zone_available: bool,
     #[serde(default)]
     pub hwmon_available: bool,
+    #[serde(default)]
+    pub hwmon_sensors: Vec<HwmonSensorReading>,
     pub temperatures: Vec<TemperatureReading>,
     pub fans: Vec<FanReading>,
 }

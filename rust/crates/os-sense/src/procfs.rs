@@ -287,7 +287,7 @@ impl ProcfsCollector {
         let network = metrics.network.clone().unwrap_or_default();
         let thermal = metrics.thermal.clone().unwrap_or_default();
         if platform.loongarch.detected {
-            platform.loongarch.hwmon_sensors = thermal_to_hwmon(&thermal);
+            platform.loongarch.hwmon_sensors = thermal.hwmon_sensors.clone();
         }
         let alerts = build_metric_alerts(&cpu, &memory, load.as_ref(), &disks, thresholds);
         let completed_at_ms = self.clock.now_ms();
@@ -890,21 +890,21 @@ fn collect_thermal(
     let hwmon_root = sys_root.join("class/hwmon");
     let (hwmon_sensors, hwmon_transient_failure) = collect_hwmon_sensors(&hwmon_root, warnings);
     transient_failure |= hwmon_transient_failure;
-    for sensor in hwmon_sensors {
+    for sensor in &hwmon_sensors {
         if sensor.sensor.starts_with("temp") {
             temperatures.push(TemperatureReading {
-                source: sensor.device,
-                label: sensor.label,
+                source: sensor.device.clone(),
+                label: sensor.label.clone(),
                 millidegrees_celsius: sensor.value,
-                path: sensor.path,
+                path: sensor.path.clone(),
             });
         } else if sensor.sensor.starts_with("fan") {
             if let Ok(rpm) = u64::try_from(sensor.value) {
                 fans.push(FanReading {
-                    source: sensor.device,
-                    label: sensor.label,
+                    source: sensor.device.clone(),
+                    label: sensor.label.clone(),
                     rpm,
-                    path: sensor.path,
+                    path: sensor.path.clone(),
                 });
             } else {
                 transient_failure = true;
@@ -914,10 +914,7 @@ fn collect_thermal(
     let thermal_zone_available = temperatures
         .iter()
         .any(|reading| reading.source == "thermal_zone");
-    let hwmon_available = temperatures
-        .iter()
-        .any(|reading| reading.source != "thermal_zone")
-        || !fans.is_empty();
+    let hwmon_available = !hwmon_sensors.is_empty();
     let availability = if thermal_zone_available || hwmon_available {
         SensorAvailability::Available
     } else {
@@ -930,43 +927,12 @@ fn collect_thermal(
             availability,
             thermal_zone_available,
             hwmon_available,
+            hwmon_sensors,
             temperatures,
             fans,
         },
         transient_failure,
     )
-}
-
-fn thermal_to_hwmon(thermal: &ThermalSnapshot) -> Vec<HwmonSensorReading> {
-    let temperatures = thermal
-        .temperatures
-        .iter()
-        .filter(|reading| reading.source != "thermal_zone")
-        .map(|reading| HwmonSensorReading {
-            device: reading.source.clone(),
-            sensor: Path::new(&reading.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("temp_input")
-                .to_string(),
-            label: reading.label.clone(),
-            value: reading.millidegrees_celsius,
-            unit: "millidegrees_celsius".to_string(),
-            path: reading.path.clone(),
-        });
-    let fans = thermal.fans.iter().map(|reading| HwmonSensorReading {
-        device: reading.source.clone(),
-        sensor: Path::new(&reading.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("fan_input")
-            .to_string(),
-        label: reading.label.clone(),
-        value: i64::try_from(reading.rpm).unwrap_or(i64::MAX),
-        unit: "rpm".to_string(),
-        path: reading.path.clone(),
-    });
-    temperatures.chain(fans).collect()
 }
 
 #[must_use]
@@ -1810,9 +1776,19 @@ mod tests {
         fs::write(thermal.join("temp"), "46000\n").expect("thermal temp");
         let hwmon = sys_root.join("class/hwmon/hwmon0");
         fs::write(hwmon.join("name"), "loongson_hwmon\n").expect("hwmon name");
-        fs::write(hwmon.join("temp1_input"), "47500\n").expect("hwmon temp");
-        fs::write(hwmon.join("temp1_label"), "CPU Package\n").expect("hwmon label");
-        fs::write(hwmon.join("fan1_input"), "1800\n").expect("hwmon fan");
+        for (sensor, value, label) in [
+            ("temp1", "47500\n", "CPU Package\n"),
+            ("fan1", "1800\n", "Chassis Fan\n"),
+            ("in1", "12000\n", "Core Voltage\n"),
+            ("curr1", "2500\n", "CPU Current\n"),
+            ("power1", "65000000\n", "Package Power\n"),
+            ("energy1", "123456789\n", "Package Energy\n"),
+            ("humidity1", "45500\n", "Ambient Humidity\n"),
+            ("freq1", "2400000000\n", "Core Clock\n"),
+        ] {
+            fs::write(hwmon.join(format!("{sensor}_input")), value).expect("hwmon input");
+            fs::write(hwmon.join(format!("{sensor}_label")), label).expect("hwmon label");
+        }
         (proc_root, sys_root)
     }
 
@@ -1909,6 +1885,7 @@ mod tests {
     fn loongarch_platform_reads_hwmon_sensor_values() {
         let root = tempfile::tempdir().expect("tempdir");
         let (proc_root, sys_root) = write_resource_fixture(root.path());
+        let hwmon_root = sys_root.join("class/hwmon").join("hwmon0");
         let clock = Arc::new(ManualClock::new(1_000));
         let mut collector = ProcfsCollector::with_dependencies(
             proc_root,
@@ -1918,20 +1895,143 @@ mod tests {
         );
 
         let snapshot = collector.collect_metrics(&MetricsThresholds::default());
-        let platform = snapshot.meta.platform;
+        let platform = &snapshot.meta.platform;
         assert!(platform.loongarch.detected);
-        assert_eq!(platform.loongarch.hwmon_sensors.len(), 2);
-        assert!(platform.loongarch.hwmon_sensors.iter().any(|sensor| {
-            sensor.sensor == "temp1_input"
-                && sensor.value == 47_500
-                && sensor.unit == "millidegrees_celsius"
-                && sensor.label.as_deref() == Some("CPU Package")
-        }));
-        assert!(platform
-            .loongarch
-            .hwmon_sensors
+        assert!(snapshot.thermal.hwmon_available);
+        assert_eq!(
+            platform.loongarch.hwmon_sensors,
+            snapshot.thermal.hwmon_sensors
+        );
+
+        let expected = [
+            ("curr1_input", "CPU Current", 2_500, "milliamps"),
+            (
+                "energy1_input",
+                "Package Energy",
+                123_456_789,
+                "microjoules",
+            ),
+            ("fan1_input", "Chassis Fan", 1_800, "rpm"),
+            ("freq1_input", "Core Clock", 2_400_000_000, "hertz"),
+            (
+                "humidity1_input",
+                "Ambient Humidity",
+                45_500,
+                "milli_percent",
+            ),
+            ("in1_input", "Core Voltage", 12_000, "millivolts"),
+            ("power1_input", "Package Power", 65_000_000, "microwatts"),
+            ("temp1_input", "CPU Package", 47_500, "millidegrees_celsius"),
+        ];
+        assert_eq!(platform.loongarch.hwmon_sensors.len(), expected.len());
+        for (sensor, (name, label, value, unit)) in
+            platform.loongarch.hwmon_sensors.iter().zip(expected)
+        {
+            assert_eq!(sensor.device, "loongson_hwmon");
+            assert_eq!(sensor.sensor, name);
+            assert_eq!(sensor.label.as_deref(), Some(label));
+            assert_eq!(sensor.value, value);
+            assert_eq!(sensor.unit, unit);
+            assert_eq!(sensor.path, hwmon_root.join(name).display().to_string());
+        }
+    }
+
+    #[test]
+    fn power_or_voltage_alone_makes_hwmon_available() {
+        for (sensor, value, unit) in [
+            ("power1_input", "65000000\n", "microwatts"),
+            ("in1_input", "12000\n", "millivolts"),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let sys_root = root.path().join("sys");
+            let hwmon = sys_root.join("class/hwmon/hwmon0");
+            fs::create_dir_all(&hwmon).expect("hwmon fixture");
+            fs::write(hwmon.join("name"), "fixture_hwmon\n").expect("hwmon name");
+            fs::write(hwmon.join(sensor), value).expect("hwmon input");
+            let mut warnings = Vec::new();
+
+            let (thermal, transient_failure) = collect_thermal(&sys_root, 1_000, &mut warnings);
+
+            assert_eq!(thermal.availability, SensorAvailability::Available);
+            assert!(thermal.hwmon_available);
+            assert!(!thermal.thermal_zone_available);
+            assert!(thermal.temperatures.is_empty());
+            assert!(thermal.fans.is_empty());
+            assert_eq!(thermal.hwmon_sensors.len(), 1);
+            assert_eq!(thermal.hwmon_sensors[0].sensor, sensor);
+            assert_eq!(thermal.hwmon_sensors[0].unit, unit);
+            assert!(!transient_failure);
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_hwmon_item_does_not_hide_other_valid_sensors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sys_root = root.path().join("sys");
+        let hwmon = sys_root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).expect("hwmon fixture");
+        fs::write(hwmon.join("name"), "fixture_hwmon\n").expect("hwmon name");
+        fs::write(hwmon.join("power1_input"), "65000000\n").expect("valid hwmon");
+        fs::write(hwmon.join("temp1_input"), "invalid\n").expect("invalid hwmon");
+        let mut warnings = Vec::new();
+
+        let (thermal, transient_failure) = collect_thermal(&sys_root, 1_000, &mut warnings);
+
+        assert_eq!(thermal.availability, SensorAvailability::Available);
+        assert!(thermal.hwmon_available);
+        assert_eq!(thermal.hwmon_sensors.len(), 1);
+        assert_eq!(thermal.hwmon_sensors[0].sensor, "power1_input");
+        assert!(transient_failure);
+        assert!(warnings
             .iter()
-            .any(|sensor| sensor.sensor == "fan1_input" && sensor.value == 1_800));
+            .any(|warning| warning.contains("temp1_input")));
+    }
+
+    #[test]
+    #[ignore = "requires a LoongArch Kylin host with readable hwmon sensors"]
+    fn loongarch_host_default_collector_matches_supported_hwmon_inputs() {
+        let mut expected_warnings = Vec::new();
+        let (expected, _) = collect_hwmon_sensors(
+            Path::new(DEFAULT_SYS_ROOT).join("class/hwmon").as_path(),
+            &mut expected_warnings,
+        );
+        assert!(
+            !expected.is_empty(),
+            "no readable and parseable supported *_input sensors under /sys/class/hwmon"
+        );
+
+        let mut collector = ProcfsCollector::default();
+        let snapshot = collector.collect_dimensions(
+            CollectionMode::OnDemand,
+            &[ResourceDimension::Thermal],
+            &MetricsThresholds::default(),
+        );
+        assert!(snapshot.meta.platform.loongarch.detected);
+        assert!(snapshot.thermal.hwmon_available);
+        assert_eq!(
+            snapshot.meta.platform.loongarch.hwmon_sensors,
+            snapshot.thermal.hwmon_sensors
+        );
+
+        let identities = |sensors: &[HwmonSensorReading]| {
+            sensors
+                .iter()
+                .map(|sensor| {
+                    (
+                        sensor.device.clone(),
+                        sensor.sensor.clone(),
+                        sensor.unit.clone(),
+                        sensor.path.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            identities(&snapshot.thermal.hwmon_sensors),
+            identities(&expected),
+            "default collector did not preserve every readable supported hwmon input"
+        );
     }
 
     #[test]

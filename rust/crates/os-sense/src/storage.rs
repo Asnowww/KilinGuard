@@ -657,6 +657,14 @@ mod tests {
             },
             "load": null,
             "disks": [],
+            "thermal": {
+                "collected_at_ms": 500,
+                "availability": "unavailable",
+                "thermal_zone_available": false,
+                "hwmon_available": false,
+                "temperatures": [],
+                "fans": []
+            },
             "alerts": [{
                 "dimension": "disk",
                 "severity": "warning",
@@ -688,6 +696,7 @@ mod tests {
             snapshot.thermal.availability,
             SensorAvailability::Unavailable
         );
+        assert!(snapshot.thermal.hwmon_sensors.is_empty());
     }
 
     #[test]

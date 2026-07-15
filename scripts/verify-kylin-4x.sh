@@ -60,6 +60,12 @@ fi
 
 printf 'Running requirement-focused Rust tests...\n'
 cd "$RUST_ROOT"
+if [ "${CLAW_REQUIRE_LOONGARCH:-0}" = "1" ]; then
+    printf 'Checking LoongArch default hwmon collection against /sys/class/hwmon...\n'
+    cargo test -p os-sense --lib \
+        procfs::tests::loongarch_host_default_collector_matches_supported_hwmon_inputs -- \
+        --ignored --exact --test-threads=1
+fi
 cargo test -p os-sense --lib -- --test-threads=1
 cargo test -p ops-plugin-sdk --lib -- --test-threads=1
 cargo test -p plugins --lib -- --test-threads=1

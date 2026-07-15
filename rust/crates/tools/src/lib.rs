@@ -7580,6 +7580,46 @@ mod tests {
     }
 
     #[test]
+    fn os_sense_metrics_json_exposes_non_temperature_hwmon() {
+        let root = temp_path("os-sense-hwmon-json");
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        let hwmon = sys_root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+        fs::create_dir_all(&hwmon).expect("hwmon fixture");
+        fs::write(proc_root.join("cpuinfo"), "model name: LoongArch 3A6000\n")
+            .expect("cpuinfo fixture");
+        fs::write(proc_root.join("sys/kernel/osrelease"), "6.6.0-kylin\n").expect("kernel fixture");
+        fs::write(hwmon.join("name"), "loongson_hwmon\n").expect("hwmon name");
+        fs::write(hwmon.join("power1_input"), "65000000\n").expect("hwmon power");
+        fs::write(hwmon.join("power1_label"), "Package Power\n").expect("hwmon label");
+
+        let mut collector = os_sense::ProcfsCollector::new(proc_root, sys_root);
+        let snapshot = collector.collect_dimensions(
+            os_sense::CollectionMode::OnDemand,
+            &[os_sense::ResourceDimension::Thermal],
+            &os_sense::MetricsThresholds::default(),
+        );
+        let output = super::to_pretty_json(snapshot).expect("metrics JSON");
+        let output: Value = serde_json::from_str(&output).expect("parse metrics JSON");
+
+        for sensors in [
+            &output["thermal"]["hwmon_sensors"],
+            &output["meta"]["platform"]["loongarch"]["hwmon_sensors"],
+        ] {
+            assert_eq!(sensors[0]["device"], "loongson_hwmon");
+            assert_eq!(sensors[0]["sensor"], "power1_input");
+            assert_eq!(sensors[0]["label"], "Package Power");
+            assert_eq!(sensors[0]["value"], 65_000_000);
+            assert_eq!(sensors[0]["unit"], "microwatts");
+            assert!(sensors[0]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("power1_input")));
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn env_guard_recovers_after_poisoning() {
         let poisoned = std::thread::spawn(|| {
             let _guard = env_guard();
