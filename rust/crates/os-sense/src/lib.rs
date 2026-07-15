@@ -32,8 +32,10 @@ pub use model::{
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{
-    collect_metrics, collect_processes, Clock, KylinPartitionUsageProvider, MetricsThresholds,
-    PartitionUsageProvider, ProcessQuery, ProcfsCollector, SystemClock, OS_SENSE_THRESHOLDS_ENV,
+    collect_metrics, collect_processes, Clock, KylinPartitionUsageProvider,
+    KylinProcessUserResolver, MetricsThresholds, MonotonicClock, PartitionUsageProvider,
+    ProcessQuery, ProcessSystemParameters, ProcessUserResolver, ProcfsCollector, SystemClock,
+    SystemMonotonicClock, OS_SENSE_THRESHOLDS_ENV,
 };
 pub use runtime::{
     current_time_ms, default_database_path, ActiveAlertStore, MetricsHistory, OsSenseRuntime,

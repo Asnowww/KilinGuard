@@ -8,9 +8,9 @@ use crate::context::{build_alert_context, collect_context_with, ContextRequest};
 use crate::error::Result;
 use crate::model::{
     ActiveAlert, ActiveAlertDimension, ActiveAlertSnapshot, AlertContext, CollectionMode,
-    CorruptSampleDetail, MetricSnapshot, OsContext, ResourceDimension,
+    CorruptSampleDetail, MetricSnapshot, OsContext, ProcessList, ResourceDimension,
 };
-use crate::procfs::{now_ms, MetricsThresholds, ProcfsCollector};
+use crate::procfs::{now_ms, MetricsThresholds, ProcessQuery, ProcfsCollector};
 use crate::scheduler::{CollectionScheduler, SchedulerConfig};
 use crate::storage::OsSenseStore;
 
@@ -357,6 +357,10 @@ impl OsSenseRuntime {
             self.persist_metrics(metrics)?;
         }
         Ok(context)
+    }
+
+    pub fn collect_processes(&mut self, query: &ProcessQuery) -> ProcessList {
+        self.collector.collect_processes(query)
     }
 
     pub fn collect_metrics_on_demand(

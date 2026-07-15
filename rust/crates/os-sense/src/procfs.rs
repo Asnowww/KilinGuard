@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +20,17 @@ use crate::redaction::redact_sensitive_text;
 
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_SYS_ROOT: &str = "/sys";
-const ASSUMED_CLK_TCK: f64 = 100.0;
+const FALLBACK_CLK_TCK: u64 = 100;
+const FALLBACK_PAGE_SIZE_BYTES: u64 = 4_096;
 const DEFAULT_PROCESS_LIMIT: usize = 100;
 const MAX_PROCESS_LIMIT: usize = 500;
+const MAX_PROCESS_WARNINGS: usize = 32;
+const PROCESS_BASELINE_TTL_MS: u64 = 10 * 60 * 1_000;
+const MAX_PROCESS_BASELINES: usize = 32_768;
+const POSITIVE_USER_CACHE_TTL_MS: u64 = 60 * 60 * 1_000;
+const NEGATIVE_USER_CACHE_TTL_MS: u64 = 30 * 1_000;
+const MAX_PROCESS_USER_CACHE_ENTRIES: usize = 4_096;
+const MAX_NSS_LOOKUPS_PER_COLLECTION: usize = 16;
 const MAX_CMDLINE_CHARS: usize = 256;
 const MAX_HWMON_SENSORS: usize = 128;
 const DISK_SECTOR_BYTES: u64 = 512;
@@ -32,8 +39,97 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+pub trait MonotonicClock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
 pub trait PartitionUsageProvider: Send + Sync {
     fn read_df_output(&self) -> Result<String>;
+}
+
+pub trait ProcessUserResolver: Send + Sync {
+    fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String>;
+}
+
+#[derive(Debug)]
+pub struct KylinProcessUserResolver {
+    passwd_users: BTreeMap<u32, String>,
+}
+
+impl Default for KylinProcessUserResolver {
+    fn default() -> Self {
+        Self {
+            passwd_users: load_passwd_users(),
+        }
+    }
+}
+
+impl ProcessUserResolver for KylinProcessUserResolver {
+    fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String> {
+        if let Some(user) = self.passwd_users.get(&uid) {
+            return Ok(Some(user.clone()));
+        }
+        resolve_user_with_getent(uid)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessSystemParameters {
+    pub clock_ticks_per_second: u64,
+    pub page_size_bytes: u64,
+}
+
+impl Default for ProcessSystemParameters {
+    fn default() -> Self {
+        Self {
+            clock_ticks_per_second: FALLBACK_CLK_TCK,
+            page_size_bytes: FALLBACK_PAGE_SIZE_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessCpuBaseline {
+    start_time_jiffies: u64,
+    cpu_time_jiffies: u64,
+    sampled_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedUserResolution {
+    user: String,
+    warning: Option<String>,
+    cached_at_ms: u64,
+    positive: bool,
+}
+
+struct ProcessReadOutcome {
+    process: ProcessInfo,
+    sampled_at_ms: u64,
+    warnings: Vec<String>,
+}
+
+trait ProcessFileReader: Send + Sync {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+}
+
+#[derive(Debug, Default)]
+struct SystemProcessFileReader;
+
+impl ProcessFileReader for SystemProcessFileReader {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+}
+
+enum ProcessReadFailure {
+    Exited,
+    Failed(OsSenseError),
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +138,25 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         now_ms()
+    }
+}
+
+#[derive(Debug)]
+pub struct SystemMonotonicClock {
+    started_at: Instant,
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 }
 
@@ -73,6 +188,42 @@ impl PartitionUsageProvider for KylinPartitionUsageProvider {
         }
         Ok(output.stdout)
     }
+}
+
+fn detect_process_system_parameters() -> (ProcessSystemParameters, Vec<String>) {
+    let mut parameters = ProcessSystemParameters::default();
+    let mut warnings = Vec::new();
+    match read_getconf_value("CLK_TCK") {
+        Ok(value) => parameters.clock_ticks_per_second = value,
+        Err(error) => warnings.push(format!(
+            "getconf CLK_TCK unavailable; using fallback {FALLBACK_CLK_TCK}: {error}"
+        )),
+    }
+    match read_getconf_value("PAGESIZE") {
+        Ok(value) => parameters.page_size_bytes = value,
+        Err(error) => warnings.push(format!(
+            "getconf PAGESIZE unavailable; using fallback {FALLBACK_PAGE_SIZE_BYTES}: {error}"
+        )),
+    }
+    (parameters, warnings)
+}
+
+fn read_getconf_value(name: &str) -> std::result::Result<u64, String> {
+    let output = run_limited_command("getconf", &[name], Duration::from_millis(500), 128, 512)
+        .map_err(|error| error.to_string())?;
+    if output.timed_out {
+        return Err("command timed out".to_string());
+    }
+    if !output.success || output.stdout_truncated {
+        return Err("command failed or exceeded output limit".to_string());
+    }
+    output
+        .stdout
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "command returned an invalid value".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -171,18 +322,34 @@ pub struct ProcfsCollector {
     proc_root: PathBuf,
     sys_root: PathBuf,
     clock: Arc<dyn Clock>,
+    process_clock: Arc<dyn MonotonicClock>,
     partition_usage: Arc<dyn PartitionUsageProvider>,
     metrics: MetricsByMode,
+    process_system_parameters: ProcessSystemParameters,
+    process_system_warnings: Vec<String>,
+    process_cpu_baselines: BTreeMap<u32, ProcessCpuBaseline>,
+    process_user_resolver: Arc<dyn ProcessUserResolver>,
+    process_user_cache: BTreeMap<u32, CachedUserResolution>,
+    process_file_reader: Arc<dyn ProcessFileReader>,
 }
 
 impl Default for ProcfsCollector {
     fn default() -> Self {
+        let (process_system_parameters, process_system_warnings) =
+            detect_process_system_parameters();
         Self {
             proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
             sys_root: PathBuf::from(DEFAULT_SYS_ROOT),
             clock: Arc::new(SystemClock),
+            process_clock: Arc::new(SystemMonotonicClock::default()),
             partition_usage: Arc::new(KylinPartitionUsageProvider),
             metrics: MetricsByMode::default(),
+            process_system_parameters,
+            process_system_warnings,
+            process_cpu_baselines: BTreeMap::new(),
+            process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
+            process_user_cache: BTreeMap::new(),
+            process_file_reader: Arc::new(SystemProcessFileReader),
         }
     }
 }
@@ -190,12 +357,21 @@ impl Default for ProcfsCollector {
 impl ProcfsCollector {
     #[must_use]
     pub fn new(proc_root: impl Into<PathBuf>, sys_root: impl Into<PathBuf>) -> Self {
+        let (process_system_parameters, process_system_warnings) =
+            detect_process_system_parameters();
         Self {
             proc_root: proc_root.into(),
             sys_root: sys_root.into(),
             clock: Arc::new(SystemClock),
+            process_clock: Arc::new(SystemMonotonicClock::default()),
             partition_usage: Arc::new(KylinPartitionUsageProvider),
             metrics: MetricsByMode::default(),
+            process_system_parameters,
+            process_system_warnings,
+            process_cpu_baselines: BTreeMap::new(),
+            process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
+            process_user_cache: BTreeMap::new(),
+            process_file_reader: Arc::new(SystemProcessFileReader),
         }
     }
 
@@ -206,12 +382,47 @@ impl ProcfsCollector {
         clock: Arc<dyn Clock>,
         partition_usage: Arc<dyn PartitionUsageProvider>,
     ) -> Self {
+        let (process_system_parameters, process_system_warnings) =
+            detect_process_system_parameters();
         Self {
             proc_root: proc_root.into(),
             sys_root: sys_root.into(),
             clock,
+            process_clock: Arc::new(SystemMonotonicClock::default()),
             partition_usage,
             metrics: MetricsByMode::default(),
+            process_system_parameters,
+            process_system_warnings,
+            process_cpu_baselines: BTreeMap::new(),
+            process_user_resolver: Arc::new(KylinProcessUserResolver::default()),
+            process_user_cache: BTreeMap::new(),
+            process_file_reader: Arc::new(SystemProcessFileReader),
+        }
+    }
+
+    #[must_use]
+    pub fn with_process_dependencies(
+        proc_root: impl Into<PathBuf>,
+        sys_root: impl Into<PathBuf>,
+        clock: Arc<dyn Clock>,
+        process_clock: Arc<dyn MonotonicClock>,
+        partition_usage: Arc<dyn PartitionUsageProvider>,
+        process_system_parameters: ProcessSystemParameters,
+        process_user_resolver: Arc<dyn ProcessUserResolver>,
+    ) -> Self {
+        Self {
+            proc_root: proc_root.into(),
+            sys_root: sys_root.into(),
+            clock,
+            process_clock,
+            partition_usage,
+            metrics: MetricsByMode::default(),
+            process_system_parameters,
+            process_system_warnings: Vec::new(),
+            process_cpu_baselines: BTreeMap::new(),
+            process_user_resolver,
+            process_user_cache: BTreeMap::new(),
+            process_file_reader: Arc::new(SystemProcessFileReader),
         }
     }
 
@@ -548,13 +759,74 @@ impl ProcfsCollector {
         }
     }
 
-    pub fn collect_processes(&self, query: &ProcessQuery) -> ProcessList {
-        let mut warnings = Vec::new();
+    pub fn collect_processes(&mut self, query: &ProcessQuery) -> ProcessList {
+        let scan_started_at_ms = self.clock.now_ms();
+        let scan_started_at_monotonic_ms = self.process_clock.now_ms();
+        prune_process_cpu_baselines(
+            &mut self.process_cpu_baselines,
+            scan_started_at_monotonic_ms,
+            PROCESS_BASELINE_TTL_MS,
+            MAX_PROCESS_BASELINES,
+        );
+        let mut warnings = self.process_system_warnings.clone();
         let platform = self.platform_info(&mut warnings);
-        let users = load_passwd_users();
-        let uptime = fs::read_to_string(self.proc_root.join("uptime"))
-            .ok()
-            .and_then(|content| content.split_whitespace().next()?.parse::<f64>().ok());
+        let mut omitted_warning_count = warnings.len().saturating_sub(MAX_PROCESS_WARNINGS);
+        warnings.truncate(MAX_PROCESS_WARNINGS);
+        let mut source_partial = !warnings.is_empty() || omitted_warning_count > 0;
+        let uptime = match fs::read_to_string(self.proc_root.join("uptime")) {
+            Ok(content) => match content
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            {
+                Some(value) => Some(value),
+                None => {
+                    source_partial = true;
+                    push_process_warning(
+                        &mut warnings,
+                        &mut omitted_warning_count,
+                        "failed to parse /proc/uptime for process uptime".to_string(),
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                source_partial = true;
+                push_process_warning(
+                    &mut warnings,
+                    &mut omitted_warning_count,
+                    format!("failed to read /proc/uptime for process uptime: {error}"),
+                );
+                None
+            }
+        };
+        let total_memory_kb = match fs::read_to_string(self.proc_root.join("meminfo")) {
+            Ok(content) => match parse_meminfo(&content)
+                .map(|memory| memory.total_kb)
+                .filter(|total| *total > 0)
+            {
+                Some(total) => Some(total),
+                None => {
+                    source_partial = true;
+                    push_process_warning(
+                        &mut warnings,
+                        &mut omitted_warning_count,
+                        "failed to parse MemTotal from /proc/meminfo".to_string(),
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                source_partial = true;
+                push_process_warning(
+                    &mut warnings,
+                    &mut omitted_warning_count,
+                    format!("failed to read /proc/meminfo for process memory usage: {error}"),
+                );
+                None
+            }
+        };
         let allowed = query
             .allowed_names
             .iter()
@@ -563,9 +835,27 @@ impl ProcfsCollector {
             .collect::<BTreeSet<_>>();
 
         let mut processes = Vec::new();
+        let mut seen_pids = BTreeSet::new();
+        let mut failed_process_count = 0;
+        let mut partial_process_count = 0;
+        let mut exited_during_scan_count = 0;
+        let mut scan_failed = false;
+        let mut remaining_nss_lookups = MAX_NSS_LOOKUPS_PER_COLLECTION;
         match fs::read_dir(&self.proc_root) {
             Ok(entries) => {
-                for entry in entries.flatten() {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            source_partial = true;
+                            push_process_warning(
+                                &mut warnings,
+                                &mut omitted_warning_count,
+                                format!("failed to enumerate a /proc process entry: {error}"),
+                            );
+                            continue;
+                        }
+                    };
                     let Some(pid) = entry
                         .file_name()
                         .to_str()
@@ -576,17 +866,92 @@ impl ProcfsCollector {
                     if query.pid.is_some_and(|wanted| wanted != pid) {
                         continue;
                     }
-                    match self.read_process(pid, uptime, &users, &allowed) {
-                        Ok(process) if process_matches(&process, query) => processes.push(process),
-                        Ok(_) => {}
-                        Err(error) => {
-                            warnings.push(format!("failed to read process {pid}: {error}"))
+                    match self.read_process(pid, uptime, &allowed) {
+                        Ok(outcome) => {
+                            let ProcessReadOutcome {
+                                mut process,
+                                sampled_at_ms,
+                                warnings: read_warnings,
+                            } = outcome;
+                            seen_pids.insert(pid);
+                            let mut process_partial = !read_warnings.is_empty();
+                            for warning in read_warnings {
+                                push_process_warning(
+                                    &mut warnings,
+                                    &mut omitted_warning_count,
+                                    warning,
+                                );
+                            }
+                            apply_process_cpu_rate(
+                                &mut process,
+                                self.process_cpu_baselines.get(&pid).copied(),
+                                sampled_at_ms,
+                                self.process_system_parameters.clock_ticks_per_second,
+                            );
+                            self.process_cpu_baselines.insert(
+                                pid,
+                                ProcessCpuBaseline {
+                                    start_time_jiffies: process.start_time_jiffies,
+                                    cpu_time_jiffies: process.cpu_time_jiffies,
+                                    sampled_at_ms,
+                                },
+                            );
+                            if let Some(uid) = process.uid {
+                                let resolution =
+                                    self.resolve_process_user(uid, &mut remaining_nss_lookups);
+                                process.user = Some(resolution.user);
+                                if let Some(warning) = resolution.warning {
+                                    process_partial = true;
+                                    push_process_warning(
+                                        &mut warnings,
+                                        &mut omitted_warning_count,
+                                        warning,
+                                    );
+                                }
+                            }
+                            process.memory_percent = process
+                                .memory_rss_kb
+                                .zip(total_memory_kb)
+                                .map(|(rss, total)| round2((rss as f64 / total as f64) * 100.0));
+                            if process_partial {
+                                partial_process_count += 1;
+                            }
+                            if process_matches(&process, query) {
+                                processes.push(process);
+                            }
+                        }
+                        Err(ProcessReadFailure::Exited) => {
+                            exited_during_scan_count += 1;
+                        }
+                        Err(ProcessReadFailure::Failed(error)) => {
+                            failed_process_count += 1;
+                            push_process_warning(
+                                &mut warnings,
+                                &mut omitted_warning_count,
+                                format!("failed to read process {pid}: {error}"),
+                            );
                         }
                     }
                 }
             }
-            Err(error) => warnings.push(format!("failed to read /proc process list: {error}")),
+            Err(error) => {
+                scan_failed = true;
+                push_process_warning(
+                    &mut warnings,
+                    &mut omitted_warning_count,
+                    format!("failed to read /proc process list: {error}"),
+                );
+            }
         }
+        if let Some(pid) = query.pid {
+            if !seen_pids.contains(&pid) {
+                self.process_cpu_baselines.remove(&pid);
+            }
+        } else if !scan_failed {
+            self.process_cpu_baselines
+                .retain(|pid, _| seen_pids.contains(pid));
+        }
+        enforce_process_cpu_baseline_limit(&mut self.process_cpu_baselines, MAX_PROCESS_BASELINES);
 
         processes.sort_by_key(|process| process.pid);
         let total = processes.len();
@@ -606,15 +971,32 @@ impl ProcfsCollector {
             .filter(|process| process.authorized == Some(false))
             .cloned()
             .collect::<Vec<_>>();
+        let collection_status = if scan_failed {
+            CollectionStatus::Failed
+        } else if source_partial
+            || failed_process_count > 0
+            || partial_process_count > 0
+            || exited_during_scan_count > 0
+        {
+            CollectionStatus::Partial
+        } else {
+            CollectionStatus::Complete
+        };
         ProcessList {
             meta: OsSampleMeta {
-                collected_at_ms: now_ms(),
+                collected_at_ms: scan_started_at_ms,
                 source: "procfs".to_string(),
                 platform,
                 warnings,
             },
             total,
             truncated,
+            failed_process_count,
+            partial_process_count,
+            exited_during_scan_count,
+            omitted_warning_count,
+            scan_failed,
+            collection_status,
             processes,
             anomalies,
             unauthorized,
@@ -625,25 +1007,55 @@ impl ProcfsCollector {
         &self,
         pid: u32,
         uptime: Option<f64>,
-        users: &BTreeMap<String, String>,
         allowed: &BTreeSet<String>,
-    ) -> Result<ProcessInfo> {
+    ) -> std::result::Result<ProcessReadOutcome, ProcessReadFailure> {
         let proc_dir = self.proc_root.join(pid.to_string());
-        let stat = fs::read_to_string(proc_dir.join("stat"))?;
-        let mut info = parse_process_stat(pid, &stat, uptime)?;
-        if let Ok(status) = fs::read_to_string(proc_dir.join("status")) {
-            apply_process_status(&mut info, &status, users);
+        let stat = self
+            .process_file_reader
+            .read_to_string(&proc_dir.join("stat"))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ProcessReadFailure::Exited
+                } else {
+                    ProcessReadFailure::Failed(OsSenseError::Io(error.to_string()))
+                }
+            })?;
+        let sampled_at_ms = self.process_clock.now_ms();
+        let mut info = parse_process_stat(pid, &stat, uptime, self.process_system_parameters)
+            .map_err(ProcessReadFailure::Failed)?;
+        let mut read_warnings = Vec::new();
+        match self
+            .process_file_reader
+            .read_to_string(&proc_dir.join("status"))
+        {
+            Ok(status) => apply_process_status(&mut info, &status),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ProcessReadFailure::Exited)
+            }
+            Err(error) => {
+                read_warnings.push(format!("failed to read process {pid} status: {error}"))
+            }
         }
-        info.command = fs::read(proc_dir.join("cmdline")).ok().and_then(|bytes| {
-            let command = bytes
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!command.is_empty()).then(|| redact_sensitive_text(&command, MAX_CMDLINE_CHARS))
-        });
-        info.anomalies = detect_process_anomalies(&info);
+        match self.process_file_reader.read(&proc_dir.join("cmdline")) {
+            Ok(bytes) => {
+                let command = bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                info.command = (!command.is_empty())
+                    .then(|| redact_sensitive_text(&command, MAX_CMDLINE_CHARS));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ProcessReadFailure::Exited)
+            }
+            Err(error) => read_warnings.push(format!(
+                "failed to read process {pid} command line: {error}"
+            )),
+        }
+        info.anomalies =
+            detect_process_anomalies(&info, self.process_system_parameters.clock_ticks_per_second);
         if !allowed.is_empty() {
             info.authorized = Some(allowed.contains(&info.name.to_ascii_lowercase()));
             if info.authorized == Some(false) {
@@ -658,7 +1070,71 @@ impl ProcfsCollector {
                 });
             }
         }
-        Ok(info)
+        Ok(ProcessReadOutcome {
+            process: info,
+            sampled_at_ms,
+            warnings: read_warnings,
+        })
+    }
+
+    fn resolve_process_user(
+        &mut self,
+        uid: u32,
+        remaining_nss_lookups: &mut usize,
+    ) -> CachedUserResolution {
+        let now_ms = self.process_clock.now_ms();
+        if let Some(cached) = self.process_user_cache.get(&uid) {
+            let ttl_ms = if cached.positive {
+                POSITIVE_USER_CACHE_TTL_MS
+            } else {
+                NEGATIVE_USER_CACHE_TTL_MS
+            };
+            if now_ms.saturating_sub(cached.cached_at_ms) < ttl_ms {
+                return cached.clone();
+            }
+        }
+        self.process_user_cache.remove(&uid);
+        if *remaining_nss_lookups == 0 {
+            return CachedUserResolution {
+                user: uid.to_string(),
+                warning: Some(format!(
+                    "NSS lookup budget exhausted for UID {uid}; using numeric UID"
+                )),
+                cached_at_ms: now_ms,
+                positive: false,
+            };
+        }
+        *remaining_nss_lookups -= 1;
+        let resolution = match self.process_user_resolver.resolve(uid) {
+            Ok(Some(user)) if !user.is_empty() => CachedUserResolution {
+                user,
+                warning: None,
+                cached_at_ms: self.process_clock.now_ms(),
+                positive: true,
+            },
+            Ok(_) => CachedUserResolution {
+                user: uid.to_string(),
+                warning: Some(format!(
+                    "user lookup returned no NSS entry for UID {uid}; using numeric UID"
+                )),
+                cached_at_ms: self.process_clock.now_ms(),
+                positive: false,
+            },
+            Err(error) => CachedUserResolution {
+                user: uid.to_string(),
+                warning: Some(format!(
+                    "user lookup failed for UID {uid}; using numeric UID: {error}"
+                )),
+                cached_at_ms: self.process_clock.now_ms(),
+                positive: false,
+            },
+        };
+        self.process_user_cache.insert(uid, resolution.clone());
+        enforce_process_user_cache_limit(
+            &mut self.process_user_cache,
+            MAX_PROCESS_USER_CACHE_ENTRIES,
+        );
+        resolution
     }
 
     fn platform_info(&self, warnings: &mut Vec<String>) -> PlatformInfo {
@@ -942,7 +1418,8 @@ pub fn collect_metrics(thresholds: &MetricsThresholds) -> MetricSnapshot {
 
 #[must_use]
 pub fn collect_processes(query: &ProcessQuery) -> ProcessList {
-    ProcfsCollector::default().collect_processes(query)
+    let mut collector = ProcfsCollector::default();
+    collector.collect_processes(query)
 }
 
 #[must_use]
@@ -1488,7 +1965,12 @@ fn build_metric_alerts(
     alerts
 }
 
-fn parse_process_stat(pid: u32, stat: &str, uptime: Option<f64>) -> Result<ProcessInfo> {
+fn parse_process_stat(
+    pid: u32,
+    stat: &str,
+    uptime: Option<f64>,
+    system: ProcessSystemParameters,
+) -> Result<ProcessInfo> {
     let open = stat
         .find('(')
         .ok_or_else(|| OsSenseError::Parse("missing process name start".to_string()))?;
@@ -1512,7 +1994,10 @@ fn parse_process_stat(pid: u32, stat: &str, uptime: Option<f64>) -> Result<Proce
         .get(12)
         .and_then(|part| part.parse::<u64>().ok())
         .unwrap_or_default();
-    let starttime = parts.get(19).and_then(|part| part.parse::<u64>().ok());
+    let start_time_jiffies = parts
+        .get(19)
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(|| OsSenseError::Parse("invalid process start time".to_string()))?;
     let virtual_memory_kb = parts
         .get(20)
         .and_then(|part| part.parse::<u64>().ok())
@@ -1521,9 +2006,10 @@ fn parse_process_stat(pid: u32, stat: &str, uptime: Option<f64>) -> Result<Proce
         .get(21)
         .and_then(|part| part.parse::<i64>().ok())
         .and_then(|pages| u64::try_from(pages).ok())
-        .map(|pages| pages * 4);
-    let uptime_seconds = uptime.zip(starttime).map(|(uptime, start)| {
-        let started_after_boot = start as f64 / ASSUMED_CLK_TCK;
+        .map(|pages| pages.saturating_mul(system.page_size_bytes) / 1024);
+    let uptime_seconds = uptime.map(|uptime| {
+        let started_after_boot =
+            start_time_jiffies as f64 / system.clock_ticks_per_second.max(1) as f64;
         round2((uptime - started_after_boot).max(0.0))
     });
 
@@ -1533,8 +2019,14 @@ fn parse_process_stat(pid: u32, stat: &str, uptime: Option<f64>) -> Result<Proce
         name,
         state,
         user: None,
+        uid: None,
         cpu_time_jiffies: utime + stime,
+        start_time_jiffies,
+        cpu_usage_percent: None,
+        cpu_sample_interval_ms: None,
+        cpu_rate_status: None,
         memory_rss_kb,
+        memory_percent: None,
         virtual_memory_kb,
         uptime_seconds,
         command: None,
@@ -1543,11 +2035,11 @@ fn parse_process_stat(pid: u32, stat: &str, uptime: Option<f64>) -> Result<Proce
     })
 }
 
-fn apply_process_status(info: &mut ProcessInfo, status: &str, users: &BTreeMap<String, String>) {
+fn apply_process_status(info: &mut ProcessInfo, status: &str) {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
             if let Some(uid) = rest.split_whitespace().next() {
-                info.user = Some(users.get(uid).cloned().unwrap_or_else(|| uid.to_string()));
+                info.uid = uid.parse().ok();
             }
         } else if let Some(rest) = line.strip_prefix("VmRSS:") {
             if let Some(kb) = rest
@@ -1569,7 +2061,10 @@ fn apply_process_status(info: &mut ProcessInfo, status: &str, users: &BTreeMap<S
     }
 }
 
-fn detect_process_anomalies(info: &ProcessInfo) -> Vec<ProcessAnomaly> {
+fn detect_process_anomalies(
+    info: &ProcessInfo,
+    clock_ticks_per_second: u64,
+) -> Vec<ProcessAnomaly> {
     let mut anomalies = Vec::new();
     if info.state == "Z" {
         anomalies.push(ProcessAnomaly {
@@ -1589,7 +2084,7 @@ fn detect_process_anomalies(info: &ProcessInfo) -> Vec<ProcessAnomaly> {
     }
     if let Some(uptime_seconds) = info.uptime_seconds {
         if uptime_seconds > 0.0 {
-            let cpu_seconds = info.cpu_time_jiffies as f64 / ASSUMED_CLK_TCK;
+            let cpu_seconds = info.cpu_time_jiffies as f64 / clock_ticks_per_second.max(1) as f64;
             if cpu_seconds / uptime_seconds > 0.9 && uptime_seconds > 60.0 {
                 anomalies.push(ProcessAnomaly {
                     pid: info.pid,
@@ -1604,6 +2099,96 @@ fn detect_process_anomalies(info: &ProcessInfo) -> Vec<ProcessAnomaly> {
         }
     }
     anomalies
+}
+
+fn apply_process_cpu_rate(
+    process: &mut ProcessInfo,
+    previous: Option<ProcessCpuBaseline>,
+    sampled_at_ms: u64,
+    clock_ticks_per_second: u64,
+) {
+    let Some(previous) = previous else {
+        process.cpu_rate_status = Some(RateStatus::WarmingUp);
+        return;
+    };
+    if previous.start_time_jiffies != process.start_time_jiffies {
+        process.cpu_rate_status = Some(RateStatus::WarmingUp);
+        return;
+    }
+    let interval_ms = sampled_at_ms.saturating_sub(previous.sampled_at_ms);
+    process.cpu_sample_interval_ms = Some(interval_ms);
+    if process.cpu_time_jiffies < previous.cpu_time_jiffies {
+        process.cpu_rate_status = Some(RateStatus::CounterReset);
+        return;
+    }
+    if interval_ms == 0 || clock_ticks_per_second == 0 {
+        process.cpu_rate_status = Some(RateStatus::WarmingUp);
+        process.cpu_sample_interval_ms = None;
+        return;
+    }
+    let delta_jiffies = process.cpu_time_jiffies - previous.cpu_time_jiffies;
+    process.cpu_usage_percent = Some(round2(
+        delta_jiffies as f64 * 100_000.0 / (interval_ms as f64 * clock_ticks_per_second as f64),
+    ));
+    process.cpu_rate_status = Some(RateStatus::Ready);
+}
+
+fn prune_process_cpu_baselines(
+    baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    now_ms: u64,
+    ttl_ms: u64,
+    max_entries: usize,
+) {
+    baselines.retain(|_, baseline| now_ms.saturating_sub(baseline.sampled_at_ms) < ttl_ms);
+    enforce_process_cpu_baseline_limit(baselines, max_entries);
+}
+
+fn enforce_process_cpu_baseline_limit(
+    baselines: &mut BTreeMap<u32, ProcessCpuBaseline>,
+    max_entries: usize,
+) {
+    let remove_count = baselines.len().saturating_sub(max_entries);
+    if remove_count == 0 {
+        return;
+    }
+    let mut oldest = baselines
+        .iter()
+        .map(|(pid, baseline)| (baseline.sampled_at_ms, *pid))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable();
+    for (_, pid) in oldest.into_iter().take(remove_count) {
+        baselines.remove(&pid);
+    }
+}
+
+fn enforce_process_user_cache_limit(
+    cache: &mut BTreeMap<u32, CachedUserResolution>,
+    max_entries: usize,
+) {
+    let remove_count = cache.len().saturating_sub(max_entries);
+    if remove_count == 0 {
+        return;
+    }
+    let mut oldest = cache
+        .iter()
+        .map(|(uid, resolution)| (resolution.cached_at_ms, *uid))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable();
+    for (_, uid) in oldest.into_iter().take(remove_count) {
+        cache.remove(&uid);
+    }
+}
+
+fn push_process_warning(
+    warnings: &mut Vec<String>,
+    omitted_warning_count: &mut usize,
+    warning: String,
+) {
+    if warnings.len() < MAX_PROCESS_WARNINGS {
+        warnings.push(warning);
+    } else {
+        *omitted_warning_count = omitted_warning_count.saturating_add(1);
+    }
 }
 
 fn process_matches(process: &ProcessInfo, query: &ProcessQuery) -> bool {
@@ -1626,18 +2211,52 @@ fn process_matches(process: &ProcessInfo, query: &ProcessQuery) -> bool {
     true
 }
 
-fn load_passwd_users() -> BTreeMap<String, String> {
+fn load_passwd_users() -> BTreeMap<u32, String> {
     fs::read_to_string("/etc/passwd")
         .map(|content| {
             content
                 .lines()
                 .filter_map(|line| {
                     let parts = line.split(':').collect::<Vec<_>>();
-                    Some((parts.get(2)?.to_string(), parts.first()?.to_string()))
+                    Some((parts.get(2)?.parse().ok()?, parts.first()?.to_string()))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn resolve_user_with_getent(uid: u32) -> std::result::Result<Option<String>, String> {
+    let uid = uid.to_string();
+    let output = run_limited_command(
+        "getent",
+        &["passwd", uid.as_str()],
+        Duration::from_millis(500),
+        4 * 1024,
+        1024,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.timed_out {
+        return Err("getent passwd timed out".to_string());
+    }
+    if output.stdout_truncated {
+        return Err("getent passwd output exceeded the limit".to_string());
+    }
+    if !output.success {
+        return Ok(None);
+    }
+    let entry = output.stdout.lines().find(|line| !line.trim().is_empty());
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let fields = entry.split(':').collect::<Vec<_>>();
+    let resolved_uid = fields.get(2).and_then(|value| value.parse::<u32>().ok());
+    if resolved_uid != uid.parse().ok() {
+        return Err("getent passwd returned a mismatched UID".to_string());
+    }
+    Ok(fields
+        .first()
+        .filter(|name| !name.is_empty())
+        .map(|name| (*name).to_string()))
 }
 
 fn round2(value: f64) -> f64 {
@@ -1652,6 +2271,7 @@ fn path_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -1709,6 +2329,35 @@ mod tests {
     impl Clock for ManualClock {
         fn now_ms(&self) -> u64 {
             self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MonotonicClock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct AdvancingClock {
+        now_ms: AtomicU64,
+        step_ms: u64,
+    }
+
+    impl AdvancingClock {
+        fn advance(&self, delta_ms: u64) {
+            self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.fetch_add(self.step_ms, Ordering::SeqCst)
+        }
+    }
+
+    impl MonotonicClock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.fetch_add(self.step_ms, Ordering::SeqCst)
         }
     }
 
@@ -1792,6 +2441,119 @@ mod tests {
         (proc_root, sys_root)
     }
 
+    struct FixtureUserResolver {
+        responses: BTreeMap<u32, std::result::Result<Option<String>, String>>,
+        calls: Mutex<Vec<u32>>,
+    }
+
+    impl ProcessUserResolver for FixtureUserResolver {
+        fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String> {
+            self.calls.lock().expect("resolver calls").push(uid);
+            self.responses
+                .get(&uid)
+                .cloned()
+                .unwrap_or_else(|| Ok(None))
+        }
+    }
+
+    struct ClockAdvancingUserResolver {
+        clock: Arc<AdvancingClock>,
+        delay_ms: u64,
+    }
+
+    impl ProcessUserResolver for ClockAdvancingUserResolver {
+        fn resolve(&self, uid: u32) -> std::result::Result<Option<String>, String> {
+            self.clock.advance(self.delay_ms);
+            Ok(Some(format!("user-{uid}")))
+        }
+    }
+
+    struct StatusFailureReader {
+        failures: BTreeMap<u32, std::io::ErrorKind>,
+        fail_all: Option<std::io::ErrorKind>,
+    }
+
+    impl ProcessFileReader for StatusFailureReader {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            if path.file_name().and_then(|name| name.to_str()) == Some("status") {
+                let pid = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<u32>().ok());
+                if let Some(kind) = pid
+                    .and_then(|pid| self.failures.get(&pid).copied())
+                    .or(self.fail_all)
+                {
+                    return Err(std::io::Error::new(kind, "fixture status failure"));
+                }
+            }
+            fs::read_to_string(path)
+        }
+
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            fs::read(path)
+        }
+    }
+
+    fn process_stat(
+        pid: u32,
+        name: &str,
+        utime: u64,
+        stime: u64,
+        start_time: u64,
+        rss_pages: i64,
+    ) -> String {
+        format!(
+            "{pid} ({name}) S 1 2 3 4 5 0 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_time} 409600 {rss_pages} 0 0\n"
+        )
+    }
+
+    fn write_process_fixture(
+        proc_root: &Path,
+        pid: u32,
+        stat: &str,
+        uid: u32,
+        status_rss_kb: Option<u64>,
+    ) {
+        let process = proc_root.join(pid.to_string());
+        fs::create_dir_all(&process).expect("process fixture");
+        fs::write(process.join("stat"), stat).expect("process stat");
+        let mut status = format!("Name:\tfixture\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        if let Some(rss_kb) = status_rss_kb {
+            status.push_str(&format!("VmRSS:\t{rss_kb} kB\n"));
+        }
+        fs::write(process.join("status"), status).expect("process status");
+        fs::write(process.join("cmdline"), b"fixture\0--serve\0").expect("process cmdline");
+    }
+
+    fn process_collector(
+        root: &Path,
+        clock: Arc<ManualClock>,
+        system: ProcessSystemParameters,
+        resolver: Arc<dyn ProcessUserResolver>,
+    ) -> ProcfsCollector {
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+        fs::create_dir_all(&sys_root).expect("sys fixture");
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime fixture");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 10000 kB\nMemAvailable: 5000 kB\n",
+        )
+        .expect("meminfo fixture");
+        ProcfsCollector::with_process_dependencies(
+            proc_root,
+            sys_root,
+            clock.clone(),
+            clock,
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+            system,
+            resolver,
+        )
+    }
+
     #[test]
     fn parses_cpu_stat() {
         let stat = "cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 100 0 50 850 0 0 0 0 0 0\n";
@@ -1850,12 +2612,616 @@ mod tests {
     #[test]
     fn parses_process_stat_with_name_containing_space() {
         let stat = "123 (my proc) S 1 2 3 4 5 0 0 0 0 0 10 20 0 0 20 0 1 0 100 409600 25 0 0";
-        let parsed = parse_process_stat(123, stat, Some(10.0)).expect("process stat");
+        let parsed = parse_process_stat(123, stat, Some(10.0), ProcessSystemParameters::default())
+            .expect("process stat");
         assert_eq!(parsed.name, "my proc");
         assert_eq!(parsed.ppid, Some(1));
         assert_eq!(parsed.cpu_time_jiffies, 30);
         assert_eq!(parsed.virtual_memory_kb, Some(400));
         assert_eq!(parsed.memory_rss_kb, Some(100));
+    }
+
+    #[test]
+    fn process_samples_use_runtime_ticks_page_size_status_rss_and_memory_total() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(42, Ok(Some("alice".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock.clone(),
+            ProcessSystemParameters {
+                clock_ticks_per_second: 250,
+                page_size_bytes: 8_192,
+            },
+            resolver.clone(),
+        );
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 10000 kB\nMemAvailable: 5000 kB\n",
+        )
+        .expect("meminfo");
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 500, 0, 1_000, 3),
+            42,
+            Some(1_000),
+        );
+
+        let first = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(first.collection_status, CollectionStatus::Complete);
+        let first = &first.processes[0];
+        assert_eq!(first.start_time_jiffies, 1_000);
+        assert_eq!(first.cpu_usage_percent, None);
+        assert_eq!(first.cpu_sample_interval_ms, None);
+        assert_eq!(first.cpu_rate_status, Some(RateStatus::WarmingUp));
+        assert_eq!(first.uptime_seconds, Some(96.0));
+        assert_eq!(first.memory_rss_kb, Some(1_000));
+        assert_eq!(first.memory_percent, Some(10.0));
+        assert_eq!(first.uid, Some(42));
+        assert_eq!(first.user.as_deref(), Some("alice"));
+
+        clock.set(3_000);
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 625, 0, 1_000, 3),
+            42,
+            None,
+        );
+        let second = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(second.collection_status, CollectionStatus::Complete);
+        let second = &second.processes[0];
+        assert_eq!(second.cpu_usage_percent, Some(25.0));
+        assert_eq!(second.cpu_sample_interval_ms, Some(2_000));
+        assert_eq!(second.cpu_rate_status, Some(RateStatus::Ready));
+        assert_eq!(second.memory_rss_kb, Some(24));
+        assert_eq!(second.memory_percent, Some(0.24));
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").as_slice(),
+            &[42]
+        );
+    }
+
+    #[test]
+    fn wall_clock_jumps_do_not_affect_process_rates_or_cache_ttls() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let wall_clock = Arc::new(ManualClock::new(1_000));
+        let monotonic_clock = Arc::new(ManualClock::new(10_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(42, Ok(Some("alice".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            wall_clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        collector.process_clock = monotonic_clock.clone();
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 100, 0, 1_000, 1),
+            42,
+            None,
+        );
+
+        let first = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(first.meta.collected_at_ms, 1_000);
+        wall_clock.set(9_000_000_000);
+        monotonic_clock.set(12_000);
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 200, 0, 1_000, 1),
+            42,
+            None,
+        );
+        let forward = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(forward.meta.collected_at_ms, 9_000_000_000);
+        assert_eq!(forward.processes[0].cpu_sample_interval_ms, Some(2_000));
+        assert_eq!(forward.processes[0].cpu_usage_percent, Some(50.0));
+
+        wall_clock.set(10);
+        monotonic_clock.set(14_000);
+        write_process_fixture(
+            &proc_root,
+            7,
+            &process_stat(7, "worker", 300, 0, 1_000, 1),
+            42,
+            None,
+        );
+        let backward = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(backward.meta.collected_at_ms, 10);
+        assert_eq!(backward.processes[0].cpu_sample_interval_ms, Some(2_000));
+        assert_eq!(backward.processes[0].cpu_usage_percent, Some(50.0));
+        assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 1);
+
+        monotonic_clock.set(614_000);
+        let expired_baseline = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(
+            expired_baseline.processes[0].cpu_rate_status,
+            Some(RateStatus::WarmingUp)
+        );
+        assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 1);
+
+        monotonic_clock.set(3_610_000);
+        collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(resolver.calls.lock().expect("resolver calls").len(), 2);
+    }
+
+    #[test]
+    fn per_pid_sampling_precedes_nss_clock_changes_and_remains_order_independent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(AdvancingClock {
+            now_ms: AtomicU64::new(1_000),
+            step_ms: 10,
+        });
+        let resolver = Arc::new(ClockAdvancingUserResolver {
+            clock: clock.clone(),
+            delay_ms: 10_000,
+        });
+        let mut collector = ProcfsCollector::with_process_dependencies(
+            proc_root.clone(),
+            root.path().join("sys"),
+            clock.clone(),
+            clock.clone(),
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+        fs::create_dir_all(root.path().join("sys")).expect("sys fixture");
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 10000 kB\nMemAvailable: 5000 kB\n",
+        )
+        .expect("meminfo");
+        for pid in [2, 1] {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 100, 0, pid as u64, 1),
+                pid,
+                None,
+            );
+        }
+
+        collector.collect_processes(&ProcessQuery::default());
+        let first_samples = collector.process_cpu_baselines.clone();
+        for pid in [1, 2] {
+            assert!(
+                first_samples[&pid].sampled_at_ms < collector.process_user_cache[&pid].cached_at_ms,
+                "PID sample must be recorded before NSS resolution changes the clock"
+            );
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 200, 0, pid as u64, 1),
+                pid,
+                None,
+            );
+        }
+        clock.advance(2_000);
+
+        let second = collector.collect_processes(&ProcessQuery::default());
+        for process in &second.processes {
+            let first_sample = first_samples[&process.pid].sampled_at_ms;
+            let second_sample = collector.process_cpu_baselines[&process.pid].sampled_at_ms;
+            let interval_ms = second_sample - first_sample;
+            assert_eq!(process.cpu_sample_interval_ms, Some(interval_ms));
+            assert_eq!(
+                process.cpu_usage_percent,
+                Some(round2(100.0 * 100_000.0 / (interval_ms as f64 * 100.0)))
+            );
+            assert_eq!(process.cpu_rate_status, Some(RateStatus::Ready));
+        }
+    }
+
+    #[test]
+    fn process_baseline_ttl_and_cap_evict_oldest_then_lowest_pid() {
+        let baseline = |sampled_at_ms| ProcessCpuBaseline {
+            start_time_jiffies: 1,
+            cpu_time_jiffies: 1,
+            sampled_at_ms,
+        };
+        let mut baselines =
+            BTreeMap::from([(1, baseline(0)), (2, baseline(100)), (3, baseline(100))]);
+
+        prune_process_cpu_baselines(&mut baselines, 500, 450, 1);
+
+        assert_eq!(baselines.keys().copied().collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn process_user_cache_uses_positive_negative_ttls_and_stable_cap() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(7, Ok(None)), (8, Ok(Some("known".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+
+        let mut lookup_budget = 100;
+        collector.resolve_process_user(7, &mut lookup_budget);
+        collector.resolve_process_user(8, &mut lookup_budget);
+        clock.set(30_999);
+        collector.resolve_process_user(7, &mut lookup_budget);
+        clock.set(31_000);
+        collector.resolve_process_user(7, &mut lookup_budget);
+        clock.set(3_600_999);
+        collector.resolve_process_user(8, &mut lookup_budget);
+        clock.set(3_601_000);
+        collector.resolve_process_user(8, &mut lookup_budget);
+        let mut calls = resolver.calls.lock().expect("resolver calls").clone();
+        calls.sort_unstable();
+        assert_eq!(calls, vec![7, 7, 8, 8]);
+
+        let cached = |cached_at_ms| CachedUserResolution {
+            user: "user".to_string(),
+            warning: None,
+            cached_at_ms,
+            positive: true,
+        };
+        let mut cache = BTreeMap::from([(1, cached(0)), (2, cached(10)), (3, cached(10))]);
+        enforce_process_user_cache_limit(&mut cache, 1);
+        assert_eq!(cache.keys().copied().collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn process_cpu_pid_reuse_counter_reset_and_exit_all_reset_the_baseline() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+        write_process_fixture(
+            &proc_root,
+            8,
+            &process_stat(8, "worker", 100, 0, 1_000, 1),
+            0,
+            None,
+        );
+        assert_eq!(
+            collector
+                .collect_processes(&ProcessQuery::default())
+                .processes[0]
+                .cpu_rate_status,
+            Some(RateStatus::WarmingUp)
+        );
+
+        clock.set(2_000);
+        write_process_fixture(
+            &proc_root,
+            8,
+            &process_stat(8, "worker", 50, 0, 2_000, 1),
+            0,
+            None,
+        );
+        let reused = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(
+            reused.processes[0].cpu_rate_status,
+            Some(RateStatus::WarmingUp)
+        );
+        assert_eq!(reused.processes[0].cpu_usage_percent, None);
+
+        clock.set(3_000);
+        write_process_fixture(
+            &proc_root,
+            8,
+            &process_stat(8, "worker", 40, 0, 2_000, 1),
+            0,
+            None,
+        );
+        let reset = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(
+            reset.processes[0].cpu_rate_status,
+            Some(RateStatus::CounterReset)
+        );
+        assert_eq!(reset.processes[0].cpu_usage_percent, None);
+
+        fs::remove_dir_all(proc_root.join("8")).expect("process exit");
+        clock.set(4_000);
+        assert!(collector
+            .collect_processes(&ProcessQuery::default())
+            .processes
+            .is_empty());
+        write_process_fixture(
+            &proc_root,
+            8,
+            &process_stat(8, "worker", 500, 0, 2_000, 1),
+            0,
+            None,
+        );
+        clock.set(5_000);
+        let restarted = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(
+            restarted.processes[0].cpu_rate_status,
+            Some(RateStatus::WarmingUp)
+        );
+    }
+
+    #[test]
+    fn nss_results_are_cached_and_unknown_uid_falls_back_to_decimal() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(42, Ok(Some("alice".to_string()))), (43, Ok(None))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock.clone(),
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        write_process_fixture(
+            &proc_root,
+            42,
+            &process_stat(42, "known", 1, 0, 1, 1),
+            42,
+            None,
+        );
+        write_process_fixture(
+            &proc_root,
+            43,
+            &process_stat(43, "unknown", 1, 0, 1, 1),
+            43,
+            None,
+        );
+
+        let first = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(first.processes[0].user.as_deref(), Some("alice"));
+        assert_eq!(first.processes[1].user.as_deref(), Some("43"));
+        assert!(first
+            .meta
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("UID 43")));
+        clock.set(2_000);
+        collector.collect_processes(&ProcessQuery::default());
+        let mut calls = resolver.calls.lock().expect("resolver calls").clone();
+        calls.sort_unstable();
+        assert_eq!(calls, vec![42, 43]);
+    }
+
+    #[test]
+    fn process_scan_counts_exits_and_surfaces_status_permission_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        for pid in [10, 11] {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 1, 0, 1, 1),
+                0,
+                None,
+            );
+        }
+        collector.process_file_reader = Arc::new(StatusFailureReader {
+            failures: BTreeMap::from([
+                (10, std::io::ErrorKind::PermissionDenied),
+                (11, std::io::ErrorKind::NotFound),
+            ]),
+            fail_all: None,
+        });
+
+        let list = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(list.processes.len(), 1);
+        assert_eq!(list.processes[0].pid, 10);
+        assert_eq!(list.failed_process_count, 0);
+        assert_eq!(list.partial_process_count, 1);
+        assert_eq!(list.exited_during_scan_count, 1);
+        assert_eq!(list.collection_status, CollectionStatus::Partial);
+        assert_eq!(list.meta.warnings.len(), 1);
+        assert!(list.meta.warnings[0].contains("process 10 status"));
+    }
+
+    #[test]
+    fn uptime_and_meminfo_failures_are_visible_and_make_collection_partial() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: BTreeMap::from([(0, Ok(Some("root".to_string())))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver,
+        );
+        fs::write(proc_root.join("uptime"), "invalid\n").expect("invalid uptime");
+        fs::write(proc_root.join("meminfo"), "MemFree: 1 kB\n").expect("invalid meminfo");
+        write_process_fixture(
+            &proc_root,
+            12,
+            &process_stat(12, "worker", 1, 0, 1, 1),
+            0,
+            Some(10),
+        );
+
+        let list = collector.collect_processes(&ProcessQuery::default());
+        assert_eq!(list.collection_status, CollectionStatus::Partial);
+        assert!(!list.scan_failed);
+        assert_eq!(list.failed_process_count, 0);
+        assert_eq!(list.partial_process_count, 0);
+        assert_eq!(list.processes[0].uptime_seconds, None);
+        assert_eq!(list.processes[0].memory_percent, None);
+        assert!(list
+            .meta
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("/proc/uptime")));
+        assert!(list
+            .meta
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("MemTotal")));
+    }
+
+    #[test]
+    fn top_level_proc_scan_failure_is_failed_and_bounded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc-file");
+        let sys_root = root.path().join("sys");
+        fs::write(&proc_root, "not a directory\n").expect("proc fixture");
+        fs::create_dir_all(&sys_root).expect("sys fixture");
+        let mut collector = ProcfsCollector::with_process_dependencies(
+            proc_root,
+            sys_root,
+            Arc::new(ManualClock::new(1_000)),
+            Arc::new(ManualClock::new(1_000)),
+            Arc::new(StaticPartitionUsage(DF_FIXTURE)),
+            ProcessSystemParameters::default(),
+            Arc::new(FixtureUserResolver {
+                responses: BTreeMap::new(),
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+
+        let list = collector.collect_processes(&ProcessQuery::default());
+        assert!(list.scan_failed);
+        assert_eq!(list.collection_status, CollectionStatus::Failed);
+        assert_eq!(list.failed_process_count, 0);
+        assert!(list.meta.warnings.len() <= MAX_PROCESS_WARNINGS);
+        assert!(list
+            .meta
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("process list")));
+    }
+
+    #[test]
+    fn process_limit_sorting_and_nss_lookup_budget_are_bounded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let proc_root = root.path().join("proc");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let resolver = Arc::new(FixtureUserResolver {
+            responses: (1..=505)
+                .map(|uid| (uid, Ok(Some(format!("user-{uid}")))))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut collector = process_collector(
+            root.path(),
+            clock,
+            ProcessSystemParameters::default(),
+            resolver.clone(),
+        );
+        for pid in (1..=505).rev() {
+            write_process_fixture(
+                &proc_root,
+                pid,
+                &process_stat(pid, "worker", 1, 0, 1, 1),
+                pid,
+                None,
+            );
+        }
+
+        let query = ProcessQuery {
+            limit: Some(1_000),
+            ..ProcessQuery::default()
+        };
+        let list = collector.collect_processes(&query);
+        assert_eq!(list.total, 505);
+        assert!(list.truncated);
+        assert_eq!(list.processes.len(), MAX_PROCESS_LIMIT);
+        assert_eq!(list.processes.first().map(|process| process.pid), Some(1));
+        assert_eq!(list.processes.last().map(|process| process.pid), Some(500));
+        assert_eq!(list.failed_process_count, 0);
+        assert_eq!(
+            list.partial_process_count,
+            505 - MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+        assert_eq!(list.collection_status, CollectionStatus::Partial);
+        assert_eq!(list.meta.warnings.len(), MAX_PROCESS_WARNINGS);
+        assert_eq!(
+            list.omitted_warning_count,
+            505 - MAX_NSS_LOOKUPS_PER_COLLECTION - MAX_PROCESS_WARNINGS
+        );
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").len(),
+            MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+        assert!(list.processes.iter().any(|process| {
+            process.user.as_deref() == Some(process.uid.expect("uid").to_string().as_str())
+        }));
+
+        let second = collector.collect_processes(&query);
+        assert_eq!(
+            resolver.calls.lock().expect("resolver calls").len(),
+            2 * MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+        assert_eq!(
+            second.partial_process_count,
+            505 - 2 * MAX_NSS_LOOKUPS_PER_COLLECTION
+        );
+    }
+
+    #[test]
+    fn legacy_process_json_defaults_new_sample_fields() {
+        let process: ProcessInfo = serde_json::from_str(
+            r#"{"pid":1,"ppid":null,"name":"init","state":"S","user":"root","cpu_time_jiffies":10,"memory_rss_kb":20,"virtual_memory_kb":30,"uptime_seconds":40.0,"command":null,"anomalies":[],"authorized":null}"#,
+        )
+        .expect("legacy process");
+        assert_eq!(process.start_time_jiffies, 0);
+        assert_eq!(process.cpu_usage_percent, None);
+        assert_eq!(process.cpu_rate_status, None);
+        assert_eq!(process.memory_percent, None);
+        assert_eq!(process.uid, None);
+
+        let list: ProcessList = serde_json::from_value(serde_json::json!({
+            "meta": basic_meta("procfs", Vec::new()),
+            "total": 1,
+            "truncated": false,
+            "processes": [process],
+            "anomalies": [],
+            "unauthorized": []
+        }))
+        .expect("legacy process list");
+        assert_eq!(list.failed_process_count, 0);
+        assert_eq!(list.partial_process_count, 0);
+        assert_eq!(list.exited_during_scan_count, 0);
+        assert_eq!(list.omitted_warning_count, 0);
+        assert!(!list.scan_failed);
+        assert_eq!(list.collection_status, CollectionStatus::Partial);
     }
 
     #[test]
@@ -1866,15 +3232,21 @@ mod tests {
             name: "unknown".to_string(),
             state: "Z".to_string(),
             user: None,
+            uid: None,
             cpu_time_jiffies: 0,
+            start_time_jiffies: 0,
+            cpu_usage_percent: None,
+            cpu_sample_interval_ms: None,
+            cpu_rate_status: None,
             memory_rss_kb: None,
+            memory_percent: None,
             virtual_memory_kb: None,
             uptime_seconds: None,
             command: None,
             anomalies: Vec::new(),
             authorized: Some(false),
         };
-        info.anomalies = detect_process_anomalies(&info);
+        info.anomalies = detect_process_anomalies(&info, FALLBACK_CLK_TCK);
         assert!(info
             .anomalies
             .iter()

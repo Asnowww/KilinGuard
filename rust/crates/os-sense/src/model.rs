@@ -340,6 +340,18 @@ pub struct ProcessList {
     pub meta: OsSampleMeta,
     pub total: usize,
     pub truncated: bool,
+    #[serde(default)]
+    pub failed_process_count: usize,
+    #[serde(default)]
+    pub partial_process_count: usize,
+    #[serde(default)]
+    pub exited_during_scan_count: usize,
+    #[serde(default)]
+    pub omitted_warning_count: usize,
+    #[serde(default)]
+    pub scan_failed: bool,
+    #[serde(default)]
+    pub collection_status: CollectionStatus,
     pub processes: Vec<ProcessInfo>,
     pub anomalies: Vec<ProcessAnomaly>,
     pub unauthorized: Vec<ProcessInfo>,
@@ -352,8 +364,20 @@ pub struct ProcessInfo {
     pub name: String,
     pub state: String,
     pub user: Option<String>,
+    #[serde(default)]
+    pub uid: Option<u32>,
     pub cpu_time_jiffies: u64,
+    #[serde(default)]
+    pub start_time_jiffies: u64,
+    #[serde(default)]
+    pub cpu_usage_percent: Option<f64>,
+    #[serde(default)]
+    pub cpu_sample_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub cpu_rate_status: Option<RateStatus>,
     pub memory_rss_kb: Option<u64>,
+    #[serde(default)]
+    pub memory_percent: Option<f64>,
     pub virtual_memory_kb: Option<u64>,
     pub uptime_seconds: Option<f64>,
     pub command: Option<String>,

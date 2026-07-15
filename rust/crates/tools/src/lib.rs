@@ -14,8 +14,8 @@ use api::{
 };
 use ops_plugin_sdk::{ScaffoldRequest, SdkLanguage};
 use os_sense::{
-    collect_network, collect_processes, current_time_ms, query_logs, query_services,
-    ActiveAlertStore, ContextRequest as OsContextRequest, LogQuery as OsLogQuery,
+    collect_network, current_time_ms, query_logs, query_services, ActiveAlertStore,
+    ContextRequest as OsContextRequest, LogQuery as OsLogQuery,
     MetricsThresholds as OsMetricsThresholds, NetworkQuery as OsNetworkQuery, OsSenseRuntime,
     OsSenseRuntimeConfig, ProcessQuery as OsProcessQuery, ServiceQuery as OsServiceQuery,
     TimeSeriesWindow,
@@ -1389,7 +1389,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_process_list",
-            description: "List OS processes with PID, name, state, CPU time, memory, uptime, user, filters, anomaly markers, and optional unauthorized-process baseline comparison.",
+            description: "List OS processes with PID, name, state, sampled CPU and memory usage, cumulative CPU time, RSS, uptime, user, filters, anomaly markers, and optional unauthorized-process baseline comparison.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2394,7 +2394,14 @@ fn run_os_sense_tick(_input: EmptyInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_os_process_list(input: OsProcessQuery) -> Result<String, String> {
-    to_pretty_json(collect_processes(&input))
+    with_os_sense_runtime(|runtime| run_os_process_list_with_runtime(runtime, &input))
+}
+
+fn run_os_process_list_with_runtime(
+    runtime: &mut OsSenseRuntime,
+    input: &OsProcessQuery,
+) -> Result<String, String> {
+    to_pretty_json(runtime.collect_processes(input))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -11105,6 +11112,114 @@ printf 'pwsh:%s' "$1"
         assert!(history["samples"]
             .as_array()
             .is_some_and(|samples| !samples.is_empty()));
+    }
+
+    #[test]
+    fn os_process_list_runtime_path_reuses_the_cpu_baseline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct ProcessClock(AtomicU64);
+
+        impl os_sense::Clock for ProcessClock {
+            fn now_ms(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        impl os_sense::MonotonicClock for ProcessClock {
+            fn now_ms(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        struct PartitionUsage;
+
+        impl os_sense::PartitionUsageProvider for PartitionUsage {
+            fn read_df_output(&self) -> os_sense::Result<String> {
+                Ok("Filesystem 1B-blocks Used Available Use% Mounted on\n".to_string())
+            }
+        }
+
+        struct UserResolver;
+
+        impl os_sense::ProcessUserResolver for UserResolver {
+            fn resolve(&self, uid: u32) -> Result<Option<String>, String> {
+                Ok((uid == 0).then(|| "root".to_string()))
+            }
+        }
+
+        let root = temp_path("os-process-runtime");
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        let process = proc_root.join("77");
+        fs::create_dir_all(proc_root.join("sys/kernel")).expect("proc fixture");
+        fs::create_dir_all(&sys_root).expect("sys fixture");
+        fs::create_dir_all(&process).expect("process fixture");
+        fs::write(proc_root.join("uptime"), "100.0 0.0\n").expect("uptime");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 10000 kB\nMemAvailable: 5000 kB\n",
+        )
+        .expect("meminfo");
+        fs::write(
+            process.join("stat"),
+            "77 (worker) S 1 2 3 4 5 0 0 0 0 0 500 0 0 0 20 0 1 0 1000 409600 3 0 0\n",
+        )
+        .expect("process stat");
+        fs::write(
+            process.join("status"),
+            "Name:\tworker\nUid:\t0\t0\t0\t0\nVmRSS:\t1000 kB\n",
+        )
+        .expect("process status");
+        fs::write(process.join("cmdline"), b"worker\0").expect("process cmdline");
+        let clock = Arc::new(ProcessClock(AtomicU64::new(1_000)));
+        let collector = os_sense::ProcfsCollector::with_process_dependencies(
+            proc_root,
+            sys_root,
+            clock.clone(),
+            clock.clone(),
+            Arc::new(PartitionUsage),
+            os_sense::ProcessSystemParameters {
+                clock_ticks_per_second: 250,
+                page_size_bytes: 8_192,
+            },
+            Arc::new(UserResolver),
+        );
+        let mut runtime = os_sense::OsSenseRuntime::with_parts(
+            collector,
+            os_sense::OsSenseStore::in_memory().expect("store"),
+            os_sense::OsSenseRuntimeConfig::default(),
+            1_000,
+        )
+        .expect("runtime");
+
+        let first = super::run_os_process_list_with_runtime(
+            &mut runtime,
+            &os_sense::ProcessQuery::default(),
+        )
+        .expect("first process list");
+        let first: Value = serde_json::from_str(&first).expect("first JSON");
+        assert_eq!(first["processes"][0]["cpu_rate_status"], "warming_up");
+        assert!(first["processes"][0]["cpu_usage_percent"].is_null());
+
+        clock.0.store(3_000, Ordering::SeqCst);
+        fs::write(
+            process.join("stat"),
+            "77 (worker) S 1 2 3 4 5 0 0 0 0 0 625 0 0 0 20 0 1 0 1000 409600 3 0 0\n",
+        )
+        .expect("updated process stat");
+        let second = super::run_os_process_list_with_runtime(
+            &mut runtime,
+            &os_sense::ProcessQuery::default(),
+        )
+        .expect("second process list");
+        let second: Value = serde_json::from_str(&second).expect("second JSON");
+        assert_eq!(second["processes"][0]["cpu_rate_status"], "ready");
+        assert_eq!(second["processes"][0]["cpu_sample_interval_ms"], 2_000);
+        assert_eq!(second["processes"][0]["cpu_usage_percent"], 25.0);
+
+        drop(runtime);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
