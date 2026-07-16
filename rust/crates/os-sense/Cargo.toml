@@ -8,6 +8,7 @@ description = "Read-only OS environment sensing collectors and context aggregati
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ipnet = "2.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

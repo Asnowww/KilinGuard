@@ -1,15 +1,20 @@
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Component, Path};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use crate::command::run_limited_command;
 use crate::error::{OsSenseError, Result};
 use crate::model::{
     CollectionStatus, DnsCheck, FirewallStatus, HealthProbeResult, NetworkAnomaly,
-    NetworkConnection, NetworkSnapshot, NetworkSourceStatus,
+    NetworkAnomalyEvidence, NetworkBaseline, NetworkBaselineEntry, NetworkConnection,
+    NetworkSnapshot, NetworkSourceStatus,
 };
 use crate::procfs::basic_meta;
 
@@ -24,6 +29,15 @@ const MAX_PROC_NET_BYTES_PER_SOURCE: usize = 512 * 1024;
 const MAX_PROC_NET_LINES_PER_SOURCE: usize = 16_384;
 const MAX_CONNECTIONS_PER_SOURCE: usize = 4_096;
 const MAX_REMOTE_FILTER_CHARS: usize = 128;
+const MAX_NETWORK_ANOMALIES: usize = 32;
+const TIME_WAIT_GROUP_THRESHOLD: usize = 20;
+const PORT_SCAN_DISTINCT_PORT_THRESHOLD: usize = 10;
+const MAX_NETWORK_BASELINE_ID_CHARS: usize = 64;
+const MAX_NETWORK_BASELINE_PATH_BYTES: usize = 4 * 1024;
+pub const NETWORK_BASELINE_VERSION: u32 = 1;
+pub const MAX_NETWORK_BASELINE_ENTRIES: usize = 256;
+pub const MAX_NETWORK_BASELINE_JSON_BYTES: usize = 64 * 1024;
+pub const OS_NETWORK_BASELINE_FILE_ENV: &str = "CLAW_OS_NETWORK_BASELINE_FILE";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const PROC_NET_SOURCES: [(&str, &str); 4] = [
     ("/proc/net/tcp", "tcp"),
@@ -31,6 +45,12 @@ const PROC_NET_SOURCES: [(&str, &str); 4] = [
     ("/proc/net/udp", "udp"),
     ("/proc/net/udp6", "udp6"),
 ];
+
+static CONFIGURED_NETWORK_BASELINE: LazyLock<std::result::Result<Option<NetworkBaseline>, String>> =
+    LazyLock::new(|| {
+        load_network_baseline_from_environment()
+            .map_err(|error| bounded_network_error(&error.to_string()))
+    });
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -50,6 +70,134 @@ pub struct TcpProbeRequest {
     pub host: String,
     pub port: u16,
     pub timeout_ms: Option<u64>,
+}
+
+impl NetworkBaseline {
+    pub fn from_json_bytes(value: &[u8]) -> Result<Self> {
+        if value.len() > MAX_NETWORK_BASELINE_JSON_BYTES {
+            return Err(OsSenseError::Configuration(format!(
+                "network baseline JSON must not exceed {MAX_NETWORK_BASELINE_JSON_BYTES} bytes"
+            )));
+        }
+        let baseline = serde_json::from_slice::<Self>(value).map_err(|error| {
+            OsSenseError::Configuration(format!("invalid network baseline JSON: {error}"))
+        })?;
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != NETWORK_BASELINE_VERSION {
+            return Err(OsSenseError::Configuration(format!(
+                "network baseline version must be {NETWORK_BASELINE_VERSION}"
+            )));
+        }
+        if self.id.is_empty()
+            || self.id.chars().count() > MAX_NETWORK_BASELINE_ID_CHARS
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(OsSenseError::Configuration(format!(
+                "network baseline id must contain 1 to {MAX_NETWORK_BASELINE_ID_CHARS} ASCII letters, digits, '.', '_', or '-'"
+            )));
+        }
+        if self.entries.len() > MAX_NETWORK_BASELINE_ENTRIES {
+            return Err(OsSenseError::Configuration(format!(
+                "network baseline must not contain more than {MAX_NETWORK_BASELINE_ENTRIES} entries"
+            )));
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            validate_network_baseline_entry(entry).map_err(|error| {
+                OsSenseError::Configuration(format!(
+                    "network baseline entries[{index}] is invalid: {error}"
+                ))
+            })?;
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            OsSenseError::Configuration(format!("failed to encode network baseline: {error}"))
+        })?;
+        if encoded.len() > MAX_NETWORK_BASELINE_JSON_BYTES {
+            return Err(OsSenseError::Configuration(format!(
+                "network baseline JSON must not exceed {MAX_NETWORK_BASELINE_JSON_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ValidatedOutboundRule {
+    protocol: String,
+    destination: IpNet,
+    port_range: Option<(u16, u16)>,
+}
+
+fn validate_network_baseline_entry(entry: &NetworkBaselineEntry) -> Result<ValidatedOutboundRule> {
+    let protocol = match entry.protocol.as_str() {
+        "tcp" | "tcp6" | "udp" | "udp6" => entry.protocol.clone(),
+        _ => {
+            return Err(OsSenseError::Configuration(
+                "protocol must be one of tcp, tcp6, udp, or udp6".to_string(),
+            ));
+        }
+    };
+    if entry.destination.is_empty()
+        || entry.destination.chars().count() > 128
+        || entry.destination.contains('\0')
+    {
+        return Err(OsSenseError::Configuration(
+            "destination must contain 1 to 128 characters without NUL".to_string(),
+        ));
+    }
+    let destination = parse_baseline_destination(&entry.destination)?;
+    let protocol_is_v6 = protocol.ends_with('6');
+    if protocol_is_v6 != matches!(destination, IpNet::V6(_)) {
+        return Err(OsSenseError::Configuration(
+            "protocol address family must match destination".to_string(),
+        ));
+    }
+    let port_range = match (entry.port_start, entry.port_end) {
+        (None, None) => None,
+        (Some(start), Some(end)) if start > 0 && start <= end => Some((start, end)),
+        _ => {
+            return Err(OsSenseError::Configuration(
+                "port_start and port_end must either both be absent or define an ordered range from 1 to 65535"
+                    .to_string(),
+            ));
+        }
+    };
+    Ok(ValidatedOutboundRule {
+        protocol,
+        destination,
+        port_range,
+    })
+}
+
+fn parse_baseline_destination(value: &str) -> Result<IpNet> {
+    if let Some((address, _)) = value.split_once('/') {
+        let address = address.parse::<IpAddr>().map_err(|_| {
+            OsSenseError::Configuration("destination CIDR address is invalid".to_string())
+        })?;
+        let network = value.parse::<IpNet>().map_err(|_| {
+            OsSenseError::Configuration("destination CIDR prefix is invalid".to_string())
+        })?;
+        if network.network() != address {
+            return Err(OsSenseError::Configuration(
+                "destination CIDR must use the canonical network address".to_string(),
+            ));
+        }
+        Ok(network)
+    } else {
+        let address = value.parse::<IpAddr>().map_err(|_| {
+            OsSenseError::Configuration("destination IP address is invalid".to_string())
+        })?;
+        let prefix = if address.is_ipv4() { 32 } else { 128 };
+        IpNet::new(address, prefix).map_err(|error| {
+            OsSenseError::Configuration(format!("destination IP address is invalid: {error}"))
+        })
+    }
 }
 
 impl NetworkQuery {
@@ -100,12 +248,25 @@ impl NetworkQuery {
 }
 
 pub fn collect_network(query: &NetworkQuery) -> Result<NetworkSnapshot> {
-    collect_network_with_reader(query, &SystemNetworkFileReader)
+    let baseline = match &*CONFIGURED_NETWORK_BASELINE {
+        Ok(baseline) => baseline.as_ref(),
+        Err(error) => return Err(OsSenseError::Configuration(error.clone())),
+    };
+    collect_network_with_reader_and_baseline(query, &SystemNetworkFileReader, baseline)
 }
 
+#[cfg(test)]
 fn collect_network_with_reader(
     query: &NetworkQuery,
     reader: &dyn NetworkFileReader,
+) -> Result<NetworkSnapshot> {
+    collect_network_with_reader_and_baseline(query, reader, None)
+}
+
+fn collect_network_with_reader_and_baseline(
+    query: &NetworkQuery,
+    reader: &dyn NetworkFileReader,
+    baseline: Option<&NetworkBaseline>,
 ) -> Result<NetworkSnapshot> {
     query.validate()?;
     let filter = ValidatedNetworkFilter::from_query(query)?;
@@ -114,6 +275,7 @@ fn collect_network_with_reader(
     let (mut connections, source_statuses) =
         collect_proc_net_connections(reader, &mut warnings, &mut omitted_warning_count);
     sort_and_deduplicate_connections(&mut connections);
+    let detected_anomalies = detect_network_anomalies(&connections, &source_statuses, baseline)?;
     connections.retain(|connection| filter.matches(connection));
     let total = connections.len();
     let connection_limit = query.limit.unwrap_or(DEFAULT_CONNECTION_LIMIT);
@@ -137,7 +299,10 @@ fn collect_network_with_reader(
         } else {
             CollectionStatus::Partial
         };
-    let anomalies = detect_network_anomalies(&connections);
+    let anomaly_total = detected_anomalies.total;
+    let omitted_anomaly_count = detected_anomalies.omitted_count;
+    let anomalies_truncated = omitted_anomaly_count > 0;
+    let anomalies = detected_anomalies.anomalies;
     connections.truncate(connection_limit);
 
     let dns_checks = query
@@ -171,6 +336,126 @@ fn collect_network_with_reader(
         tcp_probes,
         firewall,
         anomalies,
+        anomaly_total,
+        anomalies_truncated,
+        omitted_anomaly_count,
+    })
+}
+
+fn load_network_baseline_from_environment() -> Result<Option<NetworkBaseline>> {
+    let Some(path) = std::env::var_os(OS_NETWORK_BASELINE_FILE_ENV) else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Err(OsSenseError::Configuration(format!(
+            "{OS_NETWORK_BASELINE_FILE_ENV} must name a baseline JSON file"
+        )));
+    }
+    load_network_baseline_file(Path::new(&path)).map(Some)
+}
+
+fn load_network_baseline_file(path: &Path) -> Result<NetworkBaseline> {
+    validate_network_baseline_file_path(path)?;
+    let mut file = open_network_baseline_file(path)?;
+    let mut bytes = Vec::with_capacity(MAX_NETWORK_BASELINE_JSON_BYTES.min(8 * 1024));
+    file.by_ref()
+        .take((MAX_NETWORK_BASELINE_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            OsSenseError::Configuration(format!(
+                "failed to read network baseline file {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_NETWORK_BASELINE_JSON_BYTES {
+        return Err(OsSenseError::Configuration(format!(
+            "network baseline file {} exceeds {MAX_NETWORK_BASELINE_JSON_BYTES} bytes",
+            path.display()
+        )));
+    }
+    NetworkBaseline::from_json_bytes(&bytes).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "invalid network baseline file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn validate_network_baseline_file_path(path: &Path) -> Result<()> {
+    let path_bytes = path.as_os_str().to_string_lossy().len();
+    #[cfg(unix)]
+    let valid_encoding = path.to_str().is_some_and(|path| !path.contains('\0'));
+    #[cfg(not(unix))]
+    let valid_encoding = true;
+    let valid = valid_encoding
+        && path.is_absolute()
+        && path_bytes <= MAX_NETWORK_BASELINE_PATH_BYTES
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir);
+    if !valid {
+        return Err(OsSenseError::Configuration(format!(
+            "network baseline file path {} must be absolute, valid, at most {MAX_NETWORK_BASELINE_PATH_BYTES} bytes, and without '..'",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_network_baseline_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            OsSenseError::Configuration(format!(
+                "failed to securely open network baseline file {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to inspect network baseline file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(OsSenseError::Configuration(format!(
+            "network baseline file {} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(OsSenseError::Configuration(format!(
+            "network baseline file {} must not be group- or world-writable",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_network_baseline_file(path: &Path) -> Result<File> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to inspect network baseline file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(OsSenseError::Configuration(format!(
+            "network baseline file {} must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    OpenOptions::new().read(true).open(path).map_err(|error| {
+        OsSenseError::Configuration(format!(
+            "failed to securely open network baseline file {}: {error}",
+            path.display()
+        ))
     })
 }
 
@@ -679,49 +964,334 @@ fn probe_target_allowed(host: &str) -> bool {
     false
 }
 
-fn detect_network_anomalies(connections: &[NetworkConnection]) -> Vec<NetworkAnomaly> {
-    let mut anomalies = Vec::new();
-    let time_wait = connections
-        .iter()
-        .filter(|connection| connection.state == "TIME_WAIT")
-        .count();
-    if time_wait >= 100 {
-        anomalies.push(NetworkAnomaly {
-            kind: "many_time_wait".to_string(),
-            message: "TIME_WAIT connection count is elevated".to_string(),
-            count: time_wait,
-        });
-    }
-    let external_established = connections
-        .iter()
-        .filter(|connection| connection.state == "ESTABLISHED")
-        .filter(|connection| !is_private_or_local(connection_remote_address(connection)))
-        .count();
-    if external_established >= 20 {
-        anomalies.push(NetworkAnomaly {
-            kind: "many_external_connections".to_string(),
-            message: "established external connection count is elevated".to_string(),
-            count: external_established,
-        });
-    }
-    anomalies
+struct DetectedNetworkAnomalies {
+    anomalies: Vec<NetworkAnomaly>,
+    total: usize,
+    omitted_count: usize,
 }
 
-fn is_private_or_local(addr: &str) -> bool {
-    match addr.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => {
-            addr.is_unspecified() || addr.is_loopback() || addr.is_private() || addr.is_link_local()
+#[derive(Default)]
+struct ScanGroup {
+    local_ports: BTreeSet<u16>,
+    connection_count: usize,
+    states: BTreeSet<String>,
+}
+
+fn detect_network_anomalies(
+    connections: &[NetworkConnection],
+    source_statuses: &[NetworkSourceStatus],
+    baseline: Option<&NetworkBaseline>,
+) -> Result<DetectedNetworkAnomalies> {
+    let validated_rules = baseline
+        .map(|baseline| {
+            baseline.validate()?;
+            baseline
+                .entries
+                .iter()
+                .map(validate_network_baseline_entry)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let mut candidates = Vec::new();
+    detect_time_wait_groups(connections, source_statuses, &mut candidates);
+    if let (Some(baseline), Some(rules)) = (baseline, validated_rules.as_deref()) {
+        detect_unknown_outbound(
+            connections,
+            source_statuses,
+            baseline,
+            rules,
+            &mut candidates,
+        );
+    }
+    detect_inbound_port_scans(connections, source_statuses, &mut candidates);
+    Ok(select_network_anomalies_fair(candidates))
+}
+
+fn detect_time_wait_groups(
+    connections: &[NetworkConnection],
+    source_statuses: &[NetworkSourceStatus],
+    candidates: &mut Vec<NetworkAnomaly>,
+) {
+    let mut groups = BTreeMap::<(String, IpAddr, u16), usize>::new();
+    let mut total_time_wait_count = 0usize;
+    for connection in connections.iter().filter(|connection| {
+        matches!(connection.protocol.as_str(), "tcp" | "tcp6") && connection.state == "TIME_WAIT"
+    }) {
+        let Some((remote_address, remote_port)) = network_remote_endpoint(connection) else {
+            continue;
+        };
+        total_time_wait_count = total_time_wait_count.saturating_add(1);
+        *groups
+            .entry((connection.protocol.clone(), remote_address, remote_port))
+            .or_default() += 1;
+    }
+
+    for ((protocol, remote_address, remote_port), group_count) in groups {
+        if group_count < TIME_WAIT_GROUP_THRESHOLD {
+            continue;
         }
-        Ok(IpAddr::V6(addr)) => {
-            addr.is_unspecified()
-                || addr.is_loopback()
-                || (addr.segments()[0] & 0xfe00) == 0xfc00
-                || (addr.segments()[0] & 0xffc0) == 0xfe80
-                || addr
+        let subject = endpoint_subject(&protocol, remote_address, remote_port);
+        let input_complete = network_input_complete(source_statuses, &protocol);
+        candidates.push(NetworkAnomaly {
+            kind: "many_time_wait".to_string(),
+            message: format!(
+                "{group_count} TIME_WAIT connections are aggregated at remote endpoint {subject}"
+            ),
+            count: group_count,
+            score: if input_complete { 0.7 } else { 0.55 },
+            source: network_source_path(source_statuses, &protocol),
+            subject: Some(subject.clone()),
+            evidence: Some(NetworkAnomalyEvidence::TimeWaitGroup {
+                aggregation: "remote_endpoint".to_string(),
+                subject,
+                group_count,
+                total_time_wait_count,
+                threshold: TIME_WAIT_GROUP_THRESHOLD,
+                confidence: anomaly_confidence(input_complete).to_string(),
+                input_complete,
+            }),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detect_unknown_outbound(
+    connections: &[NetworkConnection],
+    source_statuses: &[NetworkSourceStatus],
+    baseline: &NetworkBaseline,
+    rules: &[ValidatedOutboundRule],
+    candidates: &mut Vec<NetworkAnomaly>,
+) {
+    let mut groups = BTreeMap::<(String, IpAddr, u16), usize>::new();
+    for connection in connections {
+        let Some((remote_address, remote_port)) = outbound_remote_endpoint(connection) else {
+            continue;
+        };
+        if rules.iter().any(|rule| {
+            rule.protocol == connection.protocol
+                && rule.destination.contains(&remote_address)
+                && rule
+                    .port_range
+                    .is_none_or(|(start, end)| (start..=end).contains(&remote_port))
+        }) {
+            continue;
+        }
+        *groups
+            .entry((connection.protocol.clone(), remote_address, remote_port))
+            .or_default() += 1;
+    }
+
+    for ((protocol, remote_address, remote_port), connection_count) in groups {
+        let subject = endpoint_subject(&protocol, remote_address, remote_port);
+        let input_complete = network_input_complete(source_statuses, &protocol);
+        candidates.push(NetworkAnomaly {
+            kind: "unknown_outbound".to_string(),
+            message: format!(
+                "outbound endpoint {subject} does not match network baseline `{}`",
+                baseline.id
+            ),
+            count: connection_count,
+            score: if input_complete { 0.9 } else { 0.7 },
+            source: network_source_path(source_statuses, &protocol),
+            subject: Some(subject),
+            evidence: Some(NetworkAnomalyEvidence::UnknownOutbound {
+                baseline_id: baseline.id.clone(),
+                baseline_version: baseline.version,
+                protocol,
+                remote_address: remote_address.to_string(),
+                remote_port,
+                connection_count,
+                confidence: anomaly_confidence(input_complete).to_string(),
+                input_complete,
+            }),
+        });
+    }
+}
+
+fn detect_inbound_port_scans(
+    connections: &[NetworkConnection],
+    source_statuses: &[NetworkSourceStatus],
+    candidates: &mut Vec<NetworkAnomaly>,
+) {
+    let mut groups = BTreeMap::<(String, IpAddr), ScanGroup>::new();
+    for connection in connections.iter().filter(|connection| {
+        matches!(connection.protocol.as_str(), "tcp" | "tcp6")
+            && matches!(connection.state.as_str(), "SYN_RECV" | "NEW_SYN_RECV")
+            && connection.local_port > 0
+    }) {
+        let Some((remote_address, _)) = valid_remote_endpoint(connection) else {
+            continue;
+        };
+        let group = groups
+            .entry((connection.protocol.clone(), remote_address))
+            .or_default();
+        group.local_ports.insert(connection.local_port);
+        group.connection_count = group.connection_count.saturating_add(1);
+        group.states.insert(connection.state.clone());
+    }
+
+    for ((protocol, remote_address), group) in groups {
+        let distinct_local_port_count = group.local_ports.len();
+        if distinct_local_port_count < PORT_SCAN_DISTINCT_PORT_THRESHOLD {
+            continue;
+        }
+        let input_complete = network_input_complete(source_statuses, &protocol);
+        let subject = remote_address.to_string();
+        candidates.push(NetworkAnomaly {
+            kind: "inbound_port_scan".to_string(),
+            message: format!(
+                "remote address {subject} has SYN_RECV connections across {distinct_local_port_count} distinct local ports"
+            ),
+            count: distinct_local_port_count,
+            score: if input_complete { 0.95 } else { 0.75 },
+            source: network_source_path(source_statuses, &protocol),
+            subject: Some(subject.clone()),
+            evidence: Some(NetworkAnomalyEvidence::PortScanIndication {
+                protocol,
+                remote_address: subject,
+                distinct_local_port_count,
+                connection_count: group.connection_count,
+                distinct_port_threshold: PORT_SCAN_DISTINCT_PORT_THRESHOLD,
+                states: group.states.into_iter().collect(),
+                confidence: anomaly_confidence(input_complete).to_string(),
+                input_complete,
+            }),
+        });
+    }
+}
+
+fn outbound_remote_endpoint(connection: &NetworkConnection) -> Option<(IpAddr, u16)> {
+    if !matches!(
+        (connection.protocol.as_str(), connection.state.as_str()),
+        ("tcp" | "tcp6", "SYN_SENT") | ("udp" | "udp6", "ESTABLISHED")
+    ) {
+        return None;
+    }
+    valid_remote_endpoint(connection)
+}
+
+fn valid_remote_endpoint(connection: &NetworkConnection) -> Option<(IpAddr, u16)> {
+    let endpoint = network_remote_endpoint(connection)?;
+    is_true_remote_address(endpoint.0).then_some(endpoint)
+}
+
+fn network_remote_endpoint(connection: &NetworkConnection) -> Option<(IpAddr, u16)> {
+    if connection.remote_port == 0 {
+        return None;
+    }
+    let address = connection_remote_address(connection)
+        .parse::<IpAddr>()
+        .ok()?;
+    let family_matches = match connection.protocol.as_str() {
+        "tcp" | "udp" => address.is_ipv4(),
+        "tcp6" | "udp6" => address.is_ipv6(),
+        _ => false,
+    };
+    if !family_matches || address.is_unspecified() {
+        return None;
+    }
+    Some((address, connection.remote_port))
+}
+
+fn is_true_remote_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => !address.is_unspecified() && !address.is_loopback(),
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address
                     .to_ipv4_mapped()
-                    .is_some_and(|mapped| mapped.is_loopback() || mapped.is_private())
+                    .is_some_and(|mapped| mapped.is_loopback())
         }
-        Err(_) => false,
+    }
+}
+
+fn network_input_complete(source_statuses: &[NetworkSourceStatus], protocol: &str) -> bool {
+    let mut matching = source_statuses
+        .iter()
+        .filter(|status| status.protocol == protocol);
+    let Some(status) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && status.status == CollectionStatus::Complete
+        && !status.truncated
+        && status.parse_failure_count == 0
+}
+
+fn network_source_path(source_statuses: &[NetworkSourceStatus], protocol: &str) -> Option<String> {
+    source_statuses
+        .iter()
+        .find(|status| status.protocol == protocol)
+        .map(|status| status.actual_path.clone())
+        .or_else(|| {
+            PROC_NET_SOURCES
+                .iter()
+                .find(|(_, source_protocol)| *source_protocol == protocol)
+                .map(|(path, _)| (*path).to_string())
+        })
+}
+
+fn anomaly_confidence(input_complete: bool) -> &'static str {
+    if input_complete {
+        "high"
+    } else {
+        "limited"
+    }
+}
+
+fn endpoint_subject(protocol: &str, address: IpAddr, port: u16) -> String {
+    match address {
+        IpAddr::V4(address) => format!("{protocol}://{address}:{port}"),
+        IpAddr::V6(address) => format!("{protocol}://[{address}]:{port}"),
+    }
+}
+
+fn select_network_anomalies_fair(candidates: Vec<NetworkAnomaly>) -> DetectedNetworkAnomalies {
+    let total = candidates.len();
+    let mut groups = BTreeMap::<(String, String), Vec<NetworkAnomaly>>::new();
+    for anomaly in candidates {
+        groups
+            .entry((
+                anomaly.kind.clone(),
+                anomaly.source.clone().unwrap_or_default(),
+            ))
+            .or_default()
+            .push(anomaly);
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|(key, mut anomalies)| {
+            anomalies.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| right.count.cmp(&left.count))
+                    .then_with(|| left.subject.cmp(&right.subject))
+                    .then_with(|| left.message.cmp(&right.message))
+            });
+            (key, VecDeque::from(anomalies))
+        })
+        .collect::<Vec<_>>();
+    let mut anomalies = Vec::with_capacity(total.min(MAX_NETWORK_ANOMALIES));
+    while anomalies.len() < MAX_NETWORK_ANOMALIES {
+        let previous_len = anomalies.len();
+        for (_, group) in &mut groups {
+            if anomalies.len() == MAX_NETWORK_ANOMALIES {
+                break;
+            }
+            if let Some(anomaly) = group.pop_front() {
+                anomalies.push(anomaly);
+            }
+        }
+        if anomalies.len() == previous_len {
+            break;
+        }
+    }
+    DetectedNetworkAnomalies {
+        omitted_count: total.saturating_sub(anomalies.len()),
+        anomalies,
+        total,
     }
 }
 
@@ -828,6 +1398,62 @@ mod tests {
         let mut output = HEADER.to_string();
         output.extend(rows);
         output
+    }
+
+    fn complete_source_statuses() -> Vec<NetworkSourceStatus> {
+        PROC_NET_SOURCES
+            .iter()
+            .map(|(path, protocol)| NetworkSourceStatus {
+                protocol: (*protocol).to_string(),
+                actual_path: (*path).to_string(),
+                available: true,
+                status: CollectionStatus::Complete,
+                error: None,
+                entry_count: 0,
+                parse_failure_count: 0,
+                truncated: false,
+            })
+            .collect()
+    }
+
+    fn connection(
+        protocol: &str,
+        local_address: &str,
+        local_port: u16,
+        remote_address: &str,
+        remote_port: u16,
+        state: &str,
+        inode: u64,
+    ) -> NetworkConnection {
+        NetworkConnection {
+            protocol: protocol.to_string(),
+            local_addr: local_address.to_string(),
+            local_address: local_address.to_string(),
+            local_port,
+            remote_addr: remote_address.to_string(),
+            remote_address: remote_address.to_string(),
+            remote_port,
+            state: state.to_string(),
+            inode: Some(inode.to_string()),
+            uid: Some(1_000),
+        }
+    }
+
+    fn baseline(entries: Vec<NetworkBaselineEntry>) -> NetworkBaseline {
+        NetworkBaseline {
+            version: NETWORK_BASELINE_VERSION,
+            id: "network-test".to_string(),
+            entries,
+        }
+    }
+
+    fn rule(protocol: &str, destination: &str, port: Option<u16>) -> NetworkBaselineEntry {
+        NetworkBaselineEntry {
+            protocol: protocol.to_string(),
+            destination: destination.to_string(),
+            port_start: port,
+            port_end: port,
+        }
     }
 
     #[test]
@@ -1185,7 +1811,11 @@ mod tests {
             "dns_checks": [],
             "tcp_probes": [],
             "firewall": [],
-            "anomalies": []
+            "anomalies": [{
+                "kind": "legacy_network_anomaly",
+                "message": "legacy anomaly",
+                "count": 1
+            }]
         });
         let snapshot: NetworkSnapshot =
             serde_json::from_value(legacy).expect("legacy network snapshot");
@@ -1195,25 +1825,453 @@ mod tests {
         assert_eq!(snapshot.connections[0].local_addr, "127.0.0.1");
         assert!(snapshot.connections[0].local_address.is_empty());
         assert_eq!(snapshot.connections[0].uid, None);
+        assert_eq!(snapshot.anomaly_total, 0);
+        assert!(!snapshot.anomalies_truncated);
+        assert_eq!(snapshot.omitted_anomaly_count, 0);
+        assert_eq!(snapshot.anomalies[0].score, 0.0);
+        assert_eq!(snapshot.anomalies[0].source, None);
+        assert_eq!(snapshot.anomalies[0].subject, None);
+        assert_eq!(snapshot.anomalies[0].evidence, None);
     }
 
     #[test]
-    fn detects_many_time_wait_connections() {
-        let connections = (0..100)
-            .map(|idx| NetworkConnection {
-                protocol: "tcp".to_string(),
-                local_addr: "127.0.0.1".to_string(),
-                local_address: "127.0.0.1".to_string(),
-                local_port: idx,
-                remote_addr: "127.0.0.1".to_string(),
-                remote_address: "127.0.0.1".to_string(),
-                remote_port: 80,
-                state: "TIME_WAIT".to_string(),
-                inode: None,
-                uid: None,
+    fn time_wait_aggregation_uses_the_twenty_connection_boundary() {
+        let connections = (0..TIME_WAIT_GROUP_THRESHOLD)
+            .map(|index| {
+                connection(
+                    "tcp",
+                    "10.0.0.1",
+                    40_000 + index as u16,
+                    "198.51.100.10",
+                    443,
+                    "TIME_WAIT",
+                    index as u64,
+                )
             })
             .collect::<Vec<_>>();
-        let anomalies = detect_network_anomalies(&connections);
-        assert!(anomalies.iter().any(|item| item.kind == "many_time_wait"));
+        let statuses = complete_source_statuses();
+        let below = detect_network_anomalies(
+            &connections[..TIME_WAIT_GROUP_THRESHOLD - 1],
+            &statuses,
+            None,
+        )
+        .expect("below TIME_WAIT threshold");
+        assert!(!below
+            .anomalies
+            .iter()
+            .any(|anomaly| anomaly.kind == "many_time_wait"));
+
+        let result = detect_network_anomalies(&connections, &statuses, None)
+            .expect("network anomaly detection");
+        let anomaly = result
+            .anomalies
+            .iter()
+            .find(|anomaly| anomaly.kind == "many_time_wait")
+            .expect("TIME_WAIT aggregate");
+        assert_eq!(anomaly.count, TIME_WAIT_GROUP_THRESHOLD);
+        assert!(matches!(
+            anomaly.evidence.as_ref(),
+            Some(NetworkAnomalyEvidence::TimeWaitGroup {
+                group_count: TIME_WAIT_GROUP_THRESHOLD,
+                threshold: TIME_WAIT_GROUP_THRESHOLD,
+                input_complete: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inbound_scan_requires_ten_distinct_syn_recv_local_ports() {
+        let mut connections = (0..(PORT_SCAN_DISTINCT_PORT_THRESHOLD - 1))
+            .map(|index| {
+                connection(
+                    "tcp",
+                    "10.0.0.1",
+                    1_000 + index as u16,
+                    "198.51.100.20",
+                    50_000 + index as u16,
+                    "SYN_RECV",
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        connections.push(connection(
+            "tcp",
+            "10.0.0.1",
+            1_000,
+            "198.51.100.20",
+            60_000,
+            "SYN_RECV",
+            100,
+        ));
+        for (index, state) in ["ESTABLISHED", "TIME_WAIT", "SYN_SENT"]
+            .into_iter()
+            .enumerate()
+        {
+            connections.push(connection(
+                "tcp",
+                "10.0.0.1",
+                2_000 + index as u16,
+                "198.51.100.20",
+                61_000 + index as u16,
+                state,
+                200 + index as u64,
+            ));
+        }
+        let statuses = complete_source_statuses();
+        let below =
+            detect_network_anomalies(&connections, &statuses, None).expect("below scan threshold");
+        assert!(!below
+            .anomalies
+            .iter()
+            .any(|anomaly| anomaly.kind == "inbound_port_scan"));
+
+        connections.push(connection(
+            "tcp",
+            "10.0.0.1",
+            1_000 + (PORT_SCAN_DISTINCT_PORT_THRESHOLD - 1) as u16,
+            "198.51.100.20",
+            62_000,
+            "SYN_RECV",
+            300,
+        ));
+        let result =
+            detect_network_anomalies(&connections, &statuses, None).expect("scan threshold");
+        let anomaly = result
+            .anomalies
+            .iter()
+            .find(|anomaly| anomaly.kind == "inbound_port_scan")
+            .expect("inbound scan anomaly");
+        assert!(matches!(
+            anomaly.evidence.as_ref(),
+            Some(NetworkAnomalyEvidence::PortScanIndication {
+                distinct_local_port_count: PORT_SCAN_DISTINCT_PORT_THRESHOLD,
+                connection_count: 11,
+                states,
+                ..
+            }) if states == &["SYN_RECV".to_string()]
+        ));
+    }
+
+    #[test]
+    fn query_filters_and_limit_do_not_change_the_anomaly_domain() {
+        let mut rows = (0..TIME_WAIT_GROUP_THRESHOLD)
+            .map(|index| {
+                proc_row(
+                    index,
+                    &format!("0100000A:{:04X}", 40_000 + index),
+                    "0A6433C6:01BB",
+                    "06",
+                    1_000,
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push(proc_row(
+            100,
+            "00000000:0050",
+            "00000000:0000",
+            "0A",
+            0,
+            100,
+        ));
+        rows.push(proc_row(
+            101,
+            "00000000:0051",
+            "00000000:0000",
+            "0A",
+            0,
+            101,
+        ));
+        let reader = FixtureNetworkFileReader::complete().with_text("/proc/net/tcp", table(rows));
+        let snapshot = collect_network_with_reader(
+            &NetworkQuery {
+                state: Some("LISTEN".to_string()),
+                limit: Some(1),
+                ..NetworkQuery::default()
+            },
+            &reader,
+        )
+        .expect("filtered network collection");
+
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.connections.len(), 1);
+        assert_eq!(snapshot.anomaly_total, 1);
+        assert_eq!(snapshot.anomalies[0].kind, "many_time_wait");
+        assert_eq!(snapshot.anomalies[0].count, TIME_WAIT_GROUP_THRESHOLD);
+    }
+
+    #[test]
+    fn baseline_none_disables_unknown_empty_denies_all_and_invalid_fails_closed() {
+        let connections = vec![connection(
+            "tcp",
+            "10.0.0.1",
+            40_000,
+            "198.51.100.30",
+            443,
+            "SYN_SENT",
+            1,
+        )];
+        let statuses = complete_source_statuses();
+        let disabled = detect_network_anomalies(&connections, &statuses, None)
+            .expect("disabled outbound baseline");
+        assert!(!disabled
+            .anomalies
+            .iter()
+            .any(|anomaly| anomaly.kind == "unknown_outbound"));
+
+        let deny_all = baseline(Vec::new());
+        let denied = detect_network_anomalies(&connections, &statuses, Some(&deny_all))
+            .expect("empty baseline is deny-all");
+        assert_eq!(
+            denied
+                .anomalies
+                .iter()
+                .filter(|anomaly| anomaly.kind == "unknown_outbound")
+                .count(),
+            1
+        );
+
+        let invalid = NetworkBaseline {
+            version: NETWORK_BASELINE_VERSION + 1,
+            ..deny_all
+        };
+        assert!(matches!(
+            detect_network_anomalies(&connections, &statuses, Some(&invalid)),
+            Err(OsSenseError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_outbound_uses_only_syn_sent_tcp_and_connected_udp() {
+        let mut connections = ["ESTABLISHED", "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| {
+                connection(
+                    "tcp",
+                    "10.0.0.1",
+                    40_000 + index as u16,
+                    &format!("198.51.100.{}", 40 + index),
+                    443,
+                    state,
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        connections.push(connection(
+            "tcp",
+            "10.0.0.1",
+            41_000,
+            "198.51.100.50",
+            443,
+            "SYN_SENT",
+            10,
+        ));
+        connections.push(connection(
+            "udp",
+            "10.0.0.1",
+            42_000,
+            "198.51.100.51",
+            53,
+            "ESTABLISHED",
+            11,
+        ));
+        connections.push(connection(
+            "udp",
+            "0.0.0.0",
+            53,
+            "0.0.0.0",
+            0,
+            "UNCONNECTED",
+            12,
+        ));
+        let result = detect_network_anomalies(
+            &connections,
+            &complete_source_statuses(),
+            Some(&baseline(Vec::new())),
+        )
+        .expect("direction-safe outbound detection");
+        let mut protocols = result
+            .anomalies
+            .iter()
+            .filter_map(|anomaly| match anomaly.evidence.as_ref() {
+                Some(NetworkAnomalyEvidence::UnknownOutbound { protocol, .. }) => {
+                    Some(protocol.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        protocols.sort_unstable();
+        assert_eq!(protocols, ["tcp", "udp"]);
+    }
+
+    #[test]
+    fn ipv4_ipv6_and_mapped_tcp6_rules_match_cidr_address_and_port() {
+        let configured = baseline(vec![
+            rule("tcp", "203.0.113.0/24", Some(443)),
+            rule("tcp6", "2001:db8::/32", Some(443)),
+            rule("tcp6", "::ffff:192.0.2.10/128", Some(443)),
+        ]);
+        configured.validate().expect("valid dual-stack baseline");
+        let cases = [
+            ("tcp", "203.0.113.10", 443),
+            ("tcp", "203.0.114.10", 443),
+            ("tcp", "203.0.113.10", 444),
+            ("tcp6", "2001:db8::10", 443),
+            ("tcp6", "2001:db9::10", 443),
+            ("tcp6", "::ffff:192.0.2.10", 443),
+        ];
+        let connections = cases
+            .into_iter()
+            .enumerate()
+            .map(|(index, (protocol, remote, port))| {
+                connection(
+                    protocol,
+                    if protocol == "tcp" {
+                        "10.0.0.1"
+                    } else {
+                        "2001:db8:ffff::1"
+                    },
+                    40_000 + index as u16,
+                    remote,
+                    port,
+                    "SYN_SENT",
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let result =
+            detect_network_anomalies(&connections, &complete_source_statuses(), Some(&configured))
+                .expect("CIDR matching");
+        let rejected = result
+            .anomalies
+            .iter()
+            .filter_map(|anomaly| match anomaly.evidence.as_ref() {
+                Some(NetworkAnomalyEvidence::UnknownOutbound {
+                    remote_address,
+                    remote_port,
+                    ..
+                }) => Some((remote_address.as_str(), *remote_port)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rejected,
+            BTreeSet::from([
+                ("2001:db9::10", 443),
+                ("203.0.113.10", 444),
+                ("203.0.114.10", 443),
+            ])
+        );
+    }
+
+    #[test]
+    fn anomaly_completeness_uses_only_the_unique_protocol_source() {
+        let connections = vec![connection(
+            "tcp",
+            "10.0.0.1",
+            40_000,
+            "198.51.100.60",
+            443,
+            "SYN_SENT",
+            1,
+        )];
+        let configured = baseline(Vec::new());
+        let mut statuses = complete_source_statuses();
+        let udp = statuses
+            .iter_mut()
+            .find(|status| status.protocol == "udp")
+            .expect("UDP status");
+        udp.status = CollectionStatus::Failed;
+        udp.available = false;
+        let complete = detect_network_anomalies(&connections, &statuses, Some(&configured))
+            .expect("unrelated source failure");
+        assert!(matches!(
+            complete.anomalies[0].evidence.as_ref(),
+            Some(NetworkAnomalyEvidence::UnknownOutbound {
+                input_complete: true,
+                ..
+            })
+        ));
+
+        let tcp = statuses
+            .iter_mut()
+            .find(|status| status.protocol == "tcp")
+            .expect("TCP status");
+        tcp.status = CollectionStatus::Partial;
+        tcp.parse_failure_count = 1;
+        let partial = detect_network_anomalies(&connections, &statuses, Some(&configured))
+            .expect("relevant source partial");
+        assert!(matches!(
+            partial.anomalies[0].evidence.as_ref(),
+            Some(NetworkAnomalyEvidence::UnknownOutbound {
+                input_complete: false,
+                ..
+            })
+        ));
+
+        statuses.push(statuses[0].clone());
+        let duplicate = detect_network_anomalies(&connections, &statuses, Some(&configured))
+            .expect("duplicate source status");
+        assert!(matches!(
+            duplicate.anomalies[0].evidence.as_ref(),
+            Some(NetworkAnomalyEvidence::UnknownOutbound {
+                input_complete: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn network_anomaly_output_is_fair_and_hard_bounded() {
+        let mut connections = (0..40)
+            .map(|index| {
+                connection(
+                    "tcp",
+                    "10.0.0.1",
+                    40_000 + index as u16,
+                    &format!("198.51.100.{}", index + 1),
+                    443,
+                    "SYN_SENT",
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        connections.extend((0..TIME_WAIT_GROUP_THRESHOLD).map(|index| {
+            connection(
+                "tcp",
+                "10.0.0.1",
+                50_000 + index as u16,
+                "203.0.113.200",
+                443,
+                "TIME_WAIT",
+                100 + index as u64,
+            )
+        }));
+        connections.extend((0..PORT_SCAN_DISTINCT_PORT_THRESHOLD).map(|index| {
+            connection(
+                "tcp",
+                "10.0.0.1",
+                1_000 + index as u16,
+                "192.0.2.200",
+                60_000 + index as u16,
+                "SYN_RECV",
+                200 + index as u64,
+            )
+        }));
+        let result = detect_network_anomalies(
+            &connections,
+            &complete_source_statuses(),
+            Some(&baseline(Vec::new())),
+        )
+        .expect("bounded fair anomaly output");
+
+        assert_eq!(result.total, 42);
+        assert_eq!(result.anomalies.len(), MAX_NETWORK_ANOMALIES);
+        assert_eq!(result.omitted_count, 10);
+        for kind in ["unknown_outbound", "many_time_wait", "inbound_port_scan"] {
+            assert!(result.anomalies.iter().any(|anomaly| anomaly.kind == kind));
+        }
     }
 }

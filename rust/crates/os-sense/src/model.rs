@@ -703,6 +703,12 @@ pub struct NetworkSnapshot {
     pub tcp_probes: Vec<HealthProbeResult>,
     pub firewall: Vec<FirewallStatus>,
     pub anomalies: Vec<NetworkAnomaly>,
+    #[serde(default)]
+    pub anomaly_total: usize,
+    #[serde(default)]
+    pub anomalies_truncated: bool,
+    #[serde(default)]
+    pub omitted_anomaly_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -738,6 +744,25 @@ pub struct NetworkSourceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkBaseline {
+    pub version: u32,
+    pub id: String,
+    pub entries: Vec<NetworkBaselineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkBaselineEntry {
+    pub protocol: String,
+    pub destination: String,
+    #[serde(default)]
+    pub port_start: Option<u16>,
+    #[serde(default)]
+    pub port_end: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsCheck {
     pub name: String,
     pub resolved_addrs: Vec<String>,
@@ -766,6 +791,48 @@ pub struct NetworkAnomaly {
     pub kind: String,
     pub message: String,
     pub count: usize,
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<NetworkAnomalyEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "metric", rename_all = "snake_case")]
+pub enum NetworkAnomalyEvidence {
+    TimeWaitGroup {
+        aggregation: String,
+        subject: String,
+        group_count: usize,
+        total_time_wait_count: usize,
+        threshold: usize,
+        confidence: String,
+        input_complete: bool,
+    },
+    UnknownOutbound {
+        baseline_id: String,
+        baseline_version: u32,
+        protocol: String,
+        remote_address: String,
+        remote_port: u16,
+        connection_count: usize,
+        confidence: String,
+        input_complete: bool,
+    },
+    PortScanIndication {
+        protocol: String,
+        remote_address: String,
+        distinct_local_port_count: usize,
+        connection_count: usize,
+        distinct_port_threshold: usize,
+        states: Vec<String>,
+        confidence: String,
+        input_complete: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

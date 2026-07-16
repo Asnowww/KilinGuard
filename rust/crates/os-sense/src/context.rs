@@ -292,11 +292,20 @@ fn build_health_summary(
         ));
     }
     if let Some(network) = network {
+        let omitted = if network.anomalies_truncated {
+            format!(
+                " ({} omitted from returned details)",
+                network.omitted_anomaly_count
+            )
+        } else {
+            String::new()
+        };
         parts.push(format!(
-            "network: {} matched connections ({} returned), {} anomalies, {:?}",
+            "network: {} matched connections ({} returned), {} anomalies{}, {:?}",
             network.total,
             network.connections.len(),
-            network.anomalies.len(),
+            network.anomaly_total,
+            omitted,
             network.collection_status
         ));
     }
@@ -327,5 +336,28 @@ mod tests {
     fn health_intent_collects_all_dimensions() {
         let dims = dimensions_for_intent(Some("overall health"));
         assert_eq!(dims, all_dimensions());
+    }
+
+    #[test]
+    fn network_summary_reports_total_and_omitted_anomalies() {
+        let network = crate::model::NetworkSnapshot {
+            meta: crate::procfs::basic_meta("network", Vec::new()),
+            truncated: false,
+            collection_status: crate::model::CollectionStatus::Complete,
+            source_statuses: Vec::new(),
+            total: 7,
+            filter_complete: true,
+            omitted_warning_count: 0,
+            connections: Vec::new(),
+            dns_checks: Vec::new(),
+            tcp_probes: Vec::new(),
+            firewall: Vec::new(),
+            anomalies: Vec::new(),
+            anomaly_total: 35,
+            anomalies_truncated: true,
+            omitted_anomaly_count: 3,
+        };
+        let summary = build_health_summary(None, None, None, Some(&network), None, 0);
+        assert!(summary.contains("35 anomalies (3 omitted from returned details)"));
     }
 }

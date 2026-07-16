@@ -30,13 +30,16 @@ pub use model::{
     FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogLlmSummaryOutput,
     LogPattern, LogPatternEvidence, LogQueryResult, LogSourceStatus, LogSummary,
     LogSummaryBoundary, LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange,
-    MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
-    NetworkMetricsSnapshot, NetworkSnapshot, NetworkSourceStatus, OsContext, OsSampleMeta,
-    PlatformInfo, ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo,
-    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
-    TemperatureReading, ThermalSnapshot,
+    MemorySnapshot, MetricSnapshot, NetworkAnomalyEvidence, NetworkBaseline, NetworkBaselineEntry,
+    NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot, NetworkSnapshot,
+    NetworkSourceStatus, OsContext, OsSampleMeta, PlatformInfo, ProcessAnomalyEvidence,
+    ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
+    SensorAvailability, ServiceSnapshot, ServiceUnit, TemperatureReading, ThermalSnapshot,
 };
-pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
+pub use network::{
+    collect_network, NetworkQuery, TcpProbeRequest, MAX_NETWORK_BASELINE_ENTRIES,
+    MAX_NETWORK_BASELINE_JSON_BYTES, NETWORK_BASELINE_VERSION, OS_NETWORK_BASELINE_FILE_ENV,
+};
 pub use procfs::{
     collect_metrics, collect_processes, Clock, KylinPartitionUsageProvider,
     KylinProcessUserResolver, MetricsThresholds, MonotonicClock, PartitionUsageProvider,
