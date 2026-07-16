@@ -76,12 +76,14 @@ pub(crate) fn collect_context_with(
     } else {
         None
     };
-    let services = include_services.then(|| {
-        query_services(&ServiceQuery {
+    let services = if include_services {
+        Some(query_services(&ServiceQuery {
             limit: Some(100),
             ..ServiceQuery::default()
-        })
-    });
+        })?)
+    } else {
+        None
+    };
 
     let mut dimensions = Vec::new();
     if metrics.is_some() {
@@ -353,9 +355,12 @@ fn build_health_summary(
     }
     if let Some(services) = services {
         parts.push(format!(
-            "services: {} units, {} failed",
-            services.units.len(),
-            services.failed_units.len()
+            "services: {} matched units ({} returned, {} omitted), {} failed, {:?}",
+            services.total,
+            services.returned_count,
+            services.omitted_count,
+            services.failed_units.len(),
+            services.collection_status
         ));
     }
     if parts.is_empty() {

@@ -1486,11 +1486,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_service_status",
-            description: "Query systemd service units, failed-service reasons, dependency fields, and optional TCP health probes using fixed systemctl invocations.",
+            description: "Enumerate and merge bounded Kylin Linux systemd runtime service units and installed service unit files, with structured per-source collection status, stable filtering, and optional TCP health probes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "maxLength": 256 },
+                    "name": { "type": "string", "minLength": 9, "maxLength": 256, "pattern": "^[A-Za-z0-9_.@:\\\\-]+\\.service$" },
                     "include_all": { "type": "boolean" },
                     "include_dependencies": { "type": "boolean" },
                     "include_ports": { "type": "boolean" },
@@ -1508,7 +1508,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 4096 }
                 },
                 "additionalProperties": false
             }),
@@ -2460,7 +2460,8 @@ fn run_os_network_connections(input: OsNetworkQuery) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_os_service_status(input: OsServiceQuery) -> Result<String, String> {
-    to_pretty_json(query_services(&input))
+    let services = query_services(&input).map_err(|error| error.to_string())?;
+    to_pretty_json(services)
 }
 
 #[allow(clippy::needless_pass_by_value)]

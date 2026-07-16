@@ -1172,24 +1172,89 @@ pub enum NetworkAnomalyEvidence {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ServiceSnapshot {
     pub meta: OsSampleMeta,
     pub available: bool,
     pub truncated: bool,
+    #[serde(default)]
+    pub collection_status: CollectionStatus,
+    #[serde(default)]
+    pub source_statuses: Vec<ServiceSourceStatus>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub returned_count: usize,
+    #[serde(default)]
+    pub omitted_count: usize,
+    #[serde(default)]
+    pub failed_total: usize,
+    #[serde(default)]
+    pub failed_returned_count: usize,
+    #[serde(default)]
+    pub failed_omitted_count: usize,
+    #[serde(default)]
+    pub failed_filter_complete: bool,
+    #[serde(default = "default_filter_complete")]
+    pub filter_complete: bool,
+    #[serde(default)]
+    pub omitted_warning_count: usize,
     pub units: Vec<ServiceUnit>,
     pub failed_units: Vec<ServiceUnit>,
     pub health_probes: Vec<HealthProbeResult>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceSource {
+    ListUnits,
+    ListUnitFiles,
+    Show,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceSourceStatus {
+    pub source: ServiceSource,
+    pub available: bool,
+    pub status: CollectionStatus,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub parse_failure_count: usize,
+    #[serde(default)]
+    pub duplicate_count: usize,
+    #[serde(default)]
+    pub conflict_count: usize,
+    pub entry_count: usize,
+    #[serde(default)]
+    pub omitted_count: usize,
+    #[serde(default)]
+    pub total_unknown: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ServiceUnit {
     pub name: String,
     pub load_state: Option<String>,
     pub active_state: Option<String>,
     pub sub_state: Option<String>,
     pub unit_file_state: Option<String>,
+    #[serde(default)]
+    pub unit_file_preset: Option<String>,
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub runtime_present: bool,
+    #[serde(default)]
+    pub sources: Vec<ServiceSource>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub description_truncated: bool,
     pub result: Option<String>,
     pub exec_main_status: Option<i32>,
     pub fragment_path: Option<String>,
@@ -1198,6 +1263,205 @@ pub struct ServiceUnit {
     pub after: Vec<String>,
     pub before: Vec<String>,
     pub ports: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ServiceUnit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawServiceUnit {
+            name: String,
+            #[serde(default)]
+            load_state: Option<String>,
+            #[serde(default)]
+            active_state: Option<String>,
+            #[serde(default)]
+            sub_state: Option<String>,
+            #[serde(default)]
+            unit_file_state: Option<String>,
+            #[serde(default)]
+            unit_file_preset: Option<String>,
+            #[serde(default)]
+            loaded: Option<bool>,
+            #[serde(default)]
+            runtime_present: Option<bool>,
+            #[serde(default)]
+            sources: Option<Vec<ServiceSource>>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            description_truncated: Option<bool>,
+            #[serde(default)]
+            result: Option<String>,
+            #[serde(default)]
+            exec_main_status: Option<i32>,
+            #[serde(default)]
+            fragment_path: Option<String>,
+            #[serde(default)]
+            requires: Vec<String>,
+            #[serde(default)]
+            wants: Vec<String>,
+            #[serde(default)]
+            after: Vec<String>,
+            #[serde(default)]
+            before: Vec<String>,
+            #[serde(default)]
+            ports: Vec<String>,
+        }
+
+        let raw = RawServiceUnit::deserialize(deserializer)?;
+        let inferred_runtime_present = raw.load_state.is_some()
+            || raw.active_state.is_some()
+            || raw.sub_state.is_some()
+            || raw.result.is_some()
+            || raw.exec_main_status.is_some()
+            || raw.fragment_path.is_some()
+            || !raw.requires.is_empty()
+            || !raw.wants.is_empty()
+            || !raw.after.is_empty()
+            || !raw.before.is_empty();
+        let runtime_present = raw.runtime_present.unwrap_or(inferred_runtime_present);
+        let sources = raw.sources.unwrap_or_else(|| {
+            let mut sources = Vec::new();
+            if runtime_present {
+                sources.push(ServiceSource::ListUnits);
+            }
+            if raw.unit_file_state.is_some() {
+                sources.push(ServiceSource::ListUnitFiles);
+            }
+            sources
+        });
+
+        Ok(Self {
+            name: raw.name,
+            loaded: raw
+                .loaded
+                .unwrap_or(raw.load_state.as_deref() == Some("loaded")),
+            load_state: raw.load_state,
+            active_state: raw.active_state,
+            sub_state: raw.sub_state,
+            unit_file_state: raw.unit_file_state,
+            unit_file_preset: raw.unit_file_preset,
+            runtime_present,
+            sources,
+            description: raw.description,
+            description_truncated: raw.description_truncated.unwrap_or(false),
+            result: raw.result,
+            exec_main_status: raw.exec_main_status,
+            fragment_path: raw.fragment_path,
+            requires: raw.requires,
+            wants: raw.wants,
+            after: raw.after,
+            before: raw.before,
+            ports: raw.ports,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ServiceSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawServiceSnapshot {
+            meta: OsSampleMeta,
+            available: bool,
+            truncated: bool,
+            #[serde(default)]
+            collection_status: Option<CollectionStatus>,
+            #[serde(default)]
+            source_statuses: Vec<ServiceSourceStatus>,
+            #[serde(default)]
+            total: Option<usize>,
+            #[serde(default)]
+            returned_count: Option<usize>,
+            #[serde(default)]
+            omitted_count: Option<usize>,
+            #[serde(default)]
+            failed_total: Option<usize>,
+            #[serde(default)]
+            failed_returned_count: Option<usize>,
+            #[serde(default)]
+            failed_omitted_count: Option<usize>,
+            #[serde(default)]
+            failed_filter_complete: Option<bool>,
+            #[serde(default)]
+            filter_complete: Option<bool>,
+            #[serde(default)]
+            omitted_warning_count: usize,
+            #[serde(default)]
+            units: Vec<ServiceUnit>,
+            #[serde(default)]
+            failed_units: Option<Vec<ServiceUnit>>,
+            #[serde(default)]
+            health_probes: Vec<HealthProbeResult>,
+        }
+
+        let raw = RawServiceSnapshot::deserialize(deserializer)?;
+        let failed_units = raw.failed_units.unwrap_or_else(|| {
+            raw.units
+                .iter()
+                .filter(|unit| {
+                    unit.active_state.as_deref() == Some("failed")
+                        || unit
+                            .result
+                            .as_deref()
+                            .is_some_and(|result| result != "success")
+                })
+                .cloned()
+                .collect()
+        });
+        let inferred_failed_total = raw
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.active_state.as_deref() == Some("failed")
+                    || unit
+                        .result
+                        .as_deref()
+                        .is_some_and(|result| result != "success")
+            })
+            .map(|unit| unit.name.as_str())
+            .chain(failed_units.iter().map(|unit| unit.name.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let total = raw.total.unwrap_or(raw.units.len());
+        let returned_count = raw.returned_count.unwrap_or(raw.units.len());
+        let omitted_count = raw
+            .omitted_count
+            .unwrap_or_else(|| total.saturating_sub(returned_count));
+        let failed_total = raw.failed_total.unwrap_or(inferred_failed_total);
+        let failed_returned_count = raw.failed_returned_count.unwrap_or(failed_units.len());
+        let failed_omitted_count = raw
+            .failed_omitted_count
+            .unwrap_or_else(|| failed_total.saturating_sub(failed_returned_count));
+        // Legacy payloads do not prove that show covered every runtime unit or
+        // emitted both failure-decision properties, so completeness is conservative.
+        let failed_filter_complete = raw.failed_filter_complete.unwrap_or(false);
+
+        Ok(Self {
+            meta: raw.meta,
+            available: raw.available,
+            truncated: raw.truncated,
+            collection_status: raw.collection_status.unwrap_or_default(),
+            source_statuses: raw.source_statuses,
+            total,
+            returned_count,
+            omitted_count,
+            failed_total,
+            failed_returned_count,
+            failed_omitted_count,
+            failed_filter_complete,
+            filter_complete: raw.filter_complete.unwrap_or_else(default_filter_complete),
+            omitted_warning_count: raw.omitted_warning_count,
+            units: raw.units,
+            failed_units,
+            health_probes: raw.health_probes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
