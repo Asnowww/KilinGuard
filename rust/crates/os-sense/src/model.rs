@@ -1195,12 +1195,22 @@ pub struct ServiceSnapshot {
     pub failed_omitted_count: usize,
     #[serde(default)]
     pub failed_filter_complete: bool,
+    #[serde(default)]
+    pub problem_total: usize,
+    #[serde(default)]
+    pub problem_returned_count: usize,
+    #[serde(default)]
+    pub problem_omitted_count: usize,
+    #[serde(default)]
+    pub problem_filter_complete: bool,
     #[serde(default = "default_filter_complete")]
     pub filter_complete: bool,
     #[serde(default)]
     pub omitted_warning_count: usize,
     pub units: Vec<ServiceUnit>,
     pub failed_units: Vec<ServiceUnit>,
+    #[serde(default)]
+    pub problem_units: Vec<ServiceUnit>,
     pub health_probes: Vec<HealthProbeResult>,
 }
 
@@ -1237,6 +1247,77 @@ pub struct ServiceSourceStatus {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHealthStatus {
+    Healthy,
+    Inactive,
+    Transitional,
+    Degraded,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceProblemKind {
+    ExitCode,
+    Signal,
+    CoreDump,
+    Timeout,
+    Watchdog,
+    StartLimit,
+    Dependency,
+    Resource,
+    Oom,
+    Load,
+    AutoRestart,
+    Maintenance,
+    Permission,
+    NotFound,
+    InvalidArgument,
+    Errno,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceProblemEvidence {
+    #[serde(default)]
+    pub load_state: Option<String>,
+    #[serde(default)]
+    pub active_state: Option<String>,
+    #[serde(default)]
+    pub sub_state: Option<String>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub exec_main_code: Option<i32>,
+    #[serde(default)]
+    pub exec_main_status: Option<i32>,
+    #[serde(default)]
+    pub status_text: Option<String>,
+    #[serde(default)]
+    pub status_text_truncated: bool,
+    #[serde(default)]
+    pub status_errno: Option<i32>,
+    #[serde(default)]
+    pub n_restarts: Option<u64>,
+    #[serde(default)]
+    pub load_error: Option<String>,
+    #[serde(default)]
+    pub load_error_truncated: bool,
+    #[serde(default)]
+    pub incomplete_properties: Vec<String>,
+    #[serde(default)]
+    pub unavailable_properties: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceProblem {
+    pub kind: ServiceProblemKind,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ServiceUnit {
     pub name: String,
@@ -1263,6 +1344,14 @@ pub struct ServiceUnit {
     pub after: Vec<String>,
     pub before: Vec<String>,
     pub ports: Vec<String>,
+    #[serde(default)]
+    pub health_status: ServiceHealthStatus,
+    #[serde(default)]
+    pub problems: Vec<ServiceProblem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_evidence: Option<ServiceProblemEvidence>,
+    #[serde(default)]
+    pub problem_complete: bool,
 }
 
 impl<'de> Deserialize<'de> for ServiceUnit {
@@ -1270,6 +1359,13 @@ impl<'de> Deserialize<'de> for ServiceUnit {
     where
         D: serde::Deserializer<'de>,
     {
+        #[derive(Deserialize)]
+        struct RawServiceProblem {
+            kind: ServiceProblemKind,
+            #[serde(default)]
+            evidence: Option<ServiceProblemEvidence>,
+        }
+
         #[derive(Deserialize)]
         struct RawServiceUnit {
             name: String,
@@ -1309,6 +1405,14 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             before: Vec<String>,
             #[serde(default)]
             ports: Vec<String>,
+            #[serde(default)]
+            health_status: Option<ServiceHealthStatus>,
+            #[serde(default)]
+            problems: Option<Vec<RawServiceProblem>>,
+            #[serde(default)]
+            problem_evidence: Option<ServiceProblemEvidence>,
+            #[serde(default)]
+            problem_complete: Option<bool>,
         }
 
         let raw = RawServiceUnit::deserialize(deserializer)?;
@@ -1333,6 +1437,41 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             }
             sources
         });
+        let inferred_health_status = infer_legacy_service_health(
+            raw.load_state.as_deref(),
+            raw.active_state.as_deref(),
+            raw.sub_state.as_deref(),
+            raw.result.as_deref(),
+            runtime_present,
+        );
+        let legacy_problem_evidence = raw
+            .problems
+            .as_ref()
+            .and_then(|problems| problems.iter().find_map(|problem| problem.evidence.clone()));
+        let (problems, inferred_problem_evidence) = raw.problems.map_or_else(
+            || {
+                infer_legacy_service_problems(
+                    raw.load_state.as_deref(),
+                    raw.active_state.as_deref(),
+                    raw.sub_state.as_deref(),
+                    raw.result.as_deref(),
+                    raw.exec_main_status,
+                )
+            },
+            |problems| {
+                (
+                    problems
+                        .into_iter()
+                        .map(|problem| ServiceProblem { kind: problem.kind })
+                        .collect(),
+                    None,
+                )
+            },
+        );
+        let problem_evidence = raw
+            .problem_evidence
+            .or(legacy_problem_evidence)
+            .or(inferred_problem_evidence);
 
         Ok(Self {
             name: raw.name,
@@ -1356,6 +1495,10 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             after: raw.after,
             before: raw.before,
             ports: raw.ports,
+            health_status: raw.health_status.unwrap_or(inferred_health_status),
+            problems,
+            problem_evidence,
+            problem_complete: raw.problem_complete.unwrap_or(false),
         })
     }
 }
@@ -1389,6 +1532,14 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             #[serde(default)]
             failed_filter_complete: Option<bool>,
             #[serde(default)]
+            problem_total: Option<usize>,
+            #[serde(default)]
+            problem_returned_count: Option<usize>,
+            #[serde(default)]
+            problem_omitted_count: Option<usize>,
+            #[serde(default)]
+            problem_filter_complete: Option<bool>,
+            #[serde(default)]
             filter_complete: Option<bool>,
             #[serde(default)]
             omitted_warning_count: usize,
@@ -1396,6 +1547,8 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             units: Vec<ServiceUnit>,
             #[serde(default)]
             failed_units: Option<Vec<ServiceUnit>>,
+            #[serde(default)]
+            problem_units: Option<Vec<ServiceUnit>>,
             #[serde(default)]
             health_probes: Vec<HealthProbeResult>,
         }
@@ -1441,6 +1594,45 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
         // Legacy payloads do not prove that show covered every runtime unit or
         // emitted both failure-decision properties, so completeness is conservative.
         let failed_filter_complete = raw.failed_filter_complete.unwrap_or(false);
+        let inferred_problem_units = raw.problem_units.is_none();
+        let problem_units = raw.problem_units.unwrap_or_else(|| {
+            let mut units_by_name = std::collections::BTreeMap::new();
+            for unit in raw
+                .units
+                .iter()
+                .filter(|unit| service_unit_has_problem(unit))
+                .chain(failed_units.iter())
+            {
+                units_by_name.insert(unit.name.clone(), unit.clone());
+            }
+            units_by_name.into_values().collect()
+        });
+        let inferred_problem_total = raw
+            .units
+            .iter()
+            .filter(|unit| service_unit_has_problem(unit))
+            .map(|unit| unit.name.as_str())
+            .chain(problem_units.iter().map(|unit| unit.name.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let problem_total =
+            raw.problem_total
+                .unwrap_or(inferred_problem_total)
+                .max(if inferred_problem_units {
+                    problem_units.len()
+                } else {
+                    0
+                });
+        let (problem_returned_count, problem_omitted_count) = if inferred_problem_units {
+            let returned = problem_units.len();
+            (returned, problem_total.saturating_sub(returned))
+        } else {
+            let returned = raw.problem_returned_count.unwrap_or(problem_units.len());
+            let omitted = raw
+                .problem_omitted_count
+                .unwrap_or_else(|| problem_total.saturating_sub(returned));
+            (returned, omitted)
+        };
 
         Ok(Self {
             meta: raw.meta,
@@ -1455,13 +1647,131 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             failed_returned_count,
             failed_omitted_count,
             failed_filter_complete,
+            problem_total,
+            problem_returned_count,
+            problem_omitted_count,
+            problem_filter_complete: raw.problem_filter_complete.unwrap_or(false),
             filter_complete: raw.filter_complete.unwrap_or_else(default_filter_complete),
             omitted_warning_count: raw.omitted_warning_count,
             units: raw.units,
             failed_units,
+            problem_units,
             health_probes: raw.health_probes,
         })
     }
+}
+
+fn infer_legacy_service_health(
+    load_state: Option<&str>,
+    active_state: Option<&str>,
+    sub_state: Option<&str>,
+    result: Option<&str>,
+    runtime_present: bool,
+) -> ServiceHealthStatus {
+    let result_failed = result.is_some_and(|value| !value.is_empty() && value != "success");
+    if active_state == Some("failed") || result_failed {
+        return ServiceHealthStatus::Failed;
+    }
+    if matches!(active_state, Some("maintenance"))
+        || matches!(sub_state, Some("auto-restart" | "failed"))
+        || matches!(load_state, Some("error" | "not-found" | "bad-setting"))
+    {
+        return ServiceHealthStatus::Degraded;
+    }
+    match active_state {
+        Some("active") => ServiceHealthStatus::Healthy,
+        Some("inactive") => ServiceHealthStatus::Inactive,
+        Some("activating" | "deactivating" | "reloading" | "refreshing") => {
+            ServiceHealthStatus::Transitional
+        }
+        Some(_) => ServiceHealthStatus::Unknown,
+        None if !runtime_present => ServiceHealthStatus::Inactive,
+        None => ServiceHealthStatus::Unknown,
+    }
+}
+
+fn infer_legacy_service_problems(
+    load_state: Option<&str>,
+    active_state: Option<&str>,
+    sub_state: Option<&str>,
+    result: Option<&str>,
+    exec_main_status: Option<i32>,
+) -> (Vec<ServiceProblem>, Option<ServiceProblemEvidence>) {
+    let mut kinds = Vec::new();
+    if let Some(result) = result.filter(|value| !value.is_empty() && *value != "success") {
+        kinds.push(match result {
+            "exit-code" => ServiceProblemKind::ExitCode,
+            "signal" => ServiceProblemKind::Signal,
+            "core-dump" => ServiceProblemKind::CoreDump,
+            value if value.contains("timeout") => ServiceProblemKind::Timeout,
+            "watchdog" => ServiceProblemKind::Watchdog,
+            "start-limit-hit" => ServiceProblemKind::StartLimit,
+            "dependency" => ServiceProblemKind::Dependency,
+            "resources" => ServiceProblemKind::Resource,
+            "oom-kill" => ServiceProblemKind::Oom,
+            _ => ServiceProblemKind::Unknown,
+        });
+    } else if active_state == Some("failed") {
+        kinds.push(ServiceProblemKind::Unknown);
+    }
+    if matches!(load_state, Some("error" | "not-found" | "bad-setting")) {
+        kinds.push(ServiceProblemKind::Load);
+    }
+    if sub_state == Some("auto-restart") {
+        kinds.push(ServiceProblemKind::AutoRestart);
+    }
+    if active_state == Some("maintenance") {
+        kinds.push(ServiceProblemKind::Maintenance);
+    }
+    kinds.sort();
+    kinds.dedup();
+
+    let mut incomplete_properties = vec![
+        "ExecMainCode".to_string(),
+        "StatusErrno".to_string(),
+        "LoadError".to_string(),
+    ];
+    if load_state.is_none() {
+        incomplete_properties.push("LoadState".to_string());
+    }
+    if active_state.is_none() {
+        incomplete_properties.push("ActiveState".to_string());
+    }
+    if sub_state.is_none() {
+        incomplete_properties.push("SubState".to_string());
+    }
+    if result.is_none() {
+        incomplete_properties.push("Result".to_string());
+    }
+    if exec_main_status.is_none() {
+        incomplete_properties.push("ExecMainStatus".to_string());
+    }
+    let evidence = ServiceProblemEvidence {
+        load_state: load_state.map(str::to_string),
+        active_state: active_state.map(str::to_string),
+        sub_state: sub_state.map(str::to_string),
+        result: result.map(str::to_string),
+        exec_main_status,
+        incomplete_properties,
+        unavailable_properties: vec!["StatusText".to_string(), "NRestarts".to_string()],
+        ..ServiceProblemEvidence::default()
+    };
+    let problems = kinds
+        .into_iter()
+        .map(|kind| ServiceProblem { kind })
+        .collect::<Vec<_>>();
+    let problem_evidence = (!problems.is_empty()).then_some(evidence);
+    (problems, problem_evidence)
+}
+
+fn service_unit_has_problem(unit: &ServiceUnit) -> bool {
+    !unit.problems.is_empty()
+        || matches!(
+            unit.health_status,
+            ServiceHealthStatus::Degraded | ServiceHealthStatus::Failed
+        )
+        || (unit.health_status == ServiceHealthStatus::Unknown
+            && (!unit.problem_complete || unit.problem_evidence.is_some()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

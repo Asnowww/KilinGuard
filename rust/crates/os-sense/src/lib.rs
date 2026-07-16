@@ -35,7 +35,8 @@ pub use model::{
     NetworkBaselineEntry, NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot,
     NetworkSnapshot, NetworkSourceStatus, OsContext, OsSampleMeta, PlatformInfo,
     ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList,
-    RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceSource,
+    RateStatus, ResourceDimension, SensorAvailability, ServiceHealthStatus, ServiceProblem,
+    ServiceProblemEvidence, ServiceProblemKind, ServiceSnapshot, ServiceSource,
     ServiceSourceStatus, ServiceUnit, TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus,
     TemperatureReading, ThermalSnapshot,
 };

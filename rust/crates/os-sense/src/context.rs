@@ -355,11 +355,16 @@ fn build_health_summary(
     }
     if let Some(services) = services {
         parts.push(format!(
-            "services: {} matched units ({} returned, {} omitted), {} failed, {:?}",
+            "services: {} matched units ({} returned, {} omitted), {} failed (complete={}), {} problem units ({} returned, {} omitted, complete={}), {:?}",
             services.total,
             services.returned_count,
             services.omitted_count,
-            services.failed_units.len(),
+            services.failed_total,
+            services.failed_filter_complete,
+            services.problem_total,
+            services.problem_returned_count,
+            services.problem_omitted_count,
+            services.problem_filter_complete,
             services.collection_status
         ));
     }

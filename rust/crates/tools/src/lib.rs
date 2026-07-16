@@ -1486,7 +1486,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_service_status",
-            description: "Enumerate and merge bounded Kylin Linux systemd runtime service units and installed service unit files, with structured per-source collection status, stable filtering, and optional TCP health probes.",
+            description: "Enumerate bounded Kylin Linux systemd services and identify healthy, inactive, transitional, degraded, failed, or unknown units with typed, redacted failure causes, structured collection completeness, stable filtering, and optional TCP health probes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
