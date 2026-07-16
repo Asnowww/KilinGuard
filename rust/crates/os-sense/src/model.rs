@@ -688,6 +688,16 @@ pub struct CountByKey {
 pub struct NetworkSnapshot {
     pub meta: OsSampleMeta,
     pub truncated: bool,
+    #[serde(default)]
+    pub collection_status: CollectionStatus,
+    #[serde(default)]
+    pub source_statuses: Vec<NetworkSourceStatus>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default = "default_filter_complete")]
+    pub filter_complete: bool,
+    #[serde(default)]
+    pub omitted_warning_count: usize,
     pub connections: Vec<NetworkConnection>,
     pub dns_checks: Vec<DnsCheck>,
     pub tcp_probes: Vec<HealthProbeResult>,
@@ -698,12 +708,33 @@ pub struct NetworkSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkConnection {
     pub protocol: String,
+    /// Legacy field retained for stored payload and API compatibility.
     pub local_addr: String,
+    #[serde(default)]
+    pub local_address: String,
     pub local_port: u16,
+    /// Legacy field retained for stored payload and API compatibility.
     pub remote_addr: String,
+    #[serde(default)]
+    pub remote_address: String,
     pub remote_port: u16,
     pub state: String,
     pub inode: Option<String>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkSourceStatus {
+    pub protocol: String,
+    pub actual_path: String,
+    pub available: bool,
+    pub status: CollectionStatus,
+    pub error: Option<String>,
+    pub entry_count: usize,
+    #[serde(default)]
+    pub parse_failure_count: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

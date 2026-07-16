@@ -1450,13 +1450,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_network_connections",
-            description: "Collect active network connections, filter by protocol/state/remote address, run DNS and TCP reachability probes, sample firewall state, and flag network anomalies.",
+            description: "Collect bounded active Kylin Linux network connections from /proc/net with per-source status, separate local/remote addresses and ports, filter before the result limit, run DNS and TCP reachability probes, sample firewall state, and flag network anomalies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "protocol": { "type": "string", "enum": ["all", "tcp", "tcp6", "udp", "udp6"] },
-                    "state": { "type": "string", "maxLength": 32 },
-                    "remote_contains": { "type": "string", "maxLength": 128 },
+                    "protocol": { "type": "string", "minLength": 1, "maxLength": 16, "description": "Case-insensitive: all, tcp/tcp4, tcp6/tcpv6, udp/udp4, or udp6/udpv6." },
+                    "state": { "type": "string", "minLength": 1, "maxLength": 32, "description": "Case-insensitive Linux socket state. TCP states and UDP unconnected/unconn are accepted." },
+                    "remote_contains": { "type": "string", "minLength": 1, "maxLength": 128 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
                     "dns_names": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 253 } },
                     "tcp_probes": {
@@ -2449,7 +2449,8 @@ pub fn execute_os_log_query_with_generator(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_os_network_connections(input: OsNetworkQuery) -> Result<String, String> {
-    to_pretty_json(collect_network(&input))
+    let network = collect_network(&input).map_err(|error| error.to_string())?;
+    to_pretty_json(network)
 }
 
 #[allow(clippy::needless_pass_by_value)]

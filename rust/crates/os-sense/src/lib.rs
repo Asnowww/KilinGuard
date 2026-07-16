@@ -31,9 +31,9 @@ pub use model::{
     LogPattern, LogPatternEvidence, LogQueryResult, LogSourceStatus, LogSummary,
     LogSummaryBoundary, LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange,
     MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
-    NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo,
-    ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList,
-    RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
+    NetworkMetricsSnapshot, NetworkSnapshot, NetworkSourceStatus, OsContext, OsSampleMeta,
+    PlatformInfo, ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo,
+    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
     TemperatureReading, ThermalSnapshot,
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};

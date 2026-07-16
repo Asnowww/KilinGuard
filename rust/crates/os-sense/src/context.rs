@@ -67,12 +67,14 @@ pub(crate) fn collect_context_with(
     } else {
         None
     };
-    let network = include_network.then(|| {
-        collect_network(&NetworkQuery {
+    let network = if include_network {
+        Some(collect_network(&NetworkQuery {
             limit: Some(100),
             ..NetworkQuery::default()
-        })
-    });
+        })?)
+    } else {
+        None
+    };
     let services = include_services.then(|| {
         query_services(&ServiceQuery {
             limit: Some(100),
@@ -291,9 +293,11 @@ fn build_health_summary(
     }
     if let Some(network) = network {
         parts.push(format!(
-            "network: {} connections, {} anomalies",
+            "network: {} matched connections ({} returned), {} anomalies, {:?}",
+            network.total,
             network.connections.len(),
-            network.anomalies.len()
+            network.anomalies.len(),
+            network.collection_status
         ));
     }
     if let Some(services) = services {
