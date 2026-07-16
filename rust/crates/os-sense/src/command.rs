@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LimitedCommandOutput {
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
@@ -36,15 +37,15 @@ pub(crate) fn run_limited_command(
         .map(|pipe| read_limited(pipe, stderr_limit));
     let started = Instant::now();
     let mut timed_out = false;
-    let success = loop {
+    let (success, exit_code) = loop {
         if let Some(status) = child.try_wait()? {
-            break status.success();
+            break (status.success(), status.code());
         }
         if started.elapsed() >= timeout {
             timed_out = true;
             let _ = child.kill();
             let _ = child.wait();
-            break false;
+            break (false, None);
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -58,6 +59,7 @@ pub(crate) fn run_limited_command(
 
     Ok(LimitedCommandOutput {
         success,
+        exit_code,
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         timed_out,

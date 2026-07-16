@@ -301,12 +301,16 @@ fn build_health_summary(
             String::new()
         };
         parts.push(format!(
-            "network: {} matched connections ({} returned), {} anomalies{}, {:?}",
+            "network: {} matched connections ({} returned), {} anomalies{}, {:?}; DNS resolver {:?} with {} nameserver(s), {} DNS check(s), {} TCP probe(s)",
             network.total,
             network.connections.len(),
             network.anomaly_total,
             omitted,
-            network.collection_status
+            network.collection_status,
+            network.dns_resolver.status,
+            network.dns_resolver.nameservers.len(),
+            network.dns_checks.len(),
+            network.tcp_probes.len()
         ));
     }
     if let Some(services) = services {
@@ -349,6 +353,7 @@ mod tests {
             filter_complete: true,
             omitted_warning_count: 0,
             connections: Vec::new(),
+            dns_resolver: crate::model::DnsResolverStatus::default(),
             dns_checks: Vec::new(),
             tcp_probes: Vec::new(),
             firewall: Vec::new(),
@@ -359,5 +364,6 @@ mod tests {
         };
         let summary = build_health_summary(None, None, None, Some(&network), None, 0);
         assert!(summary.contains("35 anomalies (3 omitted from returned details)"));
+        assert!(summary.contains("DNS resolver Partial with 0 nameserver(s)"));
     }
 }

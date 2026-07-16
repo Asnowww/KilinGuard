@@ -2043,6 +2043,7 @@ mod tests {
     fn command_output(stdout: impl Into<String>) -> LimitedCommandOutput {
         LimitedCommandOutput {
             success: true,
+            exit_code: Some(0),
             stdout: stdout.into(),
             stderr: String::new(),
             timed_out: false,
@@ -2054,6 +2055,7 @@ mod tests {
     fn failed_command(timed_out: bool) -> LimitedCommandOutput {
         LimitedCommandOutput {
             success: false,
+            exit_code: (!timed_out).then_some(1),
             stdout: String::new(),
             stderr: "permission denied".to_string(),
             timed_out,

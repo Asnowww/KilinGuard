@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Component, Path};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
-use crate::command::run_limited_command;
+use crate::command::{run_limited_command, LimitedCommandOutput};
 use crate::error::{OsSenseError, Result};
 use crate::model::{
-    CollectionStatus, DnsCheck, FirewallStatus, HealthProbeResult, NetworkAnomaly,
-    NetworkAnomalyEvidence, NetworkBaseline, NetworkBaselineEntry, NetworkConnection,
-    NetworkSnapshot, NetworkSourceStatus,
+    CollectionStatus, DnsCheck, DnsResolutionSource, DnsResolutionStatus, DnsResolverStatus,
+    FirewallStatus, HealthProbeResult, NetworkAnomaly, NetworkAnomalyEvidence, NetworkBaseline,
+    NetworkBaselineEntry, NetworkConnection, NetworkSnapshot, NetworkSourceStatus,
+    TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus,
 };
 use crate::procfs::basic_meta;
 
@@ -23,6 +24,16 @@ const MAX_CONNECTION_LIMIT: usize = 1000;
 const MAX_DNS_CHECKS: usize = 8;
 const MAX_TCP_PROBES: usize = 5;
 const MAX_PROBE_TIMEOUT_MS: u64 = 3_000;
+const MAX_DNS_ADDRESSES: usize = 8;
+const MAX_DNS_COMMAND_STDOUT_BYTES: usize = 16 * 1024;
+const MAX_DNS_COMMAND_STDERR_BYTES: usize = 4 * 1024;
+const MAX_DNS_OUTPUT_LINES: usize = 256;
+const MAX_RESOLV_CONF_BYTES: usize = 16 * 1024;
+const MAX_RESOLV_CONF_LINES: usize = 256;
+const MAX_RESOLV_NAMESERVERS: usize = 3;
+const MAX_RESOLV_SEARCH_DOMAINS: usize = 6;
+const MAX_RESOLV_OPTIONS: usize = 16;
+const MAX_RESOLV_OPTION_CHARS: usize = 64;
 const MAX_NETWORK_WARNINGS: usize = 32;
 const MAX_NETWORK_ERROR_CHARS: usize = 256;
 const MAX_PROC_NET_BYTES_PER_SOURCE: usize = 512 * 1024;
@@ -39,6 +50,9 @@ pub const MAX_NETWORK_BASELINE_ENTRIES: usize = 256;
 pub const MAX_NETWORK_BASELINE_JSON_BYTES: usize = 64 * 1024;
 pub const OS_NETWORK_BASELINE_FILE_ENV: &str = "CLAW_OS_NETWORK_BASELINE_FILE";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
+const MIN_TCP_CONNECT_BUDGET: Duration = Duration::from_millis(1);
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROC_NET_SOURCES: [(&str, &str); 4] = [
     ("/proc/net/tcp", "tcp"),
     ("/proc/net/tcp6", "tcp6"),
@@ -220,7 +234,7 @@ impl NetworkQuery {
             )));
         }
         for name in &self.dns_names {
-            validate_nonblank_bounded("dns_names entry", name, 253)?;
+            validate_dns_target("dns_names entry", name)?;
         }
         if self.tcp_probes.len() > MAX_TCP_PROBES {
             return Err(OsSenseError::Configuration(format!(
@@ -228,7 +242,7 @@ impl NetworkQuery {
             )));
         }
         for probe in &self.tcp_probes {
-            validate_nonblank_bounded("tcp_probes host", &probe.host, 253)?;
+            validate_dns_target("tcp_probes host", &probe.host)?;
             if probe.port == 0 {
                 return Err(OsSenseError::Configuration(
                     "network query tcp_probes port must be between 1 and 65535".to_string(),
@@ -252,7 +266,15 @@ pub fn collect_network(query: &NetworkQuery) -> Result<NetworkSnapshot> {
         Ok(baseline) => baseline.as_ref(),
         Err(error) => return Err(OsSenseError::Configuration(error.clone())),
     };
-    collect_network_with_reader_and_baseline(query, &SystemNetworkFileReader, baseline)
+    let clock = SystemProbeClock::new();
+    collect_network_with_components(
+        query,
+        &SystemNetworkFileReader,
+        baseline,
+        &SystemDnsResolver,
+        &SystemTcpConnector,
+        &clock,
+    )
 }
 
 #[cfg(test)]
@@ -260,18 +282,32 @@ fn collect_network_with_reader(
     query: &NetworkQuery,
     reader: &dyn NetworkFileReader,
 ) -> Result<NetworkSnapshot> {
-    collect_network_with_reader_and_baseline(query, reader, None)
+    let clock = SystemProbeClock::new();
+    collect_network_with_components(
+        query,
+        reader,
+        None,
+        &SystemDnsResolver,
+        &SystemTcpConnector,
+        &clock,
+    )
 }
 
-fn collect_network_with_reader_and_baseline(
+#[allow(clippy::too_many_arguments)]
+fn collect_network_with_components(
     query: &NetworkQuery,
     reader: &dyn NetworkFileReader,
     baseline: Option<&NetworkBaseline>,
+    dns_resolver: &dyn DnsResolver,
+    tcp_connector: &dyn TcpConnector,
+    clock: &dyn ProbeClock,
 ) -> Result<NetworkSnapshot> {
     query.validate()?;
     let filter = ValidatedNetworkFilter::from_query(query)?;
     let mut warnings = Vec::new();
     let mut omitted_warning_count = 0usize;
+    let dns_resolver_status =
+        collect_dns_resolver_status(reader, &mut warnings, &mut omitted_warning_count);
     let (mut connections, source_statuses) =
         collect_proc_net_connections(reader, &mut warnings, &mut omitted_warning_count);
     sort_and_deduplicate_connections(&mut connections);
@@ -287,7 +323,7 @@ fn collect_network_with_reader_and_baseline(
     let source_truncated = relevant_source_statuses
         .clone()
         .any(|status| status.truncated);
-    let truncated = source_truncated || total > connection_limit;
+    let mut truncated = source_truncated || total > connection_limit;
     let filter_complete = relevant_source_statuses
         .clone()
         .all(|status| status.status == CollectionStatus::Complete);
@@ -308,9 +344,16 @@ fn collect_network_with_reader_and_baseline(
     let dns_checks = query
         .dns_names
         .iter()
-        .map(|name| resolve_dns(name))
+        .map(|name| resolve_dns(name, dns_resolver))
         .collect::<Vec<_>>();
-    let tcp_probes = query.tcp_probes.iter().map(probe_tcp).collect::<Vec<_>>();
+    let tcp_probes = query
+        .tcp_probes
+        .iter()
+        .map(|request| probe_tcp_with(request, dns_resolver, tcp_connector, clock))
+        .collect::<Vec<_>>();
+    truncated |= dns_resolver_status.truncated
+        || dns_checks.iter().any(|check| check.truncated)
+        || tcp_probes.iter().any(|probe| probe.truncated);
     let firewall = if query.include_firewall {
         collect_firewall_status()
     } else {
@@ -332,6 +375,7 @@ fn collect_network_with_reader_and_baseline(
         filter_complete,
         omitted_warning_count,
         connections,
+        dns_resolver: dns_resolver_status,
         dns_checks,
         tcp_probes,
         firewall,
@@ -472,19 +516,250 @@ struct SystemNetworkFileReader;
 
 impl NetworkFileReader for SystemNetworkFileReader {
     fn read_bounded(&self, path: &str, maximum_bytes: usize) -> io::Result<BoundedNetworkFile> {
-        let file = File::open(path)?;
+        let file = open_network_source(path)?;
         let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
         file.take((maximum_bytes as u64).saturating_add(1))
             .read_to_end(&mut bytes)?;
         let truncated = bytes.len() > maximum_bytes;
         bytes.truncate(maximum_bytes);
-        Ok(BoundedNetworkFile { bytes, truncated })
+        let actual_path = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_string))
+            .unwrap_or_else(|| path.to_string());
+        Ok(BoundedNetworkFile {
+            bytes,
+            truncated,
+            actual_path: actual_path
+                .chars()
+                .take(MAX_NETWORK_BASELINE_PATH_BYTES)
+                .collect(),
+        })
     }
+}
+
+#[cfg(unix)]
+fn open_network_source(path: &str) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "network source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_network_source(path: &str) -> io::Result<File> {
+    let file = File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "network source must be a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 struct BoundedNetworkFile {
     bytes: Vec<u8>,
     truncated: bool,
+    actual_path: String,
+}
+
+fn collect_dns_resolver_status(
+    reader: &dyn NetworkFileReader,
+    warnings: &mut Vec<String>,
+    omitted_warning_count: &mut usize,
+) -> DnsResolverStatus {
+    match reader.read_bounded(RESOLV_CONF_PATH, MAX_RESOLV_CONF_BYTES) {
+        Ok(file) => {
+            let mut status = parse_resolv_conf(&file.bytes, file.truncated);
+            status.actual_path = file.actual_path;
+            if status.status != CollectionStatus::Complete {
+                push_network_warning(
+                    warnings,
+                    omitted_warning_count,
+                    format!(
+                        "{}: {}",
+                        status.actual_path,
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("DNS resolver configuration is partial")
+                    ),
+                );
+            }
+            status
+        }
+        Err(error) => {
+            let error = bounded_network_error(&error.to_string());
+            push_network_warning(
+                warnings,
+                omitted_warning_count,
+                format!("failed to read {RESOLV_CONF_PATH}: {error}"),
+            );
+            DnsResolverStatus {
+                status: CollectionStatus::Failed,
+                available: false,
+                actual_path: RESOLV_CONF_PATH.to_string(),
+                error: Some(error),
+                ..DnsResolverStatus::default()
+            }
+        }
+    }
+}
+
+fn parse_resolv_conf(bytes: &[u8], input_truncated: bool) -> DnsResolverStatus {
+    let mut nameservers = Vec::new();
+    let mut search_domains = Vec::new();
+    let mut options = Vec::new();
+    let mut nameserver_set = BTreeSet::new();
+    let mut search_set = BTreeSet::new();
+    let mut option_set = BTreeSet::new();
+    let mut parse_failure_count = usize::from(std::str::from_utf8(bytes).is_err());
+    let mut truncated = input_truncated;
+    let mut omitted_nameserver_count = 0usize;
+    let mut omitted_search_domain_count = 0usize;
+    let mut omitted_option_count = 0usize;
+
+    for (line_index, raw_line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line_index >= MAX_RESOLV_CONF_LINES {
+            truncated = true;
+            break;
+        }
+        let line = String::from_utf8_lossy(raw_line);
+        let line = line.split(['#', ';']).next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("nameserver") => {
+                if fields.len() != 2 {
+                    parse_failure_count = parse_failure_count.saturating_add(1);
+                    continue;
+                }
+                let Ok(address) = fields[1].parse::<IpAddr>() else {
+                    parse_failure_count = parse_failure_count.saturating_add(1);
+                    continue;
+                };
+                push_bounded_unique(
+                    address.to_string(),
+                    &mut nameservers,
+                    &mut nameserver_set,
+                    MAX_RESOLV_NAMESERVERS,
+                    &mut omitted_nameserver_count,
+                    &mut truncated,
+                );
+            }
+            Some("search") => {
+                if fields.len() < 2 {
+                    parse_failure_count = parse_failure_count.saturating_add(1);
+                    continue;
+                }
+                for domain in &fields[1..] {
+                    if !is_valid_dns_name(domain, false) {
+                        parse_failure_count = parse_failure_count.saturating_add(1);
+                        continue;
+                    }
+                    push_bounded_unique(
+                        domain.to_ascii_lowercase(),
+                        &mut search_domains,
+                        &mut search_set,
+                        MAX_RESOLV_SEARCH_DOMAINS,
+                        &mut omitted_search_domain_count,
+                        &mut truncated,
+                    );
+                }
+            }
+            Some("options") => {
+                if fields.len() < 2 {
+                    parse_failure_count = parse_failure_count.saturating_add(1);
+                    continue;
+                }
+                for option in &fields[1..] {
+                    if !is_valid_resolver_option(option) {
+                        parse_failure_count = parse_failure_count.saturating_add(1);
+                        continue;
+                    }
+                    push_bounded_unique(
+                        option.to_ascii_lowercase(),
+                        &mut options,
+                        &mut option_set,
+                        MAX_RESOLV_OPTIONS,
+                        &mut omitted_option_count,
+                        &mut truncated,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let error = if nameservers.is_empty() {
+        Some("DNS resolver configuration has no valid nameserver".to_string())
+    } else if parse_failure_count > 0 {
+        Some(format!(
+            "{parse_failure_count} malformed DNS resolver configuration item(s) were skipped"
+        ))
+    } else if truncated {
+        Some("DNS resolver configuration exceeded bounded collection limits".to_string())
+    } else {
+        None
+    };
+    let status = if error.is_none() {
+        CollectionStatus::Complete
+    } else {
+        CollectionStatus::Partial
+    };
+    DnsResolverStatus {
+        status,
+        available: true,
+        actual_path: RESOLV_CONF_PATH.to_string(),
+        nameservers,
+        search_domains,
+        options,
+        parse_failure_count,
+        truncated,
+        omitted_nameserver_count,
+        omitted_search_domain_count,
+        omitted_option_count,
+        error: error.map(|error| bounded_network_error(&error)),
+    }
+}
+
+fn push_bounded_unique(
+    value: String,
+    values: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    maximum: usize,
+    omitted: &mut usize,
+    truncated: &mut bool,
+) {
+    if !seen.insert(value.clone()) {
+        return;
+    }
+    if values.len() < maximum {
+        values.push(value);
+    } else {
+        *omitted = omitted.saturating_add(1);
+        *truncated = true;
+    }
+}
+
+fn is_valid_resolver_option(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_RESOLV_OPTION_CHARS
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 struct ParsedProcNet {
@@ -529,7 +804,7 @@ fn collect_proc_net_connections(
                 out.extend(parsed.connections);
                 statuses.push(NetworkSourceStatus {
                     protocol: protocol.to_string(),
-                    actual_path: path.to_string(),
+                    actual_path: file.actual_path,
                     available: true,
                     status,
                     error,
@@ -773,6 +1048,53 @@ fn validate_nonblank_bounded(name: &str, value: &str, maximum_chars: usize) -> R
     Ok(())
 }
 
+fn validate_dns_target(name: &str, value: &str) -> Result<()> {
+    if !is_valid_dns_name(value, true) {
+        return Err(OsSenseError::Configuration(format!(
+            "network query {name} must be a valid IP literal, localhost, .local name, or conventional FQDN of at most 253 ASCII characters"
+        )));
+    }
+    Ok(())
+}
+
+fn is_valid_dns_name(value: &str, require_fqdn: bool) -> bool {
+    if value.is_empty()
+        || value.len() > 253
+        || value.starts_with('-')
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let value = value.strip_suffix('.').unwrap_or(value);
+    if value.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let labels = value.split('.').collect::<Vec<_>>();
+    if (require_fqdn && labels.len() < 2)
+        || labels.is_empty()
+        || labels
+            .iter()
+            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
 fn sort_and_deduplicate_connections(connections: &mut Vec<NetworkConnection>) {
     connections.sort_by(|left, right| {
         protocol_rank(&left.protocol)
@@ -810,91 +1132,485 @@ fn bounded_network_error(error: &str) -> String {
     error.chars().take(MAX_NETWORK_ERROR_CHARS).collect()
 }
 
-fn resolve_dns(name: &str) -> DnsCheck {
-    if !probe_target_allowed(name) {
-        return DnsCheck {
-            name: name.to_string(),
-            ok: false,
-            resolved_addrs: Vec::new(),
-            error: Some(
-                "DNS checks are limited to localhost, .local names, and private IP literals"
-                    .to_string(),
-            ),
+#[derive(Debug, Clone)]
+struct DnsResolution {
+    addresses: Vec<IpAddr>,
+    status: DnsResolutionStatus,
+    latency_ms: Option<u128>,
+    source: DnsResolutionSource,
+    truncated: bool,
+    omitted_address_count: usize,
+    parse_failure_count: usize,
+    error: Option<String>,
+}
+
+trait DnsResolver {
+    fn resolve(&self, name: &str, timeout: Duration) -> DnsResolution;
+}
+
+trait DnsCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> io::Result<LimitedCommandOutput>;
+}
+
+struct SystemDnsCommandRunner;
+
+impl DnsCommandRunner for SystemDnsCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> io::Result<LimitedCommandOutput> {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_limited_command(program, &args, timeout, stdout_limit, stderr_limit)
+    }
+}
+
+struct SystemDnsResolver;
+
+impl DnsResolver for SystemDnsResolver {
+    fn resolve(&self, name: &str, timeout: Duration) -> DnsResolution {
+        resolve_dns_with_runner(name, timeout, &SystemDnsCommandRunner)
+    }
+}
+
+fn resolve_dns(name: &str, resolver: &dyn DnsResolver) -> DnsCheck {
+    let mut resolution = if let Ok(address) = name.parse::<IpAddr>() {
+        literal_dns_resolution(address)
+    } else {
+        resolver.resolve(name, DNS_RESOLUTION_TIMEOUT)
+    };
+    let (addresses, additionally_omitted) = interleave_and_limit_addresses(resolution.addresses);
+    resolution.addresses = addresses;
+    resolution.omitted_address_count = resolution
+        .omitted_address_count
+        .saturating_add(additionally_omitted);
+    resolution.truncated |= additionally_omitted > 0;
+    if additionally_omitted > 0 && resolution.status == DnsResolutionStatus::Resolved {
+        resolution.status = DnsResolutionStatus::Partial;
+    }
+    DnsCheck {
+        name: name.chars().take(253).collect(),
+        ok: matches!(
+            resolution.status,
+            DnsResolutionStatus::Resolved
+                | DnsResolutionStatus::Partial
+                | DnsResolutionStatus::Literal
+        ) && !resolution.addresses.is_empty(),
+        resolved_addrs: resolution
+            .addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        error: resolution.error,
+        status: resolution.status,
+        latency_ms: resolution.latency_ms,
+        source: resolution.source,
+        truncated: resolution.truncated,
+        omitted_address_count: resolution.omitted_address_count,
+        parse_failure_count: resolution.parse_failure_count,
+    }
+}
+
+fn resolve_dns_with_runner(
+    name: &str,
+    timeout: Duration,
+    runner: &dyn DnsCommandRunner,
+) -> DnsResolution {
+    let started = Instant::now();
+    let args = vec!["ahosts".to_string(), name.to_string()];
+    let output = match runner.run(
+        "getent",
+        &args,
+        timeout.min(DNS_RESOLUTION_TIMEOUT),
+        MAX_DNS_COMMAND_STDOUT_BYTES,
+        MAX_DNS_COMMAND_STDERR_BYTES,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return DnsResolution {
+                addresses: Vec::new(),
+                status: DnsResolutionStatus::ResolverUnavailable,
+                latency_ms: Some(started.elapsed().as_millis()),
+                source: DnsResolutionSource::GetentAhosts,
+                truncated: false,
+                omitted_address_count: 0,
+                parse_failure_count: 0,
+                error: Some(bounded_network_error(&format!(
+                    "failed to execute getent ahosts: {error}"
+                ))),
+            };
+        }
+    };
+    let latency_ms = Some(started.elapsed().as_millis());
+    let command_truncated = output.stdout_truncated || output.stderr_truncated;
+    if output.timed_out {
+        return DnsResolution {
+            addresses: Vec::new(),
+            status: DnsResolutionStatus::TimedOut,
+            latency_ms,
+            source: DnsResolutionSource::GetentAhosts,
+            truncated: command_truncated,
+            omitted_address_count: 0,
+            parse_failure_count: 0,
+            error: Some("getent ahosts timed out".to_string()),
         };
     }
-    match (name, 0).to_socket_addrs() {
-        Ok(addrs) => {
-            let resolved_addrs = addrs
-                .map(|addr| addr.ip().to_string())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            DnsCheck {
-                name: name.to_string(),
-                ok: !resolved_addrs.is_empty(),
-                resolved_addrs,
-                error: None,
+    let mut addresses = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut parse_failure_count = 0usize;
+    let mut truncated = command_truncated;
+    for (line_index, line) in output.stdout.lines().enumerate() {
+        if line_index >= MAX_DNS_OUTPUT_LINES {
+            truncated = true;
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let valid_kind = fields
+            .get(1)
+            .is_some_and(|kind| matches!(*kind, "STREAM" | "DGRAM" | "RAW"));
+        let Some(address) = fields
+            .first()
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .filter(|_| valid_kind)
+        else {
+            parse_failure_count = parse_failure_count.saturating_add(1);
+            continue;
+        };
+        if seen.insert(address) {
+            addresses.push(address);
+        }
+    }
+    let (addresses, omitted_address_count) = interleave_and_limit_addresses(addresses);
+    truncated |= omitted_address_count > 0;
+    if !output.success {
+        let not_found = output.exit_code == Some(2) && addresses.is_empty();
+        let detail = output.stderr.trim();
+        let error = if not_found {
+            "getent ahosts returned no addresses".to_string()
+        } else if detail.is_empty() {
+            "getent ahosts failed".to_string()
+        } else {
+            format!("getent ahosts failed: {detail}")
+        };
+        return DnsResolution {
+            addresses: Vec::new(),
+            status: if not_found {
+                DnsResolutionStatus::NoAddresses
+            } else {
+                DnsResolutionStatus::CommandFailed
+            },
+            latency_ms,
+            source: DnsResolutionSource::GetentAhosts,
+            truncated,
+            omitted_address_count,
+            parse_failure_count,
+            error: Some(bounded_network_error(&error)),
+        };
+    }
+    let status = if addresses.is_empty() {
+        if parse_failure_count > 0 {
+            DnsResolutionStatus::InvalidOutput
+        } else {
+            DnsResolutionStatus::NoAddresses
+        }
+    } else if parse_failure_count > 0 || truncated {
+        DnsResolutionStatus::Partial
+    } else {
+        DnsResolutionStatus::Resolved
+    };
+    let error = match status {
+        DnsResolutionStatus::NoAddresses => Some("getent ahosts returned no addresses".to_string()),
+        DnsResolutionStatus::InvalidOutput => {
+            Some("getent ahosts returned no valid address rows".to_string())
+        }
+        DnsResolutionStatus::Partial if parse_failure_count > 0 => Some(format!(
+            "getent ahosts output was partial; {parse_failure_count} malformed row(s) skipped"
+        )),
+        DnsResolutionStatus::Partial => {
+            Some("getent ahosts output exceeded bounded result limits".to_string())
+        }
+        _ => None,
+    };
+    DnsResolution {
+        addresses,
+        status,
+        latency_ms,
+        source: DnsResolutionSource::GetentAhosts,
+        truncated,
+        omitted_address_count,
+        parse_failure_count,
+        error: error.map(|error| bounded_network_error(&error)),
+    }
+}
+
+fn literal_dns_resolution(address: IpAddr) -> DnsResolution {
+    DnsResolution {
+        addresses: vec![address],
+        status: DnsResolutionStatus::Literal,
+        latency_ms: Some(0),
+        source: DnsResolutionSource::IpLiteral,
+        truncated: false,
+        omitted_address_count: 0,
+        parse_failure_count: 0,
+        error: None,
+    }
+}
+
+fn interleave_and_limit_addresses(addresses: Vec<IpAddr>) -> (Vec<IpAddr>, usize) {
+    let mut ipv4 = VecDeque::new();
+    let mut ipv6 = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    let mut start_with_ipv6 = None;
+    for address in addresses {
+        if !seen.insert(address) {
+            continue;
+        }
+        start_with_ipv6.get_or_insert(address.is_ipv6());
+        match address {
+            IpAddr::V4(_) => ipv4.push_back(address),
+            IpAddr::V6(_) => ipv6.push_back(address),
+        }
+    }
+    let total = ipv4.len().saturating_add(ipv6.len());
+    let mut bounded = Vec::with_capacity(total.min(MAX_DNS_ADDRESSES));
+    while bounded.len() < MAX_DNS_ADDRESSES && (!ipv4.is_empty() || !ipv6.is_empty()) {
+        let queues = if start_with_ipv6.unwrap_or(false) {
+            [&mut ipv6, &mut ipv4]
+        } else {
+            [&mut ipv4, &mut ipv6]
+        };
+        for queue in queues {
+            if let Some(address) = queue.pop_front() {
+                bounded.push(address);
+            }
+            if bounded.len() == MAX_DNS_ADDRESSES {
+                break;
             }
         }
-        Err(error) => DnsCheck {
-            name: name.to_string(),
-            ok: false,
-            resolved_addrs: Vec::new(),
-            error: Some(error.to_string()),
-        },
+    }
+    (bounded, total.saturating_sub(MAX_DNS_ADDRESSES))
+}
+
+trait TcpConnector {
+    fn connect(&self, address: SocketAddr, timeout: Duration) -> io::Result<()>;
+}
+
+struct SystemTcpConnector;
+
+impl TcpConnector for SystemTcpConnector {
+    fn connect(&self, address: SocketAddr, timeout: Duration) -> io::Result<()> {
+        TcpStream::connect_timeout(&address, timeout).map(|_| ())
+    }
+}
+
+trait ProbeClock {
+    fn elapsed(&self) -> Duration;
+}
+
+struct SystemProbeClock {
+    started: Instant,
+}
+
+impl SystemProbeClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ProbeClock for SystemProbeClock {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
 pub(crate) fn probe_tcp(request: &TcpProbeRequest) -> HealthProbeResult {
-    let target = format!("{}:{}", request.host, request.port);
-    if !probe_target_allowed(&request.host) {
-        return HealthProbeResult {
-            target,
-            ok: false,
-            latency_ms: None,
-            error: Some(
-                "TCP probes are limited to localhost, .local names, and private IP literals"
-                    .to_string(),
-            ),
-        };
-    }
+    let clock = SystemProbeClock::new();
+    probe_tcp_with(request, &SystemDnsResolver, &SystemTcpConnector, &clock)
+}
+
+fn probe_tcp_with(
+    request: &TcpProbeRequest,
+    resolver: &dyn DnsResolver,
+    connector: &dyn TcpConnector,
+    clock: &dyn ProbeClock,
+) -> HealthProbeResult {
+    let bounded_host = request.host.chars().take(253).collect::<String>();
+    let target = match bounded_host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{bounded_host}]:{}", request.port),
+        _ => format!("{bounded_host}:{}", request.port),
+    };
+    let started = clock.elapsed();
     let timeout = Duration::from_millis(
         request
             .timeout_ms
-            .unwrap_or(1000)
+            .unwrap_or(1_000)
             .clamp(1, MAX_PROBE_TIMEOUT_MS),
     );
-    let started = Instant::now();
-    let addr = match target
-        .as_str()
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-    {
-        Some(addr) => addr,
-        None => {
-            return HealthProbeResult {
-                target,
-                ok: false,
-                latency_ms: None,
-                error: Some("DNS resolution returned no socket address".to_string()),
-            };
-        }
-    };
-    match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(_) => HealthProbeResult {
-            target,
-            ok: true,
-            latency_ms: Some(started.elapsed().as_millis()),
-            error: None,
-        },
-        Err(error) => HealthProbeResult {
-            target,
-            ok: false,
-            latency_ms: Some(started.elapsed().as_millis()),
-            error: Some(error.to_string()),
-        },
+    let deadline = started.saturating_add(timeout);
+    let mut result = empty_probe_result(target);
+    if validate_dns_target("tcp_probes host", &request.host).is_err() || request.port == 0 {
+        result.status = TcpProbeStatus::InvalidTarget;
+        result.stage = TcpProbeStage::Validation;
+        result.error_kind = Some(TcpProbeErrorKind::InvalidTarget);
+        result.error = Some("TCP probe target is invalid".to_string());
+        return result;
     }
+
+    let resolution = if let Ok(address) = request.host.parse::<IpAddr>() {
+        literal_dns_resolution(address)
+    } else {
+        let remaining = deadline.saturating_sub(clock.elapsed());
+        if remaining.is_zero() {
+            return finish_probe_timeout(result, clock, started, TcpProbeStage::Resolution);
+        }
+        resolver.resolve(&request.host, remaining)
+    };
+    let (addresses, additionally_omitted) = interleave_and_limit_addresses(resolution.addresses);
+    result.resolution_status =
+        if additionally_omitted > 0 && resolution.status == DnsResolutionStatus::Resolved {
+            DnsResolutionStatus::Partial
+        } else {
+            resolution.status
+        };
+    result.resolution_source = resolution.source;
+    result.resolved_addrs = addresses.iter().map(ToString::to_string).collect();
+    result.omitted_address_count = resolution
+        .omitted_address_count
+        .saturating_add(additionally_omitted);
+    result.truncated = resolution.truncated || additionally_omitted > 0;
+    if clock.elapsed() >= deadline {
+        return finish_probe_timeout(result, clock, started, TcpProbeStage::Resolution);
+    }
+    let resolution_usable = matches!(
+        result.resolution_status,
+        DnsResolutionStatus::Resolved | DnsResolutionStatus::Partial | DnsResolutionStatus::Literal
+    );
+    if addresses.is_empty() || !resolution_usable {
+        result.status = if resolution.status == DnsResolutionStatus::TimedOut {
+            TcpProbeStatus::TimedOut
+        } else {
+            TcpProbeStatus::ResolutionFailed
+        };
+        result.stage = TcpProbeStage::Resolution;
+        result.error_kind = Some(match resolution.status {
+            DnsResolutionStatus::TimedOut => TcpProbeErrorKind::ResolutionTimedOut,
+            DnsResolutionStatus::ResolverUnavailable => TcpProbeErrorKind::ResolverUnavailable,
+            DnsResolutionStatus::NoAddresses => TcpProbeErrorKind::NoAddresses,
+            _ => TcpProbeErrorKind::ResolutionFailed,
+        });
+        result.error = resolution
+            .error
+            .or_else(|| Some("DNS resolution failed".to_string()))
+            .map(|error| bounded_network_error(&error));
+        result.latency_ms = Some(clock.elapsed().saturating_sub(started).as_millis());
+        return result;
+    }
+
+    let allowed = addresses
+        .into_iter()
+        .filter(|address| probe_ip_allowed(*address))
+        .collect::<Vec<_>>();
+    if allowed.is_empty() {
+        result.status = TcpProbeStatus::PolicyDenied;
+        result.stage = TcpProbeStage::Policy;
+        result.error_kind = Some(TcpProbeErrorKind::PolicyDenied);
+        result.error = Some(
+            "all resolved addresses are outside the local/private/link-local TCP probe policy"
+                .to_string(),
+        );
+        result.latency_ms = Some(clock.elapsed().saturating_sub(started).as_millis());
+        return result;
+    }
+
+    let mut last_error = None;
+    let mut last_timed_out = false;
+    let address_count = allowed.len();
+    for (index, address) in allowed.into_iter().enumerate() {
+        let remaining = deadline.saturating_sub(clock.elapsed());
+        if remaining < MIN_TCP_CONNECT_BUDGET {
+            return finish_probe_timeout(result, clock, started, TcpProbeStage::Connect);
+        }
+        let remaining_address_count = address_count.saturating_sub(index).max(1);
+        let connect_timeout = (remaining / (remaining_address_count as u32))
+            .max(MIN_TCP_CONNECT_BUDGET)
+            .min(remaining);
+        result.attempted_addrs.push(address.to_string());
+        match connector.connect(SocketAddr::new(address, request.port), connect_timeout) {
+            Ok(()) => {
+                result.ok = true;
+                result.status = TcpProbeStatus::Reachable;
+                result.stage = TcpProbeStage::Complete;
+                result.selected_addr = Some(address.to_string());
+                result.latency_ms = Some(clock.elapsed().saturating_sub(started).as_millis());
+                return result;
+            }
+            Err(error) => {
+                last_timed_out = error.kind() == io::ErrorKind::TimedOut;
+                last_error = Some(bounded_network_error(&error.to_string()));
+            }
+        }
+    }
+    if clock.elapsed() >= deadline {
+        return finish_probe_timeout(result, clock, started, TcpProbeStage::Connect);
+    }
+    result.status = TcpProbeStatus::Failed;
+    result.stage = TcpProbeStage::Connect;
+    result.error_kind = Some(if last_timed_out {
+        TcpProbeErrorKind::ConnectTimedOut
+    } else {
+        TcpProbeErrorKind::ConnectFailed
+    });
+    result.error = last_error.or_else(|| Some("TCP connection failed".to_string()));
+    result.latency_ms = Some(clock.elapsed().saturating_sub(started).as_millis());
+    result
+}
+
+fn empty_probe_result(target: String) -> HealthProbeResult {
+    HealthProbeResult {
+        target,
+        ok: false,
+        latency_ms: None,
+        error: None,
+        status: TcpProbeStatus::Unknown,
+        stage: TcpProbeStage::Unknown,
+        error_kind: None,
+        resolution_status: DnsResolutionStatus::Unknown,
+        resolution_source: DnsResolutionSource::Unknown,
+        resolved_addrs: Vec::new(),
+        attempted_addrs: Vec::new(),
+        selected_addr: None,
+        truncated: false,
+        omitted_address_count: 0,
+    }
+}
+
+fn finish_probe_timeout(
+    mut result: HealthProbeResult,
+    clock: &dyn ProbeClock,
+    started: Duration,
+    stage: TcpProbeStage,
+) -> HealthProbeResult {
+    result.status = TcpProbeStatus::TimedOut;
+    result.stage = stage;
+    result.error_kind = Some(TcpProbeErrorKind::DeadlineExceeded);
+    result.error = Some("TCP probe total deadline was exhausted".to_string());
+    result.latency_ms = Some(clock.elapsed().saturating_sub(started).as_millis());
+    result
 }
 
 fn collect_firewall_status() -> Vec<FirewallStatus> {
@@ -942,26 +1658,22 @@ fn run_firewall_command(backend: &str, command: &str, args: &[&str]) -> Firewall
     }
 }
 
-fn probe_target_allowed(host: &str) -> bool {
-    let host = host.trim();
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
-        return true;
+fn probe_ip_allowed(address: IpAddr) -> bool {
+    if address.is_unspecified() {
+        return false;
     }
-    if let Ok(addr) = host.parse::<IpAddr>() {
-        return match addr {
-            IpAddr::V4(addr) => {
-                addr.is_loopback()
-                    || addr.is_private()
-                    || addr.is_link_local()
-                    || addr.octets()[0] == 0
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return probe_ip_allowed(IpAddr::V4(mapped));
             }
-            IpAddr::V6(addr) => {
-                let first = addr.segments()[0];
-                addr.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-            }
-        };
+            let first = address.segments()[0];
+            address.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
     }
-    false
 }
 
 struct DetectedNetworkAnomalies {
@@ -1311,6 +2023,7 @@ fn socket_addr_to_string(addr: SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::io::ErrorKind;
 
@@ -1334,7 +2047,7 @@ mod tests {
             for (path, _) in PROC_NET_SOURCES {
                 reader = reader.with_text(path, HEADER);
             }
-            reader
+            reader.with_text(RESOLV_CONF_PATH, "nameserver 127.0.0.53\n")
         }
 
         fn with_text(mut self, path: &str, content: impl Into<String>) -> Self {
@@ -1373,11 +2086,205 @@ mod tests {
                     let mut bytes = bytes.clone();
                     let truncated = *forced_truncated || bytes.len() > maximum_bytes;
                     bytes.truncate(maximum_bytes);
-                    Ok(BoundedNetworkFile { bytes, truncated })
+                    Ok(BoundedNetworkFile {
+                        bytes,
+                        truncated,
+                        actual_path: path.to_string(),
+                    })
                 }
                 Some(FixtureRead::Error(kind)) => Err(io::Error::from(*kind)),
                 None => Err(io::Error::from(ErrorKind::NotFound)),
             }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DnsCommandCall {
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    }
+
+    struct FixtureDnsCommandRunner {
+        output: std::result::Result<LimitedCommandOutput, ErrorKind>,
+        calls: RefCell<Vec<DnsCommandCall>>,
+    }
+
+    impl FixtureDnsCommandRunner {
+        fn output(output: LimitedCommandOutput) -> Self {
+            Self {
+                output: Ok(output),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn error(kind: ErrorKind) -> Self {
+            Self {
+                output: Err(kind),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DnsCommandRunner for FixtureDnsCommandRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            timeout: Duration,
+            stdout_limit: usize,
+            stderr_limit: usize,
+        ) -> io::Result<LimitedCommandOutput> {
+            self.calls.borrow_mut().push(DnsCommandCall {
+                program: program.to_string(),
+                args: args.to_vec(),
+                timeout,
+                stdout_limit,
+                stderr_limit,
+            });
+            self.output
+                .as_ref()
+                .cloned()
+                .map_err(|kind| io::Error::from(*kind))
+        }
+    }
+
+    #[derive(Default)]
+    struct FixtureProbeClock {
+        elapsed_ms: Cell<u64>,
+    }
+
+    impl FixtureProbeClock {
+        fn advance(&self, duration: Duration) {
+            self.elapsed_ms.set(
+                self.elapsed_ms
+                    .get()
+                    .saturating_add(duration.as_millis().min(u128::from(u64::MAX)) as u64),
+            );
+        }
+    }
+
+    impl ProbeClock for FixtureProbeClock {
+        fn elapsed(&self) -> Duration {
+            Duration::from_millis(self.elapsed_ms.get())
+        }
+    }
+
+    struct FixtureDnsResolver<'a> {
+        resolution: DnsResolution,
+        clock: Option<&'a FixtureProbeClock>,
+        elapsed: Duration,
+        calls: Cell<usize>,
+        timeouts: RefCell<Vec<Duration>>,
+    }
+
+    impl<'a> FixtureDnsResolver<'a> {
+        fn new(resolution: DnsResolution) -> Self {
+            Self {
+                resolution,
+                clock: None,
+                elapsed: Duration::ZERO,
+                calls: Cell::new(0),
+                timeouts: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_elapsed(mut self, clock: &'a FixtureProbeClock, elapsed: Duration) -> Self {
+            self.clock = Some(clock);
+            self.elapsed = elapsed;
+            self
+        }
+    }
+
+    impl DnsResolver for FixtureDnsResolver<'_> {
+        fn resolve(&self, _name: &str, timeout: Duration) -> DnsResolution {
+            self.calls.set(self.calls.get().saturating_add(1));
+            self.timeouts.borrow_mut().push(timeout);
+            if let Some(clock) = self.clock {
+                clock.advance(self.elapsed);
+            }
+            self.resolution.clone()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FixtureConnectResult {
+        Success,
+        Failed(ErrorKind),
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FixtureConnectStep {
+        address: IpAddr,
+        elapsed: Duration,
+        result: FixtureConnectResult,
+    }
+
+    struct FixtureTcpConnector<'a> {
+        clock: &'a FixtureProbeClock,
+        steps: RefCell<VecDeque<FixtureConnectStep>>,
+        attempts: RefCell<Vec<(SocketAddr, Duration)>>,
+    }
+
+    impl<'a> FixtureTcpConnector<'a> {
+        fn new(clock: &'a FixtureProbeClock, steps: Vec<FixtureConnectStep>) -> Self {
+            Self {
+                clock,
+                steps: RefCell::new(VecDeque::from(steps)),
+                attempts: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TcpConnector for FixtureTcpConnector<'_> {
+        fn connect(&self, address: SocketAddr, timeout: Duration) -> io::Result<()> {
+            self.attempts.borrow_mut().push((address, timeout));
+            let step = self
+                .steps
+                .borrow_mut()
+                .pop_front()
+                .expect("fixture connect step");
+            assert_eq!(address.ip(), step.address);
+            assert!(step.elapsed <= timeout, "fixture exceeded connect budget");
+            self.clock.advance(step.elapsed);
+            match step.result {
+                FixtureConnectResult::Success => Ok(()),
+                FixtureConnectResult::Failed(kind) => Err(io::Error::from(kind)),
+            }
+        }
+    }
+
+    fn dns_command_output(
+        success: bool,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> LimitedCommandOutput {
+        LimitedCommandOutput {
+            success,
+            exit_code: Some(if success { 0 } else { 1 }),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    fn resolved_fixture(addresses: &[&str]) -> DnsResolution {
+        DnsResolution {
+            addresses: addresses
+                .iter()
+                .map(|address| address.parse::<IpAddr>().expect("fixture IP"))
+                .collect(),
+            status: DnsResolutionStatus::Resolved,
+            latency_ms: Some(0),
+            source: DnsResolutionSource::GetentAhosts,
+            truncated: false,
+            omitted_address_count: 0,
+            parse_failure_count: 0,
+            error: None,
         }
     }
 
@@ -1457,6 +2364,430 @@ mod tests {
     }
 
     #[test]
+    fn resolv_conf_parses_comments_duplicates_and_supported_directives() {
+        let status = parse_resolv_conf(
+            br#"
+                # generated resolver configuration
+                nameserver 10.0.0.53
+                nameserver 10.0.0.53 # duplicate
+                nameserver 2001:db8::53 ; IPv6
+                search Example.COM corp.local example.com
+                options ndots:5 timeout:1 rotate ndots:5
+                sortlist 10.0.0.0/8
+            "#,
+            false,
+        );
+        assert_eq!(status.status, CollectionStatus::Complete);
+        assert_eq!(status.nameservers, ["10.0.0.53", "2001:db8::53"]);
+        assert_eq!(status.search_domains, ["example.com", "corp.local"]);
+        assert_eq!(status.options, ["ndots:5", "timeout:1", "rotate"]);
+        assert_eq!(status.parse_failure_count, 0);
+        assert!(!status.truncated);
+    }
+
+    #[test]
+    fn resolv_conf_reports_malformed_missing_and_bounded_inputs() {
+        let malformed = parse_resolv_conf(
+            b"nameserver 10.0.0.53\nnameserver invalid\nsearch ok.local bad_label\noptions ndots:5 --bad\n",
+            false,
+        );
+        assert_eq!(malformed.status, CollectionStatus::Partial);
+        assert_eq!(malformed.nameservers, ["10.0.0.53"]);
+        assert_eq!(malformed.search_domains, ["ok.local"]);
+        assert_eq!(malformed.options, ["ndots:5"]);
+        assert_eq!(malformed.parse_failure_count, 3);
+
+        let mut warnings = Vec::new();
+        let mut omitted_warnings = 0;
+        let missing = collect_dns_resolver_status(
+            &FixtureNetworkFileReader::default(),
+            &mut warnings,
+            &mut omitted_warnings,
+        );
+        assert_eq!(missing.status, CollectionStatus::Failed);
+        assert!(!missing.available);
+        assert_eq!(missing.actual_path, RESOLV_CONF_PATH);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].chars().count() <= MAX_NETWORK_ERROR_CHARS);
+
+        let mut content = String::new();
+        for index in 1..=10 {
+            content.push_str(&format!("nameserver 10.0.0.{index}\n"));
+        }
+        content.push_str("search a.example b.example c.example d.example e.example f.example g.example h.example\n");
+        content
+            .push_str("options o1 o2 o3 o4 o5 o6 o7 o8 o9 o10 o11 o12 o13 o14 o15 o16 o17 o18\n");
+        while content.len() <= MAX_RESOLV_CONF_BYTES + 100 {
+            content.push_str("# bounded padding\n");
+        }
+        let reader = FixtureNetworkFileReader::default().with_text(RESOLV_CONF_PATH, content);
+        let bounded = collect_dns_resolver_status(&reader, &mut Vec::new(), &mut 0);
+        assert_eq!(bounded.status, CollectionStatus::Partial);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.nameservers.len(), MAX_RESOLV_NAMESERVERS);
+        assert_eq!(bounded.omitted_nameserver_count, 7);
+        assert_eq!(bounded.search_domains.len(), MAX_RESOLV_SEARCH_DOMAINS);
+        assert_eq!(bounded.omitted_search_domain_count, 2);
+        assert_eq!(bounded.options.len(), MAX_RESOLV_OPTIONS);
+        assert_eq!(bounded.omitted_option_count, 2);
+    }
+
+    #[test]
+    fn getent_resolution_is_fixed_deduplicated_dual_stack_and_bounded() {
+        let stdout = concat!(
+            "198.51.100.1 STREAM example.com\n",
+            "198.51.100.1 DGRAM example.com\n",
+            "2001:db8::1 STREAM example.com\n",
+            "198.51.100.2 STREAM example.com\n",
+            "2001:db8::2 STREAM example.com\n",
+            "198.51.100.3 STREAM example.com\n",
+            "2001:db8::3 STREAM example.com\n",
+            "198.51.100.4 STREAM example.com\n",
+            "2001:db8::4 STREAM example.com\n",
+            "198.51.100.5 STREAM example.com\n",
+            "2001:db8::5 STREAM example.com\n",
+        );
+        let runner = FixtureDnsCommandRunner::output(dns_command_output(true, stdout, ""));
+        let result = resolve_dns_with_runner("example.com", Duration::from_secs(9), &runner);
+        assert_eq!(result.status, DnsResolutionStatus::Partial);
+        assert_eq!(result.addresses.len(), MAX_DNS_ADDRESSES);
+        assert_eq!(result.omitted_address_count, 2);
+        assert_eq!(
+            result.addresses[..4],
+            [
+                "198.51.100.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+                "198.51.100.2".parse::<IpAddr>().unwrap(),
+                "2001:db8::2".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "getent");
+        assert_eq!(calls[0].args, ["ahosts", "example.com"]);
+        assert_eq!(calls[0].timeout, DNS_RESOLUTION_TIMEOUT);
+        assert_eq!(calls[0].stdout_limit, MAX_DNS_COMMAND_STDOUT_BYTES);
+        assert_eq!(calls[0].stderr_limit, MAX_DNS_COMMAND_STDERR_BYTES);
+    }
+
+    #[test]
+    fn getent_resolution_classifies_empty_timeout_failure_and_malformed_output() {
+        let empty = FixtureDnsCommandRunner::output(dns_command_output(true, "", ""));
+        assert_eq!(
+            resolve_dns_with_runner("empty.example", DNS_RESOLUTION_TIMEOUT, &empty).status,
+            DnsResolutionStatus::NoAddresses
+        );
+
+        let mut timed_out_output = dns_command_output(false, "", "late");
+        timed_out_output.timed_out = true;
+        timed_out_output.exit_code = Some(2);
+        let timed_out = FixtureDnsCommandRunner::output(timed_out_output);
+        assert_eq!(
+            resolve_dns_with_runner("slow.example", DNS_RESOLUTION_TIMEOUT, &timed_out).status,
+            DnsResolutionStatus::TimedOut
+        );
+
+        let mut not_found_output =
+            dns_command_output(false, "not-an-ip STREAM missing.example\n", "");
+        not_found_output.exit_code = Some(2);
+        not_found_output.stdout_truncated = true;
+        let not_found = FixtureDnsCommandRunner::output(not_found_output);
+        let not_found =
+            resolve_dns_with_runner("missing.example", DNS_RESOLUTION_TIMEOUT, &not_found);
+        assert_eq!(not_found.status, DnsResolutionStatus::NoAddresses);
+        assert_eq!(not_found.parse_failure_count, 1);
+        assert!(not_found.truncated);
+
+        let failed = FixtureDnsCommandRunner::output(dns_command_output(
+            false,
+            "",
+            "x".repeat(MAX_NETWORK_ERROR_CHARS * 2),
+        ));
+        let failed = resolve_dns_with_runner("failed.example", DNS_RESOLUTION_TIMEOUT, &failed);
+        assert_eq!(failed.status, DnsResolutionStatus::CommandFailed);
+        assert!(failed.error.unwrap().chars().count() <= MAX_NETWORK_ERROR_CHARS);
+
+        let malformed = FixtureDnsCommandRunner::output(dns_command_output(
+            true,
+            "not-an-ip STREAM bad.example\n10.0.0.1 UNKNOWN bad.example\n",
+            "",
+        ));
+        let malformed = resolve_dns_with_runner("bad.example", DNS_RESOLUTION_TIMEOUT, &malformed);
+        assert_eq!(malformed.status, DnsResolutionStatus::InvalidOutput);
+        assert_eq!(malformed.parse_failure_count, 2);
+
+        let unavailable = FixtureDnsCommandRunner::error(ErrorKind::NotFound);
+        assert_eq!(
+            resolve_dns_with_runner("missing.example", DNS_RESOLUTION_TIMEOUT, &unavailable).status,
+            DnsResolutionStatus::ResolverUnavailable
+        );
+    }
+
+    #[test]
+    fn public_dns_lookup_is_allowed_but_tcp_policy_checks_resolved_addresses() {
+        let resolution = resolved_fixture(&["93.184.216.34"]);
+        let resolver = FixtureDnsResolver::new(resolution);
+        let check = resolve_dns("example.com", &resolver);
+        assert!(check.ok);
+        assert_eq!(check.status, DnsResolutionStatus::Resolved);
+        assert_eq!(check.resolved_addrs, ["93.184.216.34"]);
+
+        let clock = FixtureProbeClock::default();
+        let connector = FixtureTcpConnector::new(&clock, Vec::new());
+        for host in ["example.com", "printer.local"] {
+            let result = probe_tcp_with(
+                &TcpProbeRequest {
+                    host: host.to_string(),
+                    port: 443,
+                    timeout_ms: Some(1_000),
+                },
+                &resolver,
+                &connector,
+                &clock,
+            );
+            assert_eq!(result.status, TcpProbeStatus::PolicyDenied);
+            assert_eq!(result.stage, TcpProbeStage::Policy);
+            assert_eq!(result.resolved_addrs, ["93.184.216.34"]);
+            assert!(result.attempted_addrs.is_empty());
+        }
+        assert!(connector.attempts.borrow().is_empty());
+    }
+
+    #[test]
+    fn tcp_probe_policy_rejects_unspecified_and_zero_network_addresses() {
+        for address in ["0.0.0.0", "0.1.2.3", "::"] {
+            assert!(!probe_ip_allowed(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(probe_ip_allowed(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn tcp_probe_ip_literal_skips_dns_and_multi_address_probe_shares_deadline() {
+        let clock = FixtureProbeClock::default();
+        let unused_resolver = FixtureDnsResolver::new(resolved_fixture(&["93.184.216.34"]));
+        let literal_connector = FixtureTcpConnector::new(
+            &clock,
+            vec![FixtureConnectStep {
+                address: "10.0.0.5".parse().unwrap(),
+                elapsed: Duration::from_millis(20),
+                result: FixtureConnectResult::Success,
+            }],
+        );
+        let literal = probe_tcp_with(
+            &TcpProbeRequest {
+                host: "10.0.0.5".to_string(),
+                port: 22,
+                timeout_ms: Some(1_000),
+            },
+            &unused_resolver,
+            &literal_connector,
+            &clock,
+        );
+        assert!(literal.ok);
+        assert_eq!(literal.resolution_source, DnsResolutionSource::IpLiteral);
+        assert_eq!(unused_resolver.calls.get(), 0);
+
+        let clock = FixtureProbeClock::default();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&["10.0.0.1", "fd00::1"]))
+            .with_elapsed(&clock, Duration::from_millis(200));
+        let connector = FixtureTcpConnector::new(
+            &clock,
+            vec![
+                FixtureConnectStep {
+                    address: "10.0.0.1".parse().unwrap(),
+                    elapsed: Duration::from_millis(400),
+                    result: FixtureConnectResult::Failed(ErrorKind::TimedOut),
+                },
+                FixtureConnectStep {
+                    address: "fd00::1".parse().unwrap(),
+                    elapsed: Duration::from_millis(100),
+                    result: FixtureConnectResult::Success,
+                },
+            ],
+        );
+        let result = probe_tcp_with(
+            &TcpProbeRequest {
+                host: "service.local".to_string(),
+                port: 8443,
+                timeout_ms: Some(1_000),
+            },
+            &resolver,
+            &connector,
+            &clock,
+        );
+        assert!(result.ok);
+        assert_eq!(result.attempted_addrs, ["10.0.0.1", "fd00::1"]);
+        assert_eq!(result.selected_addr.as_deref(), Some("fd00::1"));
+        assert_eq!(result.latency_ms, Some(700));
+        assert!(result.latency_ms.unwrap() <= 1_000);
+        assert_eq!(
+            resolver.timeouts.borrow().as_slice(),
+            [Duration::from_secs(1)]
+        );
+        let attempts = connector.attempts.borrow();
+        assert_eq!(attempts[0].1, Duration::from_millis(400));
+        assert_eq!(attempts[1].1, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn tcp_probe_slices_deadline_after_ipv6_timeout_before_ipv4_success() {
+        let clock = FixtureProbeClock::default();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&["fd00::1", "10.0.0.1"]))
+            .with_elapsed(&clock, Duration::from_millis(200));
+        let connector = FixtureTcpConnector::new(
+            &clock,
+            vec![
+                FixtureConnectStep {
+                    address: "fd00::1".parse().unwrap(),
+                    elapsed: Duration::from_millis(400),
+                    result: FixtureConnectResult::Failed(ErrorKind::TimedOut),
+                },
+                FixtureConnectStep {
+                    address: "10.0.0.1".parse().unwrap(),
+                    elapsed: Duration::from_millis(50),
+                    result: FixtureConnectResult::Success,
+                },
+            ],
+        );
+        let result = probe_tcp_with(
+            &TcpProbeRequest {
+                host: "service.local".to_string(),
+                port: 8443,
+                timeout_ms: Some(1_000),
+            },
+            &resolver,
+            &connector,
+            &clock,
+        );
+        assert!(result.ok);
+        assert_eq!(result.attempted_addrs, ["fd00::1", "10.0.0.1"]);
+        assert_eq!(result.selected_addr.as_deref(), Some("10.0.0.1"));
+        assert_eq!(result.latency_ms, Some(650));
+        assert!(result.latency_ms.unwrap() <= 1_000);
+        let attempts = connector.attempts.borrow();
+        assert_eq!(attempts[0].1, Duration::from_millis(400));
+        assert_eq!(attempts[1].1, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn tcp_probe_stops_when_the_shared_deadline_is_exhausted() {
+        let clock = FixtureProbeClock::default();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&["10.0.0.1", "10.0.0.2"]))
+            .with_elapsed(&clock, Duration::from_millis(200));
+        let connector = FixtureTcpConnector::new(
+            &clock,
+            vec![
+                FixtureConnectStep {
+                    address: "10.0.0.1".parse().unwrap(),
+                    elapsed: Duration::from_millis(400),
+                    result: FixtureConnectResult::Failed(ErrorKind::TimedOut),
+                },
+                FixtureConnectStep {
+                    address: "10.0.0.2".parse().unwrap(),
+                    elapsed: Duration::from_millis(400),
+                    result: FixtureConnectResult::Failed(ErrorKind::TimedOut),
+                },
+            ],
+        );
+        let result = probe_tcp_with(
+            &TcpProbeRequest {
+                host: "service.local".to_string(),
+                port: 443,
+                timeout_ms: Some(1_000),
+            },
+            &resolver,
+            &connector,
+            &clock,
+        );
+        assert_eq!(result.status, TcpProbeStatus::TimedOut);
+        assert_eq!(result.error_kind, Some(TcpProbeErrorKind::DeadlineExceeded));
+        assert_eq!(result.attempted_addrs, ["10.0.0.1", "10.0.0.2"]);
+        let attempts = connector.attempts.borrow();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, Duration::from_millis(400));
+        assert_eq!(attempts[1].1, Duration::from_millis(400));
+        assert_eq!(result.latency_ms, Some(1_000));
+    }
+
+    #[test]
+    fn dns_and_tcp_legacy_json_default_new_typed_fields() {
+        let dns: DnsCheck = serde_json::from_value(serde_json::json!({
+            "name": "legacy.local",
+            "resolved_addrs": ["10.0.0.1"],
+            "ok": true,
+            "error": null
+        }))
+        .expect("legacy DNS check");
+        assert_eq!(dns.status, DnsResolutionStatus::Unknown);
+        assert_eq!(dns.source, DnsResolutionSource::Unknown);
+        assert_eq!(dns.latency_ms, None);
+        assert!(!dns.truncated);
+
+        let probe: HealthProbeResult = serde_json::from_value(serde_json::json!({
+            "target": "10.0.0.1:22",
+            "ok": true,
+            "latency_ms": 1,
+            "error": null
+        }))
+        .expect("legacy TCP probe");
+        assert_eq!(probe.status, TcpProbeStatus::Unknown);
+        assert_eq!(probe.stage, TcpProbeStage::Unknown);
+        assert!(probe.resolved_addrs.is_empty());
+        assert!(probe.attempted_addrs.is_empty());
+    }
+
+    #[test]
+    fn dns_target_validation_accepts_public_names_and_rejects_unsafe_or_malformed_values() {
+        for value in [
+            "example.com",
+            "example.com.",
+            "localhost",
+            "printer.local",
+            "8.8.8.8",
+            "2001:db8::1",
+        ] {
+            assert!(validate_dns_target("target", value).is_ok(), "{value}");
+        }
+        for value in [
+            "",
+            " example.com",
+            "example.com\n",
+            "--help",
+            "singlelabel",
+            "bad..example",
+            "-bad.example",
+            "bad-.example",
+            "bad_label.example",
+            "999.999.999.999",
+        ] {
+            assert!(validate_dns_target("target", value).is_err(), "{value}");
+        }
+
+        let valid = NetworkQuery {
+            dns_names: vec!["example.com".to_string(); MAX_DNS_CHECKS],
+            tcp_probes: vec![
+                TcpProbeRequest {
+                    host: "service.local".to_string(),
+                    port: 443,
+                    timeout_ms: Some(MAX_PROBE_TIMEOUT_MS),
+                };
+                MAX_TCP_PROBES
+            ],
+            ..NetworkQuery::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
     fn parses_proc_net_ipv4_ports_uid_and_inode() {
         let content = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0200007F:01BB 01 00000000:00000000 00:00000000 00000000   100        0 12345 1 0000000000000000 100 0 0 10 0\n";
         let connections = parse_proc_net(content, "tcp");
@@ -1530,6 +2861,9 @@ mod tests {
             .source_statuses
             .iter()
             .all(|status| status.status == CollectionStatus::Complete));
+        assert_eq!(snapshot.dns_resolver.status, CollectionStatus::Complete);
+        assert_eq!(snapshot.dns_resolver.nameservers, ["127.0.0.53"]);
+        assert!(snapshot.dns_checks.is_empty());
     }
 
     #[test]
@@ -1825,6 +3159,7 @@ mod tests {
         assert_eq!(snapshot.connections[0].local_addr, "127.0.0.1");
         assert!(snapshot.connections[0].local_address.is_empty());
         assert_eq!(snapshot.connections[0].uid, None);
+        assert_eq!(snapshot.dns_resolver, DnsResolverStatus::default());
         assert_eq!(snapshot.anomaly_total, 0);
         assert!(!snapshot.anomalies_truncated);
         assert_eq!(snapshot.omitted_anomaly_count, 0);

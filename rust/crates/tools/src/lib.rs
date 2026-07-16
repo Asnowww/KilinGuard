@@ -1450,7 +1450,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_network_connections",
-            description: "Collect bounded active Kylin Linux network connections from /proc/net with per-source status, separate local/remote addresses and ports, filter before the result limit, run DNS and TCP reachability probes, sample firewall state, and flag network anomalies.",
+            description: "Collect bounded Kylin Linux network state: active /proc/net connections, default /etc/resolv.conf health, fixed getent ahosts DNS checks, DNS-rebinding-safe local/private TCP reachability probes with a shared deadline, firewall state, and network anomalies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1458,14 +1458,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "state": { "type": "string", "minLength": 1, "maxLength": 32, "description": "Case-insensitive Linux socket state. TCP states and UDP unconnected/unconn are accepted." },
                     "remote_contains": { "type": "string", "minLength": 1, "maxLength": 128 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                    "dns_names": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 253 } },
+                    "dns_names": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "description": "Conventional public or private FQDNs, localhost, .local names, and IPv4/IPv6 literals. Option-like and malformed names are rejected.",
+                        "items": { "type": "string", "minLength": 1, "maxLength": 253 }
+                    },
                     "tcp_probes": {
                         "type": "array",
                         "maxItems": 5,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "host": { "type": "string", "maxLength": 253 },
+                                "host": { "type": "string", "minLength": 1, "maxLength": 253, "description": "Validated FQDN, localhost, .local name, or IP literal. Every resolved IP is checked against the local/private/link-local policy before connecting." },
                                 "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3000 }
                             },
@@ -11209,6 +11214,30 @@ printf 'pwsh:%s' "$1"
                 "info",
                 "debug"
             ])
+        );
+        let network_spec = specs
+            .iter()
+            .find(|spec| spec.name == "os_network_connections")
+            .expect("network tool spec");
+        assert!(network_spec.description.contains("/etc/resolv.conf"));
+        assert!(network_spec.description.contains("getent ahosts"));
+        assert!(network_spec.description.contains("DNS-rebinding-safe"));
+        assert_eq!(
+            network_spec.input_schema["properties"]["dns_names"]["maxItems"],
+            8
+        );
+        assert_eq!(
+            network_spec.input_schema["properties"]["dns_names"]["items"]["minLength"],
+            1
+        );
+        assert_eq!(
+            network_spec.input_schema["properties"]["tcp_probes"]["maxItems"],
+            5
+        );
+        assert_eq!(
+            network_spec.input_schema["properties"]["tcp_probes"]["items"]["properties"]
+                ["timeout_ms"]["maximum"],
+            3000
         );
     }
 

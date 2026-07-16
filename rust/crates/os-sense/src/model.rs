@@ -699,6 +699,8 @@ pub struct NetworkSnapshot {
     #[serde(default)]
     pub omitted_warning_count: usize,
     pub connections: Vec<NetworkConnection>,
+    #[serde(default)]
+    pub dns_resolver: DnsResolverStatus,
     pub dns_checks: Vec<DnsCheck>,
     pub tcp_probes: Vec<HealthProbeResult>,
     pub firewall: Vec<FirewallStatus>,
@@ -762,12 +764,115 @@ pub struct NetworkBaselineEntry {
     pub port_end: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsResolverStatus {
+    #[serde(default)]
+    pub status: CollectionStatus,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub actual_path: String,
+    #[serde(default)]
+    pub nameservers: Vec<String>,
+    #[serde(default)]
+    pub search_domains: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub parse_failure_count: usize,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_nameserver_count: usize,
+    #[serde(default)]
+    pub omitted_search_domain_count: usize,
+    #[serde(default)]
+    pub omitted_option_count: usize,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsResolutionStatus {
+    #[default]
+    Unknown,
+    Resolved,
+    Partial,
+    Literal,
+    NoAddresses,
+    TimedOut,
+    CommandFailed,
+    InvalidOutput,
+    ResolverUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsResolutionSource {
+    #[default]
+    Unknown,
+    GetentAhosts,
+    IpLiteral,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsCheck {
     pub name: String,
     pub resolved_addrs: Vec<String>,
     pub ok: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub status: DnsResolutionStatus,
+    #[serde(default)]
+    pub latency_ms: Option<u128>,
+    #[serde(default)]
+    pub source: DnsResolutionSource,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_address_count: usize,
+    #[serde(default)]
+    pub parse_failure_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpProbeStatus {
+    #[default]
+    Unknown,
+    Reachable,
+    Failed,
+    TimedOut,
+    PolicyDenied,
+    ResolutionFailed,
+    InvalidTarget,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpProbeStage {
+    #[default]
+    Unknown,
+    Validation,
+    Resolution,
+    Policy,
+    Connect,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpProbeErrorKind {
+    InvalidTarget,
+    ResolverUnavailable,
+    ResolutionTimedOut,
+    ResolutionFailed,
+    NoAddresses,
+    PolicyDenied,
+    ConnectFailed,
+    ConnectTimedOut,
+    DeadlineExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -776,6 +881,26 @@ pub struct HealthProbeResult {
     pub ok: bool,
     pub latency_ms: Option<u128>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub status: TcpProbeStatus,
+    #[serde(default)]
+    pub stage: TcpProbeStage,
+    #[serde(default)]
+    pub error_kind: Option<TcpProbeErrorKind>,
+    #[serde(default)]
+    pub resolution_status: DnsResolutionStatus,
+    #[serde(default)]
+    pub resolution_source: DnsResolutionSource,
+    #[serde(default)]
+    pub resolved_addrs: Vec<String>,
+    #[serde(default)]
+    pub attempted_addrs: Vec<String>,
+    #[serde(default)]
+    pub selected_addr: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_address_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
