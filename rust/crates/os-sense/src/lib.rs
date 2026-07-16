@@ -19,17 +19,21 @@ pub mod storage;
 
 pub use context::{build_alert_context, collect_context, ContextRequest};
 pub use error::{OsSenseError, Result};
-pub use logs::{query_logs, LogQuery};
+pub use logs::{
+    query_logs, query_logs_with_summary_generator, render_log_summary_prompt, LogQuery,
+    LogSummaryGenerator,
+};
 pub use model::{
     ActiveAlert, ActiveAlertDimension, ActiveAlertSnapshot, Alert, AlertContext,
     AlertEvaluationFreshness, CollectionMode, CollectionStatus, CorruptSampleDetail,
     CpuCoreSnapshot, CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
-    FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogPattern,
-    LogQueryResult, LogSourceStatus, MemorySnapshot, MetricSnapshot, NetworkConnection,
-    NetworkInterfaceSnapshot, NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta,
-    PlatformInfo, ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo,
-    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
-    TemperatureReading, ThermalSnapshot,
+    FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogLlmSummaryOutput,
+    LogPattern, LogQueryResult, LogSourceStatus, LogSummary, LogSummaryBoundary,
+    LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange, MemorySnapshot,
+    MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot,
+    NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessAnomalyEvidence,
+    ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
+    SensorAvailability, ServiceSnapshot, ServiceUnit, TemperatureReading, ThermalSnapshot,
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{

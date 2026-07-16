@@ -2312,6 +2312,7 @@ dependencies = [
  "crossterm",
  "log",
  "mock-anthropic-service",
+ "os-sense",
  "plugins",
  "pulldown-cmark",
  "runtime",

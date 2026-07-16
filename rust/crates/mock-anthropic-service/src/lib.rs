@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{InputContentBlock, MessageRequest, MessageResponse, OutputContentBlock, Usage};
 use serde_json::{json, Value};
@@ -11,6 +11,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
+pub const LOG_SUMMARY_SCENARIO_PREFIX: &str = "LOG_SUMMARY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,12 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    LogSummaryRoundtrip,
+    LogSummarySuccess,
+    LogSummaryInvalidJson,
+    LogSummaryToolUse,
+    LogSummaryApiError,
+    LogSummaryTimeout,
 }
 
 impl Scenario {
@@ -117,6 +124,7 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "log_summary_roundtrip" => Some(Self::LogSummaryRoundtrip),
             _ => None,
         }
     }
@@ -135,6 +143,12 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::LogSummaryRoundtrip => "log_summary_roundtrip",
+            Self::LogSummarySuccess => "log_summary_success",
+            Self::LogSummaryInvalidJson => "log_summary_invalid_json",
+            Self::LogSummaryToolUse => "log_summary_tool_use",
+            Self::LogSummaryApiError => "log_summary_api_error",
+            Self::LogSummaryTimeout => "log_summary_timeout",
         }
     }
 }
@@ -157,6 +171,10 @@ async fn handle_connection(
         stream: request.stream,
         raw_body,
     });
+
+    if scenario == Scenario::LogSummaryTimeout {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     let response = build_http_response(&request, scenario);
     socket.write_all(response.as_bytes()).await?;
@@ -242,7 +260,7 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
-    request.messages.iter().rev().find_map(|message| {
+    let parity = request.messages.iter().rev().find_map(|message| {
         message.content.iter().rev().find_map(|block| match block {
             InputContentBlock::Text { text } => text
                 .split_whitespace()
@@ -250,6 +268,37 @@ fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
                 .and_then(Scenario::parse),
             _ => None,
         })
+    });
+    parity.or_else(|| detect_log_summary_scenario(request))
+}
+
+fn detect_log_summary_scenario(request: &MessageRequest) -> Option<Scenario> {
+    if !request
+        .system
+        .as_deref()
+        .is_some_and(|system| system.contains("non-executable suggestions"))
+    {
+        return None;
+    }
+    let requested = request.messages.iter().find_map(|message| {
+        message.content.iter().find_map(|block| match block {
+            InputContentBlock::Text { text } => {
+                text.find(LOG_SUMMARY_SCENARIO_PREFIX).map(|start| {
+                    text[start + LOG_SUMMARY_SCENARIO_PREFIX.len()..]
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                        .collect::<String>()
+                })
+            }
+            _ => None,
+        })
+    });
+    Some(match requested {
+        Some(value) if value == "invalid_json" => Scenario::LogSummaryInvalidJson,
+        Some(value) if value == "tool_use" => Scenario::LogSummaryToolUse,
+        Some(value) if value == "api_error" => Scenario::LogSummaryApiError,
+        Some(value) if value == "timeout" => Scenario::LogSummaryTimeout,
+        _ => Scenario::LogSummarySuccess,
     })
 }
 
@@ -309,6 +358,14 @@ fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> Strin
 
 #[allow(clippy::too_many_lines)]
 fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
+    if scenario == Scenario::LogSummaryApiError {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"type":"error","error":{"type":"api_error","message":"mock log summary failure token=private"}}"#,
+            &[("request-id", request_id_for(scenario))],
+        );
+    }
     let response = if request.stream {
         let body = build_stream_body(request, scenario);
         return http_response(
@@ -464,6 +521,25 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::LogSummaryRoundtrip => match latest_tool_result(request) {
+            Some((tool_output, _)) => {
+                final_text_sse(&format!("log summary roundtrip complete: {tool_output}"))
+            }
+            None => tool_use_sse(
+                "toolu_log_summary_query",
+                "os_log_query",
+                &[r#"{"sources":["journalctl"],"limit":10,"summarize":true}"#],
+            ),
+        },
+        Scenario::LogSummarySuccess
+        | Scenario::LogSummaryInvalidJson
+        | Scenario::LogSummaryApiError
+        | Scenario::LogSummaryTimeout => final_text_sse("log summary response"),
+        Scenario::LogSummaryToolUse => tool_use_sse(
+            "toolu_log_summary_forbidden",
+            "bash",
+            &[r#"{"command":"echo forbidden"}"#],
+        ),
     }
 }
 
@@ -634,6 +710,34 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::LogSummaryRoundtrip => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_log_summary_roundtrip_final",
+                &format!("log summary roundtrip complete: {tool_output}"),
+            ),
+            None => tool_message_response(
+                "msg_log_summary_roundtrip_tool",
+                "toolu_log_summary_query",
+                "os_log_query",
+                json!({"sources": ["journalctl"], "limit": 10, "summarize": true}),
+            ),
+        },
+        Scenario::LogSummarySuccess | Scenario::LogSummaryTimeout => text_message_response(
+            "msg_log_summary_success",
+            r#"{"diagnosis":"A service error requires inspection.","key_findings":["An error-level event was observed."],"recommended_checks":["Review the cited service state."],"confidence":0.85,"evidence_ids":["E001"]}"#,
+        ),
+        Scenario::LogSummaryInvalidJson => {
+            text_message_response("msg_log_summary_invalid", "not valid JSON")
+        }
+        Scenario::LogSummaryToolUse => tool_message_response(
+            "msg_log_summary_tool",
+            "toolu_log_summary_forbidden",
+            "bash",
+            json!({"command": "echo forbidden"}),
+        ),
+        Scenario::LogSummaryApiError => {
+            text_message_response("msg_log_summary_api_error", "unreachable")
+        }
     }
 }
 
@@ -651,6 +755,12 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::LogSummaryRoundtrip => "req_log_summary_roundtrip",
+        Scenario::LogSummarySuccess => "req_log_summary_success",
+        Scenario::LogSummaryInvalidJson => "req_log_summary_invalid_json",
+        Scenario::LogSummaryToolUse => "req_log_summary_tool_use",
+        Scenario::LogSummaryApiError => "req_log_summary_api_error",
+        Scenario::LogSummaryTimeout => "req_log_summary_timeout",
     }
 }
 

@@ -271,8 +271,19 @@ fn build_health_summary(
         ));
     }
     if let Some(logs) = logs {
+        let summary = logs
+            .summary
+            .as_ref()
+            .map(|summary| match summary.mode {
+                crate::model::LogSummaryMode::Llm => "llm summary",
+                crate::model::LogSummaryMode::Fallback if logs.summary_request.is_some() => {
+                    "fallback summary with LLM-ready data-only request"
+                }
+                crate::model::LogSummaryMode::Fallback => "fallback summary",
+            })
+            .unwrap_or("no summary");
         parts.push(format!(
-            "logs: {} entries, {} patterns",
+            "logs: {} entries, {} patterns, {summary}",
             logs.entries.len(),
             logs.patterns.len()
         ));
