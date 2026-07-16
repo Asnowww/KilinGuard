@@ -283,9 +283,10 @@ fn build_health_summary(
             })
             .unwrap_or("no summary");
         parts.push(format!(
-            "logs: {} entries, {} patterns, {summary}",
+            "logs: {} entries, {} patterns, {} omitted patterns, {summary}",
             logs.entries.len(),
-            logs.patterns.len()
+            logs.patterns.len(),
+            logs.omitted_pattern_count
         ));
     }
     if let Some(network) = network {

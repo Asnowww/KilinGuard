@@ -488,6 +488,12 @@ pub struct LogQueryResult {
     pub filter_complete: bool,
     pub entries: Vec<LogEntry>,
     pub patterns: Vec<LogPattern>,
+    #[serde(default)]
+    pub pattern_input_count: usize,
+    #[serde(default)]
+    pub pattern_input_truncated: bool,
+    #[serde(default)]
+    pub omitted_pattern_count: usize,
     pub summary: Option<LogSummary>,
     #[serde(default)]
     pub summary_request: Option<LogSummaryRequest>,
@@ -523,6 +529,54 @@ pub struct LogPattern {
     pub kind: String,
     pub count: usize,
     pub message: String,
+    #[serde(default)]
+    pub score: Option<u8>,
+    #[serde(default)]
+    pub evidence: Option<LogPatternEvidence>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogPatternEvidence {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub bucket_width_ms: Option<u64>,
+    #[serde(default)]
+    pub baseline_window_start: Option<String>,
+    #[serde(default)]
+    pub baseline_window_end: Option<String>,
+    #[serde(default)]
+    pub current_window_start: Option<String>,
+    #[serde(default)]
+    pub current_window_end: Option<String>,
+    #[serde(default)]
+    pub baseline_bucket_count: Option<usize>,
+    #[serde(default)]
+    pub baseline_observed_bucket_count: Option<usize>,
+    #[serde(default)]
+    pub baseline_median_count: Option<u64>,
+    #[serde(default)]
+    pub baseline_mad_count: Option<u64>,
+    #[serde(default)]
+    pub current_count: Option<u64>,
+    #[serde(default)]
+    pub period_ms: Option<u64>,
+    #[serde(default)]
+    pub interval_count: Option<usize>,
+    #[serde(default)]
+    pub maximum_jitter_ms: Option<u64>,
+    #[serde(default)]
+    pub tolerance_ms: Option<u64>,
+    #[serde(default)]
+    pub sample_timestamps: Vec<String>,
+    #[serde(default)]
+    pub input_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

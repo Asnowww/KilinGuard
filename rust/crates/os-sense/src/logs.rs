@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::command::{run_limited_command, LimitedCommandOutput};
 use crate::error::{OsSenseError, Result};
 use crate::model::{
-    CollectionStatus, CountByKey, LogEntry, LogLlmSummaryOutput, LogPattern, LogQueryResult,
-    LogSourceStatus, LogSummary, LogSummaryEvidence, LogSummaryMode, LogSummaryRequest,
-    LogSummaryTimeRange,
+    CollectionStatus, CountByKey, LogEntry, LogLlmSummaryOutput, LogPattern, LogPatternEvidence,
+    LogQueryResult, LogSourceStatus, LogSummary, LogSummaryEvidence, LogSummaryMode,
+    LogSummaryRequest, LogSummaryTimeRange,
 };
 use crate::procfs::basic_meta;
 use crate::redaction::redact_sensitive_text;
@@ -28,6 +28,18 @@ const MAX_LOG_RAW_LINE_BYTES: usize = 4 * 1024;
 const MAX_LOG_WARNINGS: usize = 32;
 const MAX_LOG_ERROR_CHARS: usize = 256;
 const MAX_LOG_SOURCES: usize = 4;
+const MAX_LOG_PATTERN_INPUT_PER_SOURCE: usize = 500;
+const MAX_LOG_PATTERN_INPUT: usize = MAX_LOG_PATTERN_INPUT_PER_SOURCE * MAX_LOG_SOURCES;
+const MAX_LOG_PATTERNS: usize = 32;
+const LOG_ERROR_BUCKET_WIDTH_MS: i64 = 5 * 60 * 1_000;
+const LOG_ERROR_BASELINE_BUCKETS: i64 = 3;
+const MIN_LOG_ERROR_SPIKE_INCREMENT: u64 = 5;
+const MIN_LOG_ERROR_SPIKE_MULTIPLIER: u64 = 3;
+const MIN_PERIODIC_EVENT_COUNT: usize = 4;
+const MIN_PERIODIC_INTERVAL_MS: u64 = 30 * 1_000;
+const MAX_PERIODIC_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_PATTERN_SIGNATURE_CHARS: usize = 256;
+const MAX_PATTERN_EVIDENCE_TIMESTAMPS: usize = 8;
 const MAX_SYSLOG_TIMESTAMP_DISTANCE_MS: u64 = 183 * 24 * 60 * 60 * 1_000;
 const MAX_LOG_SUMMARY_EVIDENCE: usize = 32;
 const MAX_LOG_SUMMARY_PATTERNS: usize = 16;
@@ -385,6 +397,7 @@ fn query_logs_with_components(
         timezone,
     };
     let limit = effective_log_limit(query.limit);
+    let collection_limit = MAX_LOG_PATTERN_INPUT_PER_SOURCE.max(limit);
     let mut warnings = Vec::new();
     let mut omitted_warning_count = 0usize;
     let mut indeterminate_filter_count = 0usize;
@@ -393,22 +406,24 @@ fn query_logs_with_components(
     for source in sources {
         let mut collected = match source {
             LogicalLogSource::Journalctl => {
-                read_journalctl(query, command_runner, &timestamp_context)
+                read_journalctl(query, command_runner, &timestamp_context, collection_limit)
             }
             LogicalLogSource::Syslog => read_log_files(
                 source,
                 &SYSLOG_PATHS,
-                query,
                 file_reader,
                 &timestamp_context,
+                collection_limit,
             ),
-            LogicalLogSource::Dmesg => read_dmesg(query, command_runner, &timestamp_context),
+            LogicalLogSource::Dmesg => {
+                read_dmesg(query, command_runner, &timestamp_context, collection_limit)
+            }
             LogicalLogSource::Auth => read_log_files(
                 source,
                 &AUTH_LOG_PATHS,
-                query,
                 file_reader,
                 &timestamp_context,
+                collection_limit,
             ),
         };
         for warning in collected.warnings {
@@ -438,6 +453,26 @@ fn query_logs_with_components(
     }
 
     let source_truncated = source_statuses.iter().any(|status| status.truncated);
+    let incomplete_pattern_sources = source_statuses
+        .iter()
+        .filter(|status| status.truncated || status.status != CollectionStatus::Complete)
+        .filter_map(|status| status.actual_source.clone())
+        .collect::<BTreeSet<_>>();
+    let (pattern_entries, pattern_selection_truncated) =
+        select_pattern_entries(&entries_by_source, MAX_LOG_PATTERN_INPUT);
+    let pattern_cutoff_ms = filter
+        .until
+        .as_ref()
+        .map(DateTime::timestamp_millis)
+        .unwrap_or(collected_at_ms);
+    let pattern_since_ms = filter.since.as_ref().map(DateTime::timestamp_millis);
+    let detected_patterns = detect_log_patterns(
+        &pattern_entries,
+        &incomplete_pattern_sources,
+        pattern_cutoff_ms,
+        pattern_since_ms,
+    );
+    let pattern_input_truncated = source_truncated || pattern_selection_truncated;
     let (entries, merge_truncated) = merge_entries_round_robin(entries_by_source, limit);
     let truncated = source_truncated || merge_truncated;
     let collection_status = if source_statuses
@@ -453,7 +488,7 @@ fn query_logs_with_components(
     } else {
         CollectionStatus::Partial
     };
-    let patterns = detect_log_patterns(&entries);
+    let patterns = detected_patterns.patterns;
     let generated_at_ms = u64::try_from(collected_at_ms).unwrap_or_default();
     let (summary, summary_request) = build_summary_result(
         query.summarize,
@@ -461,7 +496,7 @@ fn query_logs_with_components(
         &entries,
         &patterns,
         generated_at_ms,
-        truncated,
+        truncated || pattern_input_truncated || detected_patterns.omitted_count > 0,
         summary_generator,
     );
     let mut meta = basic_meta("logs", warnings);
@@ -481,9 +516,37 @@ fn query_logs_with_components(
         filter_complete: indeterminate_filter_count == 0,
         entries,
         patterns,
+        pattern_input_count: pattern_entries.len(),
+        pattern_input_truncated,
+        omitted_pattern_count: detected_patterns.omitted_count,
         summary,
         summary_request,
     })
+}
+
+fn select_pattern_entries(
+    entries_by_source: &[Vec<LogEntry>],
+    limit: usize,
+) -> (Vec<LogEntry>, bool) {
+    let total = entries_by_source.iter().map(Vec::len).sum::<usize>();
+    let mut positions = vec![0usize; entries_by_source.len()];
+    let mut selected = Vec::with_capacity(total.min(limit));
+    while selected.len() < limit {
+        let previous_len = selected.len();
+        for (source_index, entries) in entries_by_source.iter().enumerate() {
+            if selected.len() == limit {
+                break;
+            }
+            if let Some(entry) = entries.get(positions[source_index]) {
+                selected.push(entry.clone());
+                positions[source_index] += 1;
+            }
+        }
+        if selected.len() == previous_len {
+            break;
+        }
+    }
+    (selected, total > limit)
 }
 
 fn merge_entries_round_robin(
@@ -543,9 +606,9 @@ fn read_journalctl(
     query: &LogQuery,
     runner: &dyn LogCommandRunner,
     timestamp_context: &LogTimestampContext<'_>,
+    collection_limit: usize,
 ) -> SourceCollection {
-    let limit = effective_log_limit(query.limit);
-    let requested_limit = limit.saturating_add(1).to_string();
+    let requested_limit = collection_limit.saturating_add(1).to_string();
     let mut args = vec![
         "--no-pager".to_string(),
         "--output=short-iso".to_string(),
@@ -570,7 +633,7 @@ fn read_journalctl(
         "journalctl",
         args,
         runner,
-        limit,
+        collection_limit,
         timestamp_context,
     )
 }
@@ -579,6 +642,7 @@ fn read_dmesg(
     query: &LogQuery,
     runner: &dyn LogCommandRunner,
     timestamp_context: &LogTimestampContext<'_>,
+    collection_limit: usize,
 ) -> SourceCollection {
     let mut args = vec!["--time-format".to_string(), "iso".to_string()];
     if let Some(priority) = query.severity.as_deref().and_then(dmesg_level_for_severity) {
@@ -590,7 +654,7 @@ fn read_dmesg(
         "dmesg",
         args,
         runner,
-        effective_log_limit(query.limit),
+        collection_limit,
         timestamp_context,
     )
 }
@@ -598,20 +662,16 @@ fn read_dmesg(
 fn read_log_files(
     source: LogicalLogSource,
     paths: &[&str],
-    query: &LogQuery,
     reader: &dyn LogFileReader,
     timestamp_context: &LogTimestampContext<'_>,
+    collection_limit: usize,
 ) -> SourceCollection {
     let mut failures = Vec::new();
     for path in paths {
         match reader.read_tail(Path::new(path), MAX_LOG_FILE_BYTES) {
             Ok(tail) => {
-                let (entries, line_truncated) = parse_log_bytes(
-                    path,
-                    &tail.bytes,
-                    effective_log_limit(query.limit),
-                    timestamp_context,
-                );
+                let (entries, line_truncated) =
+                    parse_log_bytes(path, &tail.bytes, collection_limit, timestamp_context);
                 let truncated = tail.truncated || line_truncated;
                 let mut warnings = failures;
                 if truncated {
@@ -895,43 +955,374 @@ fn entry_contains_ascii_keyword(entry: &LogEntry, keyword_ascii_lower: &str) -> 
             .contains(keyword_ascii_lower)
 }
 
-fn detect_log_patterns(entries: &[LogEntry]) -> Vec<LogPattern> {
+struct DetectedPatterns {
+    patterns: Vec<LogPattern>,
+    omitted_count: usize,
+}
+
+#[derive(Default)]
+struct ErrorBucket {
+    entry_count: u64,
+    error_count: u64,
+}
+
+fn detect_log_patterns(
+    entries: &[LogEntry],
+    incomplete_sources: &BTreeSet<String>,
+    cutoff_ms: i64,
+    since_ms: Option<i64>,
+) -> DetectedPatterns {
     let mut patterns = Vec::new();
-    let error_count = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .severity
-                .as_deref()
-                .is_some_and(|severity| severity_rank(severity) <= severity_rank("error"))
-        })
-        .count();
-    if error_count >= 5 {
-        patterns.push(LogPattern {
-            kind: "error_frequency".to_string(),
-            count: error_count,
-            message: "error-level log volume is elevated in the queried sample".to_string(),
-        });
+    detect_error_frequency_spikes(
+        entries,
+        incomplete_sources,
+        cutoff_ms,
+        since_ms,
+        &mut patterns,
+    );
+    let periodic_signatures =
+        detect_periodic_failures(entries, incomplete_sources, cutoff_ms, &mut patterns);
+    detect_repeating_messages(entries, &periodic_signatures, &mut patterns);
+    select_patterns_fair(patterns)
+}
+
+fn detect_error_frequency_spikes(
+    entries: &[LogEntry],
+    incomplete_sources: &BTreeSet<String>,
+    cutoff_ms: i64,
+    since_ms: Option<i64>,
+    patterns: &mut Vec<LogPattern>,
+) {
+    let mut by_source = BTreeMap::<String, Vec<&LogEntry>>::new();
+    for entry in entries {
+        by_source
+            .entry(entry.source.clone())
+            .or_default()
+            .push(entry);
     }
 
-    let mut repeated = BTreeMap::<String, usize>::new();
-    for entry in entries {
-        *repeated
-            .entry(normalize_message(&entry.message))
-            .or_default() += 1;
+    for (source, source_entries) in by_source {
+        if incomplete_sources.contains(&source)
+            || source_entries.iter().any(|entry| {
+                entry
+                    .timestamp
+                    .as_deref()
+                    .and_then(|value| parse_iso_timestamp(value, true, true))
+                    .is_none()
+                    || entry
+                        .severity
+                        .as_deref()
+                        .and_then(known_severity_rank)
+                        .is_none()
+            })
+        {
+            continue;
+        }
+
+        let mut buckets = BTreeMap::<i64, ErrorBucket>::new();
+        for entry in source_entries {
+            let timestamp_ms = entry
+                .timestamp
+                .as_deref()
+                .and_then(|value| parse_iso_timestamp(value, true, true))
+                .map(|timestamp| timestamp.timestamp_millis())
+                .expect("validated timestamp above");
+            let bucket = timestamp_ms.div_euclid(LOG_ERROR_BUCKET_WIDTH_MS);
+            let counts = buckets.entry(bucket).or_default();
+            counts.entry_count = counts.entry_count.saturating_add(1);
+            if entry
+                .severity
+                .as_deref()
+                .and_then(known_severity_rank)
+                .is_some_and(|rank| rank <= severity_rank("error"))
+            {
+                counts.error_count = counts.error_count.saturating_add(1);
+            }
+        }
+        let current_bucket = cutoff_ms
+            .div_euclid(LOG_ERROR_BUCKET_WIDTH_MS)
+            .saturating_sub(1);
+        let current_start_ms = current_bucket.saturating_mul(LOG_ERROR_BUCKET_WIDTH_MS);
+        let baseline_first_bucket = current_bucket.saturating_sub(LOG_ERROR_BASELINE_BUCKETS);
+        let baseline_start_ms = baseline_first_bucket.saturating_mul(LOG_ERROR_BUCKET_WIDTH_MS);
+        if since_ms.is_some_and(|since| since > baseline_start_ms) {
+            continue;
+        }
+        let mut baseline_counts = (baseline_first_bucket..current_bucket)
+            .map(|bucket| buckets.get(&bucket).map_or(0, |counts| counts.error_count))
+            .collect::<Vec<_>>();
+        let baseline_observed_bucket_count = (baseline_first_bucket..current_bucket)
+            .filter(|bucket| {
+                buckets
+                    .get(bucket)
+                    .is_some_and(|counts| counts.entry_count > 0)
+            })
+            .count();
+        let baseline_median = median_u64(&mut baseline_counts);
+        let mut deviations = baseline_counts
+            .iter()
+            .map(|count| count.abs_diff(baseline_median))
+            .collect::<Vec<_>>();
+        let baseline_mad = median_u64(&mut deviations);
+        let current_count = buckets
+            .get(&current_bucket)
+            .map_or(0, |counts| counts.error_count);
+        let required_increment = MIN_LOG_ERROR_SPIKE_INCREMENT.max(baseline_mad.saturating_mul(3));
+        if current_count < baseline_median.saturating_add(required_increment)
+            || current_count
+                < baseline_median
+                    .max(1)
+                    .saturating_mul(MIN_LOG_ERROR_SPIKE_MULTIPLIER)
+        {
+            continue;
+        }
+
+        let score = 70u64
+            .saturating_add(
+                current_count
+                    .saturating_sub(baseline_median)
+                    .saturating_mul(2),
+            )
+            .min(100) as u8;
+        patterns.push(LogPattern {
+            kind: "error_frequency_spike".to_string(),
+            count: usize::try_from(current_count).unwrap_or(usize::MAX),
+            message: format!(
+                "error-level events in {source} increased to {current_count} from a baseline median of {baseline_median} per five-minute bucket"
+            ),
+            score: Some(score),
+            evidence: Some(LogPatternEvidence {
+                source: Some(source),
+                confidence: Some("high".to_string()),
+                bucket_width_ms: u64::try_from(LOG_ERROR_BUCKET_WIDTH_MS).ok(),
+                baseline_window_start: timestamp_string(baseline_start_ms),
+                baseline_window_end: timestamp_string(current_start_ms),
+                current_window_start: timestamp_string(current_start_ms),
+                current_window_end: timestamp_string(
+                    current_start_ms.saturating_add(LOG_ERROR_BUCKET_WIDTH_MS),
+                ),
+                baseline_bucket_count: Some(LOG_ERROR_BASELINE_BUCKETS as usize),
+                baseline_observed_bucket_count: Some(baseline_observed_bucket_count),
+                baseline_median_count: Some(baseline_median),
+                baseline_mad_count: Some(baseline_mad),
+                current_count: Some(current_count),
+                ..LogPatternEvidence::default()
+            }),
+        });
     }
-    if let Some((message, count)) = repeated
-        .into_iter()
-        .filter(|(_, count)| *count >= 3)
-        .max_by_key(|(_, count)| *count)
-    {
+}
+
+type PatternSignature = (String, String, String);
+
+fn detect_periodic_failures(
+    entries: &[LogEntry],
+    incomplete_sources: &BTreeSet<String>,
+    cutoff_ms: i64,
+    patterns: &mut Vec<LogPattern>,
+) -> BTreeSet<PatternSignature> {
+    let mut unknown_sources = BTreeSet::new();
+    let mut groups = BTreeMap::<PatternSignature, Vec<(i64, String)>>::new();
+    for entry in entries {
+        let Some(rank) = entry.severity.as_deref().and_then(known_severity_rank) else {
+            unknown_sources.insert(entry.source.clone());
+            continue;
+        };
+        if rank > severity_rank("error") {
+            continue;
+        }
+        let Some(timestamp) = entry
+            .timestamp
+            .as_deref()
+            .and_then(|value| parse_iso_timestamp(value, true, true))
+        else {
+            unknown_sources.insert(entry.source.clone());
+            continue;
+        };
+        if timestamp.timestamp_millis() > cutoff_ms {
+            continue;
+        }
+        let signature = (
+            entry.source.clone(),
+            entry.unit.clone().unwrap_or_default(),
+            normalize_message(&entry.message),
+        );
+        groups.entry(signature).or_default().push((
+            timestamp.timestamp_millis(),
+            timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+        ));
+    }
+
+    let mut periodic_signatures = BTreeSet::new();
+    for (signature, mut samples) in groups {
+        samples.sort_by_key(|sample| sample.0);
+        samples.dedup_by_key(|sample| sample.0);
+        if samples.len() < MIN_PERIODIC_EVENT_COUNT {
+            continue;
+        }
+        let mut intervals = samples
+            .windows(2)
+            .filter_map(|pair| u64::try_from(pair[1].0.saturating_sub(pair[0].0)).ok())
+            .collect::<Vec<_>>();
+        let period_ms = median_u64(&mut intervals);
+        if !(MIN_PERIODIC_INTERVAL_MS..=MAX_PERIODIC_INTERVAL_MS).contains(&period_ms) {
+            continue;
+        }
+        let tolerance_ms = (period_ms / 10).max(1_000);
+        let maximum_jitter_ms = intervals
+            .iter()
+            .map(|interval| interval.abs_diff(period_ms))
+            .max()
+            .unwrap_or_default();
+        if maximum_jitter_ms > tolerance_ms {
+            continue;
+        }
+        let (source, unit, normalized_message) = &signature;
+        let reduced_confidence =
+            incomplete_sources.contains(source) || unknown_sources.contains(source);
+        let score = if reduced_confidence { 70 } else { 90 };
+        patterns.push(LogPattern {
+            kind: "periodic_failure".to_string(),
+            count: samples.len(),
+            message: format!(
+                "a stable failure signature in {source} repeated every {period_ms} ms across {} samples",
+                samples.len()
+            ),
+            score: Some(score),
+            evidence: Some(LogPatternEvidence {
+                source: Some(source.clone()),
+                unit: (!unit.is_empty()).then(|| unit.clone()),
+                signature: Some(pattern_signature_evidence(normalized_message)),
+                confidence: Some(
+                    if reduced_confidence { "reduced" } else { "high" }.to_string(),
+                ),
+                period_ms: Some(period_ms),
+                interval_count: Some(intervals.len()),
+                maximum_jitter_ms: Some(maximum_jitter_ms),
+                tolerance_ms: Some(tolerance_ms),
+                sample_timestamps: samples
+                    .iter()
+                    .take(MAX_PATTERN_EVIDENCE_TIMESTAMPS)
+                    .map(|sample| sample.1.clone())
+                    .collect(),
+                input_truncated: incomplete_sources.contains(source),
+                ..LogPatternEvidence::default()
+            }),
+        });
+        periodic_signatures.insert(signature);
+    }
+    periodic_signatures
+}
+
+fn detect_repeating_messages(
+    entries: &[LogEntry],
+    periodic_signatures: &BTreeSet<PatternSignature>,
+    patterns: &mut Vec<LogPattern>,
+) {
+    let mut repeated = BTreeMap::<PatternSignature, usize>::new();
+    for entry in entries {
+        let signature = (
+            entry.source.clone(),
+            entry.unit.clone().unwrap_or_default(),
+            normalize_message(&entry.message),
+        );
+        *repeated.entry(signature).or_default() += 1;
+    }
+    for ((source, unit, signature), count) in repeated {
+        if count < 3
+            || periodic_signatures.contains(&(source.clone(), unit.clone(), signature.clone()))
+        {
+            continue;
+        }
         patterns.push(LogPattern {
             kind: "repeating_message".to_string(),
             count,
-            message,
+            message: format!("a stable log signature repeated {count} times in {source}"),
+            score: Some(50),
+            evidence: Some(LogPatternEvidence {
+                source: Some(source),
+                unit: (!unit.is_empty()).then_some(unit),
+                signature: Some(pattern_signature_evidence(&signature)),
+                confidence: Some("informational".to_string()),
+                ..LogPatternEvidence::default()
+            }),
         });
     }
-    patterns
+}
+
+fn select_patterns_fair(patterns: Vec<LogPattern>) -> DetectedPatterns {
+    let total = patterns.len();
+    let mut groups = BTreeMap::<(String, String), Vec<LogPattern>>::new();
+    for pattern in patterns {
+        let source = pattern
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source.clone())
+            .unwrap_or_default();
+        groups
+            .entry((pattern.kind.clone(), source))
+            .or_default()
+            .push(pattern);
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|(key, mut patterns)| {
+            patterns.sort_by(|left, right| {
+                right
+                    .score
+                    .unwrap_or_default()
+                    .cmp(&left.score.unwrap_or_default())
+                    .then_with(|| right.count.cmp(&left.count))
+                    .then_with(|| pattern_signature(left).cmp(pattern_signature(right)))
+                    .then_with(|| left.message.cmp(&right.message))
+            });
+            (key, VecDeque::from(patterns))
+        })
+        .collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(total.min(MAX_LOG_PATTERNS));
+    while selected.len() < MAX_LOG_PATTERNS {
+        let previous_len = selected.len();
+        for (_, patterns) in &mut groups {
+            if selected.len() == MAX_LOG_PATTERNS {
+                break;
+            }
+            if let Some(pattern) = patterns.pop_front() {
+                selected.push(pattern);
+            }
+        }
+        if selected.len() == previous_len {
+            break;
+        }
+    }
+    DetectedPatterns {
+        omitted_count: total.saturating_sub(selected.len()),
+        patterns: selected,
+    }
+}
+
+fn pattern_signature(pattern: &LogPattern) -> &str {
+    pattern
+        .evidence
+        .as_ref()
+        .and_then(|evidence| evidence.signature.as_deref())
+        .unwrap_or_default()
+}
+
+fn median_u64(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 0 {
+        values[midpoint - 1].saturating_add(values[midpoint]) / 2
+    } else {
+        values[midpoint]
+    }
+}
+
+fn timestamp_string(timestamp_ms: i64) -> Option<String> {
+    DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn build_summary_result(
@@ -998,6 +1389,8 @@ fn build_log_summary_request(
                 kind: redact_log_text(&pattern.kind, 64),
                 count: pattern.count,
                 message: redact_log_text(&pattern.message, MAX_LOG_SUMMARY_ITEM_CHARS),
+                score: pattern.score,
+                evidence: pattern.evidence.clone(),
             })
             .collect(),
         evidence: entries
@@ -1467,17 +1860,55 @@ fn known_severity_rank(severity: &str) -> Option<u8> {
 }
 
 fn normalize_message(message: &str) -> String {
-    message
-        .split_whitespace()
-        .map(|token| {
-            if token.chars().any(|ch| ch.is_ascii_digit()) {
-                "#"
-            } else {
-                token
+    let mut normalized = String::new();
+    let mut in_digits = false;
+    let mut pending_space = false;
+    for ch in message.chars().take(MAX_LOG_MESSAGE_CHARS) {
+        if ch.is_ascii_digit() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            pending_space = false;
+            if !in_digits {
+                normalized.push('#');
+                in_digits = true;
+            }
+        } else if ch.is_whitespace() {
+            pending_space = true;
+            in_digits = false;
+        } else {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            in_digits = false;
+            normalized.push(ch.to_ascii_lowercase());
+        }
+    }
+    normalized
+}
+
+fn pattern_signature_evidence(signature: &str) -> String {
+    let suffix = format!(" [fnv1a64:{:016x}]", fnv1a64(signature.as_bytes()));
+    let available = MAX_PATTERN_SIGNATURE_CHARS.saturating_sub(suffix.chars().count());
+    let signature_chars = signature.chars().count();
+    let mut rendered = signature.chars().take(available).collect::<String>();
+    if signature_chars > available {
+        let keep = available.saturating_sub(3);
+        rendered = signature.chars().take(keep).collect::<String>();
+        rendered.push_str("...");
+    }
+    rendered.push_str(&suffix);
+    rendered
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -1721,6 +2152,34 @@ mod tests {
             .timestamp_millis()
     }
 
+    fn pattern_entry(
+        source: &str,
+        timestamp: &str,
+        severity: &str,
+        unit: Option<&str>,
+        message: impl Into<String>,
+    ) -> LogEntry {
+        LogEntry {
+            source: source.to_string(),
+            timestamp: Some(timestamp.to_string()),
+            severity: Some(severity.to_string()),
+            unit: unit.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    fn detect_test_patterns(
+        entries: &[LogEntry],
+        incomplete_sources: &BTreeSet<String>,
+    ) -> DetectedPatterns {
+        detect_log_patterns(
+            entries,
+            incomplete_sources,
+            test_timestamp_ms("2026-07-15T01:00:00Z"),
+            None,
+        )
+    }
+
     #[test]
     fn infers_log_severity_and_unit() {
         let entry = parse_log_line(
@@ -1732,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_error_frequency_and_repeats() {
+    fn detects_repeating_messages_without_treating_total_errors_as_a_spike() {
         let entries = (0..6)
             .map(|idx| LogEntry {
                 source: "syslog".to_string(),
@@ -1742,13 +2201,493 @@ mod tests {
                 message: format!("service failed with code {idx}"),
             })
             .collect::<Vec<_>>();
-        let patterns = detect_log_patterns(&entries);
-        assert!(patterns
+        let patterns = detect_test_patterns(&entries, &BTreeSet::new());
+        assert!(!patterns
+            .patterns
             .iter()
-            .any(|pattern| pattern.kind == "error_frequency"));
+            .any(|pattern| pattern.kind == "error_frequency_spike"));
         assert!(patterns
+            .patterns
             .iter()
             .any(|pattern| pattern.kind == "repeating_message"));
+    }
+
+    #[test]
+    fn error_frequency_spike_uses_complete_bucket_and_zero_filled_baseline() {
+        let baseline = [
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T00:05:00Z",
+            "2026-07-15T00:10:00Z",
+        ];
+        let mut entries = baseline
+            .iter()
+            .flat_map(|timestamp| {
+                [
+                    pattern_entry("journalctl", timestamp, "error", None, "baseline error"),
+                    pattern_entry("journalctl", timestamp, "info", None, "baseline heartbeat"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        entries.extend((0..6).map(|index| {
+            pattern_entry(
+                "journalctl",
+                &format!("2026-07-15T00:15:{index:02}Z"),
+                "error",
+                None,
+                format!("current failure {index}"),
+            )
+        }));
+
+        let detected = detect_log_patterns(
+            &entries,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        );
+        let spike = detected
+            .patterns
+            .iter()
+            .find(|pattern| pattern.kind == "error_frequency_spike")
+            .expect("error frequency spike");
+        let evidence = spike.evidence.as_ref().expect("spike evidence");
+        assert_eq!(spike.count, 6);
+        assert_eq!(evidence.bucket_width_ms, Some(300_000));
+        assert_eq!(evidence.baseline_observed_bucket_count, Some(3));
+        assert_eq!(evidence.baseline_median_count, Some(1));
+        assert_eq!(evidence.current_count, Some(6));
+        assert_eq!(
+            evidence.current_window_end.as_deref(),
+            Some("2026-07-15T00:20:00.000Z")
+        );
+
+        let normal = entries[..entries.len() - 3].to_vec();
+        assert!(!detect_log_patterns(
+            &normal,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        )
+        .patterns
+        .iter()
+        .any(|pattern| pattern.kind == "error_frequency_spike"));
+        let current_bucket_only = entries[6..].to_vec();
+        let zero_filled = detect_log_patterns(
+            &current_bucket_only,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        );
+        assert!(zero_filled
+            .patterns
+            .iter()
+            .any(|pattern| pattern.kind == "error_frequency_spike"));
+        assert_eq!(
+            zero_filled
+                .patterns
+                .iter()
+                .find(|pattern| pattern.kind == "error_frequency_spike")
+                .and_then(|pattern| pattern.evidence.as_ref())
+                .and_then(|evidence| evidence.baseline_observed_bucket_count),
+            Some(0)
+        );
+
+        let mut with_incomplete_bucket = entries.clone();
+        with_incomplete_bucket.extend((0..20).map(|index| {
+            pattern_entry(
+                "journalctl",
+                &format!("2026-07-15T00:20:{index:02}Z"),
+                "error",
+                None,
+                format!("incomplete failure {index}"),
+            )
+        }));
+        let exact_boundary = detect_log_patterns(
+            &with_incomplete_bucket,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        );
+        assert_eq!(
+            exact_boundary
+                .patterns
+                .iter()
+                .find(|pattern| pattern.kind == "error_frequency_spike")
+                .map(|pattern| pattern.count),
+            Some(6)
+        );
+        assert!(!detect_log_patterns(
+            &with_incomplete_bucket,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:19:59Z"),
+            None,
+        )
+        .patterns
+        .iter()
+        .any(|pattern| pattern.kind == "error_frequency_spike"));
+        assert!(!detect_log_patterns(
+            &entries,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            Some(test_timestamp_ms("2026-07-15T00:00:00.001Z")),
+        )
+        .patterns
+        .iter()
+        .any(|pattern| pattern.kind == "error_frequency_spike"));
+        assert!(!detect_log_patterns(
+            &entries,
+            &BTreeSet::from(["journalctl".to_string()]),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        )
+        .patterns
+        .iter()
+        .any(|pattern| pattern.kind == "error_frequency_spike"));
+    }
+
+    #[test]
+    fn error_frequency_spike_threshold_uses_median_and_mad() {
+        fn error_entries(minute: usize, count: usize) -> Vec<LogEntry> {
+            (0..count)
+                .map(|second| {
+                    pattern_entry(
+                        "journalctl",
+                        &format!("2026-07-15T00:{minute:02}:{second:02}Z"),
+                        "error",
+                        None,
+                        format!("failure at {minute}:{second}"),
+                    )
+                })
+                .collect()
+        }
+
+        let mut entries = error_entries(0, 1);
+        entries.extend(error_entries(5, 3));
+        entries.extend(error_entries(10, 5));
+        entries.extend(error_entries(15, 8));
+        assert!(!detect_log_patterns(
+            &entries,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        )
+        .patterns
+        .iter()
+        .any(|pattern| pattern.kind == "error_frequency_spike"));
+
+        entries.push(pattern_entry(
+            "journalctl",
+            "2026-07-15T00:15:08Z",
+            "error",
+            None,
+            "threshold failure",
+        ));
+        let detected = detect_log_patterns(
+            &entries,
+            &BTreeSet::new(),
+            test_timestamp_ms("2026-07-15T00:20:00Z"),
+            None,
+        );
+        let evidence = detected
+            .patterns
+            .iter()
+            .find(|pattern| pattern.kind == "error_frequency_spike")
+            .and_then(|pattern| pattern.evidence.as_ref())
+            .expect("MAD-qualified spike");
+        assert_eq!(evidence.baseline_median_count, Some(3));
+        assert_eq!(evidence.baseline_mad_count, Some(2));
+        assert_eq!(evidence.current_count, Some(9));
+    }
+
+    #[test]
+    fn periodic_failure_uses_stable_bounded_signature_and_source_isolation() {
+        let periodic = [0, 60, 121, 180]
+            .into_iter()
+            .enumerate()
+            .map(|(index, second)| {
+                pattern_entry(
+                    "journalctl",
+                    &format!("2026-07-15T00:{:02}:{:02}Z", second / 60, second % 60),
+                    "error",
+                    Some("worker.service"),
+                    format!(
+                        "worker pid={} failed with code {}",
+                        100 + index,
+                        500 + index
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let detected = detect_test_patterns(&periodic, &BTreeSet::new());
+        let pattern = detected
+            .patterns
+            .iter()
+            .find(|pattern| pattern.kind == "periodic_failure")
+            .expect("periodic failure");
+        let evidence = pattern.evidence.as_ref().expect("period evidence");
+        assert_eq!(pattern.count, 4);
+        assert_eq!(evidence.period_ms, Some(60_000));
+        assert_eq!(evidence.interval_count, Some(3));
+        assert_eq!(evidence.maximum_jitter_ms, Some(1_000));
+        assert!(evidence.signature.as_deref().is_some_and(|signature| {
+            signature.contains("pid=#")
+                && signature.contains("code #")
+                && signature.contains("[fnv1a64:")
+        }));
+        assert!(!detected
+            .patterns
+            .iter()
+            .any(|candidate| candidate.kind == "repeating_message"));
+
+        let jittered = [0, 60, 150, 170]
+            .into_iter()
+            .map(|second| {
+                pattern_entry(
+                    "journalctl",
+                    &format!("2026-07-15T00:{:02}:{:02}Z", second / 60, second % 60),
+                    "error",
+                    None,
+                    "same failure",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!detect_test_patterns(&jittered, &BTreeSet::new())
+            .patterns
+            .iter()
+            .any(|candidate| candidate.kind == "periodic_failure"));
+        assert!(!detect_test_patterns(&periodic[..3], &BTreeSet::new())
+            .patterns
+            .iter()
+            .any(|candidate| candidate.kind == "periodic_failure"));
+
+        let split_sources = periodic
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut entry = entry.clone();
+                entry.source = if index % 2 == 0 {
+                    "source-a"
+                } else {
+                    "source-b"
+                }
+                .to_string();
+                entry
+            })
+            .collect::<Vec<_>>();
+        assert!(!detect_test_patterns(&split_sources, &BTreeSet::new())
+            .patterns
+            .iter()
+            .any(|candidate| candidate.kind == "periodic_failure"));
+    }
+
+    #[test]
+    fn periodic_failure_sorts_deduplicates_and_accepts_tolerance_boundary() {
+        let entries = [190, 90, 90, 300, 0]
+            .into_iter()
+            .map(|second| {
+                let timestamp =
+                    timestamp_string(test_timestamp_ms("2026-07-15T00:00:00Z") + second * 1_000)
+                        .expect("timestamp");
+                pattern_entry(
+                    "journalctl",
+                    &timestamp,
+                    "error",
+                    Some("worker.service"),
+                    "periodic failure 123",
+                )
+            })
+            .collect::<Vec<_>>();
+        let detected = detect_test_patterns(&entries, &BTreeSet::new());
+        let evidence = detected
+            .patterns
+            .iter()
+            .find(|pattern| pattern.kind == "periodic_failure")
+            .and_then(|pattern| pattern.evidence.as_ref())
+            .expect("periodic evidence at tolerance boundary");
+        assert_eq!(evidence.period_ms, Some(100_000));
+        assert_eq!(evidence.maximum_jitter_ms, Some(10_000));
+        assert_eq!(evidence.tolerance_ms, Some(10_000));
+        assert_eq!(evidence.interval_count, Some(3));
+    }
+
+    #[test]
+    fn periodic_failure_does_not_merge_long_signatures_with_same_prefix() {
+        let shared = "x".repeat(MAX_PATTERN_SIGNATURE_CHARS + 20);
+        let timestamps = [0, 60, 120, 180];
+        let entries = timestamps
+            .into_iter()
+            .enumerate()
+            .map(|(index, second)| {
+                let timestamp =
+                    timestamp_string(test_timestamp_ms("2026-07-15T00:00:00Z") + second * 1_000)
+                        .expect("timestamp");
+                let suffix = if index % 2 == 0 {
+                    " alpha failure"
+                } else {
+                    " beta failure"
+                };
+                pattern_entry(
+                    "journalctl",
+                    &timestamp,
+                    "error",
+                    None,
+                    format!("{shared}{suffix}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!detect_test_patterns(&entries, &BTreeSet::new())
+            .patterns
+            .iter()
+            .any(|pattern| pattern.kind == "periodic_failure"));
+        assert_ne!(
+            pattern_signature_evidence(&normalize_message(&entries[0].message)),
+            pattern_signature_evidence(&normalize_message(&entries[1].message))
+        );
+    }
+
+    #[test]
+    fn pattern_detection_precedes_display_limit_and_summary_keeps_typed_evidence() {
+        let periodic = (0..4)
+            .map(|minute| {
+                format!(
+                    "2026-07-15T00:{minute:02}:00Z fixture.service: error recurring pid={}\n",
+                    100 + minute
+                )
+            })
+            .collect::<String>();
+        let informational = (4..20)
+            .map(|minute| {
+                format!("2026-07-15T00:{minute:02}:00Z other.service: info event {minute}\n")
+            })
+            .collect::<String>();
+        let commands = FixtureCommandRunner::default().with_output(
+            "journalctl",
+            command_output(format!("{periodic}{informational}")),
+        );
+        let result = query_logs_with_at(
+            &LogQuery {
+                sources: vec!["journalctl".to_string()],
+                limit: Some(2),
+                ..LogQuery::default()
+            },
+            &commands,
+            &FixtureLogFileReader::default(),
+            test_timestamp_ms("2026-07-15T01:00:00Z"),
+        )
+        .expect("bounded display query");
+
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.pattern_input_count, 20);
+        let periodic = result
+            .patterns
+            .iter()
+            .find(|pattern| pattern.kind == "periodic_failure")
+            .expect("limit-independent periodic pattern");
+        assert_eq!(periodic.count, 4);
+        let request = result.summary_request.expect("LLM-ready summary request");
+        assert!(request.patterns.iter().any(|pattern| {
+            pattern.kind == "periodic_failure"
+                && pattern
+                    .evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.period_ms)
+                    == Some(60_000)
+        }));
+    }
+
+    #[test]
+    fn pattern_output_and_detection_input_are_hard_bounded() {
+        let entries = (0..40)
+            .flat_map(|signature| {
+                (0..3).map(move |repeat| LogEntry {
+                    source: format!("source-{signature:02}"),
+                    timestamp: None,
+                    severity: Some("error".to_string()),
+                    unit: None,
+                    message: format!("failure signature {signature} repeat {repeat}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let detected = detect_test_patterns(&entries, &BTreeSet::new());
+        assert_eq!(detected.patterns.len(), MAX_LOG_PATTERNS);
+        assert_eq!(detected.omitted_count, 8);
+        assert_eq!(
+            detected.patterns[0]
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.source.as_deref()),
+            Some("source-00")
+        );
+
+        let per_source = (0..MAX_LOG_SOURCES)
+            .map(|source| {
+                (0..600)
+                    .map(|index| LogEntry {
+                        source: format!("source-{source}"),
+                        timestamp: None,
+                        severity: None,
+                        unit: None,
+                        message: format!("entry {index}"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (selected, truncated) = select_pattern_entries(&per_source, MAX_LOG_PATTERN_INPUT);
+        assert_eq!(selected.len(), MAX_LOG_PATTERN_INPUT);
+        assert!(truncated);
+        assert_eq!(
+            selected
+                .iter()
+                .take(MAX_LOG_SOURCES)
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            ["source-0", "source-1", "source-2", "source-3"]
+        );
+    }
+
+    #[test]
+    fn pattern_output_round_robin_is_fair_across_kind_and_source() {
+        let mut candidates = Vec::new();
+        for kind in ["error_frequency_spike", "periodic_failure"] {
+            for source in ["journalctl", "syslog"] {
+                for index in 0..12usize {
+                    candidates.push(LogPattern {
+                        kind: kind.to_string(),
+                        count: 12 - index,
+                        message: format!("{kind} {source} {index}"),
+                        score: Some(80),
+                        evidence: Some(LogPatternEvidence {
+                            source: Some(source.to_string()),
+                            signature: Some(format!("signature-{index:02}")),
+                            ..LogPatternEvidence::default()
+                        }),
+                    });
+                }
+            }
+        }
+
+        let selected = select_patterns_fair(candidates);
+        assert_eq!(selected.patterns.len(), MAX_LOG_PATTERNS);
+        assert_eq!(selected.omitted_count, 16);
+        let mut counts = BTreeMap::<(String, String), usize>::new();
+        let mut signatures = BTreeMap::<(String, String), Vec<String>>::new();
+        for pattern in selected.patterns {
+            let evidence = pattern.evidence.expect("pattern evidence");
+            let key = (pattern.kind, evidence.source.expect("pattern source"));
+            *counts.entry(key.clone()).or_default() += 1;
+            signatures
+                .entry(key)
+                .or_default()
+                .push(evidence.signature.expect("pattern signature"));
+        }
+        assert_eq!(counts.values().copied().collect::<Vec<_>>(), [8, 8, 8, 8]);
+        for group_signatures in signatures.values() {
+            assert_eq!(
+                group_signatures,
+                &(0..8)
+                    .map(|index| format!("signature-{index:02}"))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -1929,9 +2868,9 @@ mod tests {
                 ),
             })
             .collect::<Vec<_>>();
-        let patterns = detect_log_patterns(&entries);
-        let request = build_log_summary_request(&entries, &patterns, 77, false);
-        let repeated = build_log_summary_request(&entries, &patterns, 77, false);
+        let patterns = detect_test_patterns(&entries, &BTreeSet::new());
+        let request = build_log_summary_request(&entries, &patterns.patterns, 77, false);
+        let repeated = build_log_summary_request(&entries, &patterns.patterns, 77, false);
 
         assert_eq!(request, repeated);
         assert!(request.input_truncated);
@@ -2469,7 +3408,7 @@ mod tests {
         assert_eq!(calls[0].program, "journalctl");
         assert_eq!(
             calls[0].args,
-            ["--no-pager", "--output=short-iso", "-n", "11"]
+            ["--no-pager", "--output=short-iso", "-n", "501"]
         );
         assert_eq!(calls[0].timeout, Duration::from_secs(3));
         assert_eq!(calls[0].stdout_limit, MAX_LOG_COMMAND_BYTES);
@@ -2619,7 +3558,7 @@ mod tests {
                 "--no-pager",
                 "--output=short-iso",
                 "-n",
-                "6",
+                "501",
                 "--since",
                 "2026-01-01T00:00:00Z",
                 "--until",
@@ -2643,10 +3582,11 @@ mod tests {
         );
         let truncated = query_logs_with(&query, &three_rows, &FixtureLogFileReader::default())
             .expect("three journal rows");
-        assert_eq!(three_rows.calls()[0].args[3], "3");
+        assert_eq!(three_rows.calls()[0].args[3], "501");
         assert_eq!(truncated.entries.len(), 2);
         assert!(truncated.truncated);
-        assert!(truncated.source_statuses[0].truncated);
+        assert!(!truncated.source_statuses[0].truncated);
+        assert_eq!(truncated.pattern_input_count, 3);
 
         let two_rows = FixtureCommandRunner::default().with_output(
             "journalctl",
@@ -2676,6 +3616,7 @@ mod tests {
                 },
                 &commands,
                 &timestamp_context,
+                MAX_LOG_PATTERN_INPUT_PER_SOURCE,
             );
         }
 
@@ -2843,7 +3784,11 @@ mod tests {
                 "truncated": false
             }],
             "entries": [],
-            "patterns": [],
+            "patterns": [{
+                "kind": "repeating_message",
+                "count": 3,
+                "message": "legacy pattern"
+            }],
             "summary": {
                 "kind": "rule_based_llm_ready_summary",
                 "text": "legacy summary",
@@ -2858,6 +3803,11 @@ mod tests {
         assert_eq!(result.omitted_warning_count, 0);
         assert_eq!(result.indeterminate_filter_count, 0);
         assert!(result.filter_complete);
+        assert_eq!(result.pattern_input_count, 0);
+        assert!(!result.pattern_input_truncated);
+        assert_eq!(result.omitted_pattern_count, 0);
+        assert!(result.patterns[0].score.is_none());
+        assert!(result.patterns[0].evidence.is_none());
         let summary = result.summary.expect("legacy summary");
         assert_eq!(summary.mode, LogSummaryMode::Fallback);
         assert_eq!(summary.generated_at_ms, 0);

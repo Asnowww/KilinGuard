@@ -28,12 +28,13 @@ pub use model::{
     AlertEvaluationFreshness, CollectionMode, CollectionStatus, CorruptSampleDetail,
     CpuCoreSnapshot, CpuSnapshot, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
     FanReading, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry, LogLlmSummaryOutput,
-    LogPattern, LogQueryResult, LogSourceStatus, LogSummary, LogSummaryBoundary,
-    LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange, MemorySnapshot,
-    MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot,
-    NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo, ProcessAnomalyEvidence,
-    ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
-    SensorAvailability, ServiceSnapshot, ServiceUnit, TemperatureReading, ThermalSnapshot,
+    LogPattern, LogPatternEvidence, LogQueryResult, LogSourceStatus, LogSummary,
+    LogSummaryBoundary, LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange,
+    MemorySnapshot, MetricSnapshot, NetworkConnection, NetworkInterfaceSnapshot,
+    NetworkMetricsSnapshot, NetworkSnapshot, OsContext, OsSampleMeta, PlatformInfo,
+    ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList,
+    RateStatus, ResourceDimension, SensorAvailability, ServiceSnapshot, ServiceUnit,
+    TemperatureReading, ThermalSnapshot,
 };
 pub use network::{collect_network, NetworkQuery, TcpProbeRequest};
 pub use procfs::{
