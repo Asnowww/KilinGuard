@@ -354,6 +354,21 @@ fn build_health_summary(
         ));
     }
     if let Some(services) = services {
+        let dependency_impact = services.dependency_analysis.as_ref().map_or_else(
+            String::new,
+            |analysis| {
+                format!(
+                    ", dependency impact for {}: {} known affected ({} direct, {} returned, {} omitted, total_unknown={}, complete={})",
+                    analysis.target,
+                    analysis.total,
+                    analysis.direct_total,
+                    analysis.returned_count,
+                    analysis.omitted_count,
+                    analysis.total_unknown,
+                    analysis.complete
+                )
+            },
+        );
         parts.push(format!(
             "services: {} matched units ({} returned, {} omitted), {} failed (complete={}), {} problem units ({} returned, {} omitted, complete={}), {:?}",
             services.total,
@@ -365,8 +380,11 @@ fn build_health_summary(
             services.problem_returned_count,
             services.problem_omitted_count,
             services.problem_filter_complete,
-            services.collection_status
+            services.collection_status,
         ));
+        if let Some(summary) = parts.last_mut() {
+            summary.push_str(&dependency_impact);
+        }
     }
     if parts.is_empty() {
         return "No OS context dimensions were collected.".to_string();

@@ -1486,11 +1486,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_service_status",
-            description: "Enumerate bounded Kylin Linux systemd services and identify healthy, inactive, transitional, degraded, failed, or unknown units with typed, redacted failure causes, structured collection completeness, stable filtering, and optional TCP health probes.",
+            description: "Enumerate bounded Kylin Linux systemd services, identify typed health problems, and optionally analyze which services are directly or transitively affected when one service fails. Dependency impact distinguishes hard, lifecycle, soft, and ordering-only relationships without extra per-service commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "minLength": 9, "maxLength": 256, "pattern": "^[A-Za-z0-9_.@:\\\\-]+\\.service$" },
+                    "impact_of": { "type": "string", "minLength": 9, "maxLength": 256, "pattern": "^[A-Za-z0-9_.@:\\\\-]+\\.service$", "description": "Analyze reverse dependency impact if this service becomes unavailable; independent from name filtering." },
                     "include_all": { "type": "boolean" },
                     "include_dependencies": { "type": "boolean" },
                     "include_ports": { "type": "boolean" },

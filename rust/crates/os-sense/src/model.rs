@@ -1211,6 +1211,8 @@ pub struct ServiceSnapshot {
     pub failed_units: Vec<ServiceUnit>,
     #[serde(default)]
     pub problem_units: Vec<ServiceUnit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_analysis: Option<ServiceDependencyAnalysis>,
     pub health_probes: Vec<HealthProbeResult>,
 }
 
@@ -1318,6 +1320,84 @@ pub struct ServiceProblem {
     pub kind: ServiceProblemKind,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyRelationKind {
+    Requires,
+    Requisite,
+    BindsTo,
+    PartOf,
+    Wants,
+    After,
+    Before,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyImpactSeverity {
+    Ordering,
+    Soft,
+    Lifecycle,
+    Hard,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyImpactReason {
+    RequiredDependency,
+    RequisiteCondition,
+    BoundLifecycle,
+    PartOfLifecycle,
+    WantedDependency,
+    OrderedAfter,
+    OrderedBefore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServiceDependencyPathEdge {
+    pub dependency: String,
+    pub dependent: String,
+    pub relation: DependencyRelationKind,
+    pub severity: DependencyImpactSeverity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDependencyImpact {
+    pub service: String,
+    pub depth: usize,
+    #[serde(default)]
+    pub direct: bool,
+    #[serde(default)]
+    pub has_direct_relation: bool,
+    #[serde(default)]
+    pub selected_path_direct: bool,
+    #[serde(default)]
+    pub direct_relations: Vec<DependencyRelationKind>,
+    pub severity: DependencyImpactSeverity,
+    pub reason: DependencyImpactReason,
+    pub path: Vec<ServiceDependencyPathEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDependencyAnalysis {
+    pub target: String,
+    pub target_found: bool,
+    pub collection_status: CollectionStatus,
+    pub complete: bool,
+    pub direct_total: usize,
+    pub total: usize,
+    pub returned_count: usize,
+    pub omitted_count: usize,
+    pub cycle_detected: bool,
+    pub depth_truncated: bool,
+    #[serde(default)]
+    pub traversal_truncated: bool,
+    #[serde(default)]
+    pub total_unknown: bool,
+    pub truncated: bool,
+    pub impacts: Vec<ServiceDependencyImpact>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ServiceUnit {
     pub name: String,
@@ -1340,9 +1420,23 @@ pub struct ServiceUnit {
     pub exec_main_status: Option<i32>,
     pub fragment_path: Option<String>,
     pub requires: Vec<String>,
+    #[serde(default)]
+    pub requisite: Vec<String>,
+    #[serde(default)]
+    pub binds_to: Vec<String>,
+    #[serde(default)]
+    pub part_of: Vec<String>,
     pub wants: Vec<String>,
     pub after: Vec<String>,
     pub before: Vec<String>,
+    #[serde(default)]
+    pub dependency_complete: bool,
+    #[serde(default)]
+    pub dependency_parse_failure_count: usize,
+    #[serde(default)]
+    pub dependency_omitted_count: usize,
+    #[serde(default)]
+    pub dependency_truncated: bool,
     pub ports: Vec<String>,
     #[serde(default)]
     pub health_status: ServiceHealthStatus,
@@ -1398,11 +1492,25 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             #[serde(default)]
             requires: Vec<String>,
             #[serde(default)]
+            requisite: Vec<String>,
+            #[serde(default)]
+            binds_to: Vec<String>,
+            #[serde(default)]
+            part_of: Vec<String>,
+            #[serde(default)]
             wants: Vec<String>,
             #[serde(default)]
             after: Vec<String>,
             #[serde(default)]
             before: Vec<String>,
+            #[serde(default)]
+            dependency_complete: Option<bool>,
+            #[serde(default)]
+            dependency_parse_failure_count: usize,
+            #[serde(default)]
+            dependency_omitted_count: usize,
+            #[serde(default)]
+            dependency_truncated: Option<bool>,
             #[serde(default)]
             ports: Vec<String>,
             #[serde(default)]
@@ -1423,6 +1531,9 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             || raw.exec_main_status.is_some()
             || raw.fragment_path.is_some()
             || !raw.requires.is_empty()
+            || !raw.requisite.is_empty()
+            || !raw.binds_to.is_empty()
+            || !raw.part_of.is_empty()
             || !raw.wants.is_empty()
             || !raw.after.is_empty()
             || !raw.before.is_empty();
@@ -1491,9 +1602,16 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             exec_main_status: raw.exec_main_status,
             fragment_path: raw.fragment_path,
             requires: raw.requires,
+            requisite: raw.requisite,
+            binds_to: raw.binds_to,
+            part_of: raw.part_of,
             wants: raw.wants,
             after: raw.after,
             before: raw.before,
+            dependency_complete: raw.dependency_complete.unwrap_or(false),
+            dependency_parse_failure_count: raw.dependency_parse_failure_count,
+            dependency_omitted_count: raw.dependency_omitted_count,
+            dependency_truncated: raw.dependency_truncated.unwrap_or(false),
             ports: raw.ports,
             health_status: raw.health_status.unwrap_or(inferred_health_status),
             problems,
@@ -1549,6 +1667,8 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             failed_units: Option<Vec<ServiceUnit>>,
             #[serde(default)]
             problem_units: Option<Vec<ServiceUnit>>,
+            #[serde(default)]
+            dependency_analysis: Option<ServiceDependencyAnalysis>,
             #[serde(default)]
             health_probes: Vec<HealthProbeResult>,
         }
@@ -1656,6 +1776,7 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             units: raw.units,
             failed_units,
             problem_units,
+            dependency_analysis: raw.dependency_analysis,
             health_probes: raw.health_probes,
         })
     }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::command::{run_limited_command, LimitedCommandOutput};
 use crate::error::{OsSenseError, Result};
 use crate::model::{
-    CollectionStatus, HealthProbeResult, ServiceHealthStatus, ServiceProblem,
-    ServiceProblemEvidence, ServiceProblemKind, ServiceSnapshot, ServiceSource,
-    ServiceSourceStatus, ServiceUnit,
+    CollectionStatus, DependencyImpactReason, DependencyImpactSeverity, DependencyRelationKind,
+    HealthProbeResult, ServiceDependencyAnalysis, ServiceDependencyImpact,
+    ServiceDependencyPathEdge, ServiceHealthStatus, ServiceProblem, ServiceProblemEvidence,
+    ServiceProblemKind, ServiceSnapshot, ServiceSource, ServiceSourceStatus, ServiceUnit,
 };
 use crate::network::{probe_tcp, NetworkQuery, TcpProbeRequest};
 use crate::procfs::basic_meta;
@@ -24,6 +25,11 @@ const MAX_SERVICE_NAME_CHARS: usize = 256;
 const MAX_SERVICE_DESCRIPTION_CHARS: usize = 512;
 const MAX_SERVICE_EVIDENCE_TEXT_CHARS: usize = 256;
 const MAX_SERVICE_PROPERTY_TOKEN_CHARS: usize = 64;
+const MAX_DEPENDENCY_UNITS_PER_PROPERTY: usize = 256;
+const MAX_DEPENDENCY_PROPERTY_CHARS: usize = 64 * 1024;
+const MAX_DEPENDENCY_IMPACT_DETAILS: usize = 256;
+const MAX_DEPENDENCY_IMPACT_DEPTH: usize = 16;
+const MAX_DEPENDENCY_TRAVERSAL_STATES: usize = 8_192;
 const MAX_HEALTH_PROBES: usize = 5;
 const SERVICE_STDOUT_LIMIT: usize = 1024 * 1024;
 const SERVICE_STDERR_LIMIT: usize = 32 * 1024;
@@ -44,7 +50,7 @@ const LIST_UNIT_FILES_ARGS: [&str; 4] = [
     "--no-legend",
 ];
 const SHOW_ALL_PATTERN: &str = "*.service";
-const SHOW_PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,UnitFileState,Description,Result,ExecMainCode,ExecMainStatus,StatusText,StatusErrno,NRestarts,LoadError,FragmentPath,Requires,Wants,After,Before";
+const SHOW_PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,UnitFileState,Description,Result,ExecMainCode,ExecMainStatus,StatusText,StatusErrno,NRestarts,LoadError,FragmentPath,Requires,Requisite,BindsTo,PartOf,Wants,After,Before";
 const SERVICE_PROBLEM_CORE_PROPERTIES: [&str; 8] = [
     "LoadState",
     "ActiveState",
@@ -56,11 +62,21 @@ const SERVICE_PROBLEM_CORE_PROPERTIES: [&str; 8] = [
     "LoadError",
 ];
 const SERVICE_PROBLEM_OPTIONAL_PROPERTIES: [&str; 2] = ["StatusText", "NRestarts"];
+const SERVICE_DEPENDENCY_PROPERTIES: [&str; 7] = [
+    "Requires",
+    "Requisite",
+    "BindsTo",
+    "PartOf",
+    "Wants",
+    "After",
+    "Before",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceQuery {
     pub name: Option<String>,
+    pub impact_of: Option<String>,
     pub include_all: bool,
     pub include_dependencies: bool,
     pub include_ports: bool,
@@ -72,6 +88,7 @@ impl Default for ServiceQuery {
     fn default() -> Self {
         Self {
             name: None,
+            impact_of: None,
             include_all: true,
             include_dependencies: true,
             include_ports: false,
@@ -84,6 +101,9 @@ impl Default for ServiceQuery {
 impl ServiceQuery {
     pub fn validate(&self) -> Result<()> {
         if let Some(name) = self.name.as_deref() {
+            validate_unit_name(name)?;
+        }
+        if let Some(name) = self.impact_of.as_deref() {
             validate_unit_name(name)?;
         }
         if self
@@ -139,6 +159,7 @@ struct ParsedServiceSource {
     units: BTreeMap<String, ServiceUnit>,
     failure_evaluable_names: BTreeSet<String>,
     problem_evaluable_names: BTreeSet<String>,
+    dependency_evaluable_names: BTreeSet<String>,
     parse_failure_count: usize,
     duplicate_count: usize,
     conflict_count: usize,
@@ -151,6 +172,7 @@ struct ParsedServiceSource {
 struct ServiceSourceCoverage {
     failure_evaluable_names: BTreeSet<String>,
     problem_evaluable_names: BTreeSet<String>,
+    dependency_evaluable_names: BTreeSet<String>,
 }
 
 #[must_use = "service query failures must be handled"]
@@ -199,14 +221,42 @@ fn query_services_with_runner(
     let mut merged = runtime_units;
     merge_service_maps(&mut merged, file_units);
 
-    let show_target = query.name.as_deref().unwrap_or(SHOW_ALL_PATTERN);
-    let (show_units, show_status, show_coverage) = if let Some(name) = query.name.as_deref() {
+    let use_batch_show = query.name.is_none() || query.impact_of.is_some();
+    let show_target = if use_batch_show {
+        SHOW_ALL_PATTERN
+    } else {
+        query
+            .name
+            .as_deref()
+            .expect("exact show has a service name")
+    };
+    let (show_units, show_status, show_coverage) = if !use_batch_show {
+        let name = query
+            .name
+            .as_deref()
+            .expect("exact show has a service name");
         let show_args = ["show", name, "--no-pager", "--property", SHOW_PROPERTIES];
         collect_service_source(
             runner,
             ServiceSource::Show,
             &show_args,
             |content, input_truncated| parse_show_output(content, name, input_truncated),
+        )
+    } else if let Some(name) = query.name.as_deref() {
+        let show_args = [
+            "show",
+            SHOW_ALL_PATTERN,
+            name,
+            "--all",
+            "--no-pager",
+            "--property",
+            SHOW_PROPERTIES,
+        ];
+        collect_service_source(
+            runner,
+            ServiceSource::Show,
+            &show_args,
+            parse_show_records_output,
         )
     } else {
         let show_args = [
@@ -234,8 +284,9 @@ fn query_services_with_runner(
     let show_unit_name = query
         .name
         .as_ref()
+        .filter(|_| !use_batch_show)
         .and_then(|_| show_units.keys().next().cloned());
-    let required_runtime_names = if query.name.is_some() {
+    let required_runtime_names = if !use_batch_show {
         show_unit_name.iter().cloned().collect::<BTreeSet<String>>()
     } else {
         runtime_unit_names
@@ -244,6 +295,8 @@ fn query_services_with_runner(
         required_runtime_names.is_subset(&show_coverage.failure_evaluable_names);
     let show_problem_coverage_complete =
         required_runtime_names.is_subset(&show_coverage.problem_evaluable_names);
+    let show_dependency_coverage_complete =
+        required_runtime_names.is_subset(&show_coverage.dependency_evaluable_names);
     if show_status.status != CollectionStatus::Failed {
         merge_show_units(&mut merged, show_units);
     }
@@ -265,6 +318,23 @@ fn query_services_with_runner(
         status.source == ServiceSource::Show && status.status == CollectionStatus::Complete
     }) && show_problem_coverage_complete;
     let source_truncated = source_statuses.iter().any(|status| status.truncated);
+
+    let dependency_analysis = query.impact_of.as_deref().map(|target| {
+        analyze_service_dependency_impact(
+            target,
+            &merged,
+            query.limit.unwrap_or(MAX_SERVICE_LIMIT),
+            source_statuses.iter().any(|status| {
+                status.source == ServiceSource::ListUnits
+                    && status.status == CollectionStatus::Complete
+            }),
+            source_statuses.iter().any(|status| {
+                status.source == ServiceSource::Show && status.status == CollectionStatus::Complete
+            }),
+            show_dependency_coverage_complete,
+            source_truncated,
+        )
+    });
 
     let mut units = merged.into_values().collect::<Vec<_>>();
     if let Some(name) = query.name.as_deref() {
@@ -288,6 +358,9 @@ fn query_services_with_runner(
     if !query.include_dependencies {
         for unit in &mut units {
             unit.requires.clear();
+            unit.requisite.clear();
+            unit.binds_to.clear();
+            unit.part_of.clear();
             unit.wants.clear();
             unit.after.clear();
             unit.before.clear();
@@ -329,7 +402,10 @@ fn query_services_with_runner(
     let truncated = source_truncated
         || omitted_count > 0
         || failed_omitted_count > 0
-        || problem_omitted_count > 0;
+        || problem_omitted_count > 0
+        || dependency_analysis
+            .as_ref()
+            .is_some_and(|analysis| analysis.truncated);
     let health_probes = query.health_probes.iter().map(probe_tcp).collect();
 
     Ok(ServiceSnapshot {
@@ -354,6 +430,7 @@ fn query_services_with_runner(
         units,
         failed_units,
         problem_units,
+        dependency_analysis,
         health_probes,
     })
 }
@@ -468,6 +545,7 @@ where
     let coverage = ServiceSourceCoverage {
         failure_evaluable_names: parsed.failure_evaluable_names,
         problem_evaluable_names: parsed.problem_evaluable_names,
+        dependency_evaluable_names: parsed.dependency_evaluable_names,
     };
     (parsed.units, source_status, coverage)
 }
@@ -530,9 +608,16 @@ fn parse_list_units_output(content: &str, input_truncated: bool) -> ParsedServic
             exec_main_status: None,
             fragment_path: None,
             requires: Vec::new(),
+            requisite: Vec::new(),
+            binds_to: Vec::new(),
+            part_of: Vec::new(),
             wants: Vec::new(),
             after: Vec::new(),
             before: Vec::new(),
+            dependency_complete: false,
+            dependency_parse_failure_count: 0,
+            dependency_omitted_count: 0,
+            dependency_truncated: false,
             ports: Vec::new(),
             health_status,
             problems,
@@ -591,9 +676,16 @@ fn parse_list_unit_files_output(content: &str, input_truncated: bool) -> ParsedS
             exec_main_status: None,
             fragment_path: None,
             requires: Vec::new(),
+            requisite: Vec::new(),
+            binds_to: Vec::new(),
+            part_of: Vec::new(),
             wants: Vec::new(),
             after: Vec::new(),
             before: Vec::new(),
+            dependency_complete: false,
+            dependency_parse_failure_count: 0,
+            dependency_omitted_count: 0,
+            dependency_truncated: false,
             ports: Vec::new(),
             health_status: ServiceHealthStatus::Inactive,
             problems: Vec::new(),
@@ -690,9 +782,16 @@ fn merge_show_units(
             existing.exec_main_status = incoming.exec_main_status;
             existing.fragment_path = incoming.fragment_path;
             existing.requires = incoming.requires;
+            existing.requisite = incoming.requisite;
+            existing.binds_to = incoming.binds_to;
+            existing.part_of = incoming.part_of;
             existing.wants = incoming.wants;
             existing.after = incoming.after;
             existing.before = incoming.before;
+            existing.dependency_complete = incoming.dependency_complete;
+            existing.dependency_parse_failure_count = incoming.dependency_parse_failure_count;
+            existing.dependency_omitted_count = incoming.dependency_omitted_count;
+            existing.dependency_truncated = incoming.dependency_truncated;
             existing.health_status = incoming.health_status;
             existing.problems = incoming.problems;
             existing.problem_evidence = incoming.problem_evidence;
@@ -781,6 +880,9 @@ fn parse_show_records_output(content: &str, input_truncated: bool) -> ParsedServ
         parsed
             .problem_evaluable_names
             .extend(record.problem_evaluable_names);
+        parsed
+            .dependency_evaluable_names
+            .extend(record.dependency_evaluable_names);
         let mut cap_reached = false;
         for unit in record.units.into_values() {
             cap_reached |= insert_source_unit(&mut parsed, unit);
@@ -951,6 +1053,36 @@ fn parse_show_output(
     });
     let (health_status, problems) = analyze_service_health(&evidence);
     let problem_evidence = (!problems.is_empty()).then_some(evidence);
+    let mut dependency_stats = DependencyParseStats::default();
+    let requires = parse_dependency_property(values.get("Requires"), &mut dependency_stats);
+    let requisite = parse_dependency_property(values.get("Requisite"), &mut dependency_stats);
+    let binds_to = parse_dependency_property(values.get("BindsTo"), &mut dependency_stats);
+    let part_of = parse_dependency_property(values.get("PartOf"), &mut dependency_stats);
+    let wants = parse_dependency_property(values.get("Wants"), &mut dependency_stats);
+    let after = parse_dependency_property(values.get("After"), &mut dependency_stats);
+    let before = parse_dependency_property(values.get("Before"), &mut dependency_stats);
+    let dependency_complete = SERVICE_DEPENDENCY_PROPERTIES
+        .iter()
+        .all(|property| values.contains_key(*property))
+        && dependency_stats.parse_failure_count == 0
+        && dependency_stats.omitted_count == 0
+        && !dependency_stats.truncated
+        && !input_truncated
+        && !content.contains('\u{fffd}');
+    if dependency_stats.parse_failure_count > 0 || dependency_stats.omitted_count > 0 {
+        parsed.parse_failure_count = parsed
+            .parse_failure_count
+            .saturating_add(dependency_stats.parse_failure_count);
+        parsed.omitted_count = parsed
+            .omitted_count
+            .saturating_add(dependency_stats.omitted_count);
+        parsed.total_unknown = true;
+        parsed.truncated = true;
+    }
+    let dependency_truncated = dependency_stats.truncated
+        || dependency_stats.parse_failure_count > 0
+        || input_truncated
+        || content.contains('\u{fffd}');
     let unit = ServiceUnit {
         name: name.clone(),
         loaded: load_state.as_deref() == Some("loaded"),
@@ -966,10 +1098,17 @@ fn parse_show_output(
         result,
         exec_main_status,
         fragment_path: non_empty(&values, "FragmentPath"),
-        requires: split_units(values.get("Requires")),
-        wants: split_units(values.get("Wants")),
-        after: split_units(values.get("After")),
-        before: split_units(values.get("Before")),
+        requires,
+        requisite,
+        binds_to,
+        part_of,
+        wants,
+        after,
+        before,
+        dependency_complete,
+        dependency_parse_failure_count: dependency_stats.parse_failure_count,
+        dependency_omitted_count: dependency_stats.omitted_count,
+        dependency_truncated,
         ports: Vec::new(),
         health_status,
         problems,
@@ -981,6 +1120,9 @@ fn parse_show_output(
     }
     if problem_evaluable {
         parsed.problem_evaluable_names.insert(name.clone());
+    }
+    if dependency_complete {
+        parsed.dependency_evaluable_names.insert(name.clone());
     }
     parsed.units.insert(name, unit);
     parsed
@@ -1350,10 +1492,483 @@ fn problem_kind_from_status_text(status_text: Option<&str>) -> Option<ServicePro
     }
 }
 
-fn split_units(value: Option<&String>) -> Vec<String> {
-    value
-        .map(|value| value.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default()
+#[derive(Default)]
+struct DependencyParseStats {
+    parse_failure_count: usize,
+    omitted_count: usize,
+    truncated: bool,
+}
+
+fn parse_dependency_property(
+    value: Option<&String>,
+    stats: &mut DependencyParseStats,
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut chars = value.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_DEPENDENCY_PROPERTY_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        stats.omitted_count = stats.omitted_count.saturating_add(1);
+        stats.truncated = true;
+    }
+
+    let mut units = BTreeSet::new();
+    for token in bounded.split_whitespace() {
+        if !validate_dependency_unit_name(token) {
+            stats.parse_failure_count = stats.parse_failure_count.saturating_add(1);
+            stats.omitted_count = stats.omitted_count.saturating_add(1);
+            continue;
+        }
+        if units.contains(token) {
+            continue;
+        }
+        if units.len() >= MAX_DEPENDENCY_UNITS_PER_PROPERTY {
+            stats.omitted_count = stats.omitted_count.saturating_add(1);
+            stats.truncated = true;
+            continue;
+        }
+        units.insert(token.to_string());
+    }
+    units.into_iter().collect()
+}
+
+fn validate_dependency_unit_name(name: &str) -> bool {
+    const UNIT_SUFFIXES: [&str; 13] = [
+        ".service",
+        ".socket",
+        ".target",
+        ".device",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".timer",
+        ".path",
+        ".slice",
+        ".scope",
+        ".busname",
+        ".snapshot",
+    ];
+
+    !name.is_empty()
+        && name.chars().count() <= MAX_SERVICE_NAME_CHARS
+        && name.is_ascii()
+        && !name.contains('/')
+        && !name.contains("..")
+        && UNIT_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        && valid_systemd_unit_name_bytes(name.as_bytes())
+}
+
+fn valid_systemd_unit_name_bytes(bytes: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len()
+                || bytes[index + 1] != b'x'
+                || !bytes[index + 2].is_ascii_hexdigit()
+                || !bytes[index + 3].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 4;
+            continue;
+        }
+        if !bytes[index].is_ascii_alphanumeric()
+            && !matches!(bytes[index], b':' | b'_' | b'.' | b'@' | b'-')
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn analyze_service_dependency_impact(
+    target: &str,
+    units: &BTreeMap<String, ServiceUnit>,
+    query_limit: usize,
+    list_units_complete: bool,
+    show_complete: bool,
+    dependency_coverage_complete: bool,
+    source_truncated: bool,
+) -> ServiceDependencyAnalysis {
+    analyze_service_dependency_impact_with_limits(
+        target,
+        units,
+        query_limit,
+        list_units_complete,
+        show_complete,
+        dependency_coverage_complete,
+        source_truncated,
+        DependencyTraversalLimits {
+            accepted: MAX_DEPENDENCY_TRAVERSAL_STATES,
+            queued: MAX_DEPENDENCY_TRAVERSAL_STATES,
+            expanded: MAX_DEPENDENCY_TRAVERSAL_STATES,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct DependencyTraversalLimits {
+    accepted: usize,
+    queued: usize,
+    expanded: usize,
+}
+
+fn analyze_service_dependency_impact_with_limits(
+    target: &str,
+    units: &BTreeMap<String, ServiceUnit>,
+    query_limit: usize,
+    list_units_complete: bool,
+    show_complete: bool,
+    dependency_coverage_complete: bool,
+    source_truncated: bool,
+    limits: DependencyTraversalLimits,
+) -> ServiceDependencyAnalysis {
+    let runtime_services = units
+        .values()
+        .filter(|unit| {
+            unit.name.ends_with(".service") && unit.sources.contains(&ServiceSource::ListUnits)
+        })
+        .map(|unit| unit.name.clone())
+        .collect::<BTreeSet<_>>();
+    let target_found = runtime_services.contains(target);
+    let mut reverse_edges = BTreeMap::<String, Vec<ServiceDependencyPathEdge>>::new();
+
+    for unit in units
+        .values()
+        .filter(|unit| runtime_services.contains(&unit.name))
+    {
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.requires,
+            &unit.name,
+            DependencyRelationKind::Requires,
+        );
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.requisite,
+            &unit.name,
+            DependencyRelationKind::Requisite,
+        );
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.binds_to,
+            &unit.name,
+            DependencyRelationKind::BindsTo,
+        );
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.part_of,
+            &unit.name,
+            DependencyRelationKind::PartOf,
+        );
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.wants,
+            &unit.name,
+            DependencyRelationKind::Wants,
+        );
+        add_reverse_dependency_edges(
+            &mut reverse_edges,
+            &runtime_services,
+            &unit.after,
+            &unit.name,
+            DependencyRelationKind::After,
+        );
+        for dependent in &unit.before {
+            if runtime_services.contains(dependent) {
+                reverse_edges.entry(unit.name.clone()).or_default().push(
+                    ServiceDependencyPathEdge {
+                        dependency: unit.name.clone(),
+                        dependent: dependent.clone(),
+                        relation: DependencyRelationKind::Before,
+                        severity: DependencyImpactSeverity::Ordering,
+                    },
+                );
+            }
+        }
+    }
+    for edges in reverse_edges.values_mut() {
+        edges.sort();
+        edges.dedup();
+    }
+
+    let mut direct_relations = BTreeMap::<String, BTreeSet<DependencyRelationKind>>::new();
+    for edge in reverse_edges.get(target).into_iter().flatten() {
+        if edge.dependent != target {
+            direct_relations
+                .entry(edge.dependent.clone())
+                .or_default()
+                .insert(edge.relation);
+        }
+    }
+    let direct_total = direct_relations.len();
+
+    let mut states = BTreeMap::<String, Vec<ServiceDependencyImpact>>::new();
+    let mut queue = VecDeque::from([(target.to_string(), Vec::new())]);
+    let mut accepted_count = 0usize;
+    let mut queued_count = 1usize;
+    let mut expanded_count = 0usize;
+    let mut cycle_detected = false;
+    let mut depth_truncated = false;
+    let mut traversal_truncated = limits.queued == 0;
+
+    'traversal: while !traversal_truncated {
+        if queue.is_empty() {
+            break;
+        }
+        if expanded_count >= limits.expanded {
+            traversal_truncated = true;
+            break;
+        }
+        let Some((dependency, path)) = queue.pop_front() else {
+            break;
+        };
+        expanded_count = expanded_count.saturating_add(1);
+        if !path.is_empty()
+            && !states
+                .get(&dependency)
+                .is_some_and(|node_states| node_states.iter().any(|state| state.path == path))
+        {
+            continue;
+        }
+        let Some(edges) = reverse_edges.get(&dependency) else {
+            continue;
+        };
+        for edge in edges {
+            if edge.severity == DependencyImpactSeverity::Ordering && !path.is_empty() {
+                continue;
+            }
+            if edge.dependent == target
+                || path.iter().any(|ancestor: &ServiceDependencyPathEdge| {
+                    ancestor.dependency == edge.dependent || ancestor.dependent == edge.dependent
+                })
+            {
+                cycle_detected = true;
+                continue;
+            }
+            if path.len() >= MAX_DEPENDENCY_IMPACT_DEPTH {
+                depth_truncated = true;
+                continue;
+            }
+
+            let mut candidate_path = path.clone();
+            candidate_path.push(edge.clone());
+            let severity = candidate_path
+                .iter()
+                .map(|edge| edge.severity)
+                .min()
+                .expect("dependency path is non-empty");
+            let weakest_edge = candidate_path
+                .iter()
+                .filter(|edge| edge.severity == severity)
+                .min_by_key(|edge| edge.relation)
+                .expect("dependency path has a weakest edge");
+            let candidate = ServiceDependencyImpact {
+                service: edge.dependent.clone(),
+                depth: candidate_path.len(),
+                direct: candidate_path.len() == 1,
+                has_direct_relation: false,
+                selected_path_direct: candidate_path.len() == 1,
+                direct_relations: Vec::new(),
+                severity,
+                reason: dependency_reason(weakest_edge.relation),
+                path: candidate_path.clone(),
+            };
+            if !dependency_state_would_be_accepted(&states, &candidate) {
+                continue;
+            }
+            if accepted_count >= limits.accepted {
+                traversal_truncated = true;
+                break 'traversal;
+            }
+            let registered = register_dependency_state(&mut states, candidate.clone());
+            debug_assert!(registered);
+            accepted_count = accepted_count.saturating_add(1);
+            if edge.severity != DependencyImpactSeverity::Ordering {
+                if queued_count >= limits.queued {
+                    traversal_truncated = true;
+                    break 'traversal;
+                }
+                queue.push_back((edge.dependent.clone(), candidate_path));
+                queued_count = queued_count.saturating_add(1);
+            }
+        }
+    }
+
+    let mut impacts = states
+        .into_values()
+        .filter_map(|node_states| {
+            node_states.into_iter().reduce(|best, candidate| {
+                if dependency_impact_is_better_for_output(&candidate, &best) {
+                    candidate
+                } else {
+                    best
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for impact in &mut impacts {
+        if let Some(relations) = direct_relations.get(&impact.service) {
+            impact.has_direct_relation = true;
+            impact.direct_relations = relations.iter().copied().collect();
+        }
+        impact.selected_path_direct = impact.depth == 1;
+        impact.direct = impact.selected_path_direct;
+    }
+    impacts.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.service.cmp(&right.service))
+            .then_with(|| right.severity.cmp(&left.severity))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let total = impacts.len();
+    let detail_limit = query_limit.min(MAX_DEPENDENCY_IMPACT_DETAILS);
+    impacts.truncate(detail_limit);
+    let returned_count = impacts.len();
+    let omitted_count = total.saturating_sub(returned_count);
+    let complete = target_found
+        && list_units_complete
+        && show_complete
+        && dependency_coverage_complete
+        && !source_truncated
+        && !depth_truncated
+        && !traversal_truncated;
+    let collection_status = if complete {
+        CollectionStatus::Complete
+    } else if !list_units_complete && !show_complete && units.is_empty() {
+        CollectionStatus::Failed
+    } else {
+        CollectionStatus::Partial
+    };
+
+    ServiceDependencyAnalysis {
+        target: target.to_string(),
+        target_found,
+        collection_status,
+        complete,
+        direct_total,
+        total,
+        returned_count,
+        omitted_count,
+        cycle_detected,
+        depth_truncated,
+        traversal_truncated,
+        total_unknown: !complete,
+        truncated: source_truncated || depth_truncated || traversal_truncated || omitted_count > 0,
+        impacts,
+    }
+}
+
+fn add_reverse_dependency_edges(
+    reverse_edges: &mut BTreeMap<String, Vec<ServiceDependencyPathEdge>>,
+    runtime_services: &BTreeSet<String>,
+    dependencies: &[String],
+    dependent: &str,
+    relation: DependencyRelationKind,
+) {
+    for dependency in dependencies {
+        if runtime_services.contains(dependency) {
+            reverse_edges
+                .entry(dependency.clone())
+                .or_default()
+                .push(ServiceDependencyPathEdge {
+                    dependency: dependency.clone(),
+                    dependent: dependent.to_string(),
+                    relation,
+                    severity: dependency_severity(relation),
+                });
+        }
+    }
+}
+
+fn dependency_severity(relation: DependencyRelationKind) -> DependencyImpactSeverity {
+    match relation {
+        DependencyRelationKind::Requires | DependencyRelationKind::Requisite => {
+            DependencyImpactSeverity::Hard
+        }
+        DependencyRelationKind::BindsTo | DependencyRelationKind::PartOf => {
+            DependencyImpactSeverity::Lifecycle
+        }
+        DependencyRelationKind::Wants => DependencyImpactSeverity::Soft,
+        DependencyRelationKind::After | DependencyRelationKind::Before => {
+            DependencyImpactSeverity::Ordering
+        }
+    }
+}
+
+fn dependency_reason(relation: DependencyRelationKind) -> DependencyImpactReason {
+    match relation {
+        DependencyRelationKind::Requires => DependencyImpactReason::RequiredDependency,
+        DependencyRelationKind::Requisite => DependencyImpactReason::RequisiteCondition,
+        DependencyRelationKind::BindsTo => DependencyImpactReason::BoundLifecycle,
+        DependencyRelationKind::PartOf => DependencyImpactReason::PartOfLifecycle,
+        DependencyRelationKind::Wants => DependencyImpactReason::WantedDependency,
+        DependencyRelationKind::After => DependencyImpactReason::OrderedAfter,
+        DependencyRelationKind::Before => DependencyImpactReason::OrderedBefore,
+    }
+}
+
+fn register_dependency_state(
+    states: &mut BTreeMap<String, Vec<ServiceDependencyImpact>>,
+    candidate: ServiceDependencyImpact,
+) -> bool {
+    if !dependency_state_would_be_accepted(states, &candidate) {
+        return false;
+    }
+    let node_states = states.entry(candidate.service.clone()).or_default();
+    node_states.retain(|existing| !dependency_state_dominates(&candidate, existing));
+    node_states.push(candidate);
+    node_states.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| left.depth.cmp(&right.depth))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    true
+}
+
+fn dependency_state_would_be_accepted(
+    states: &BTreeMap<String, Vec<ServiceDependencyImpact>>,
+    candidate: &ServiceDependencyImpact,
+) -> bool {
+    !states.get(&candidate.service).is_some_and(|node_states| {
+        node_states
+            .iter()
+            .any(|existing| dependency_state_dominates(existing, candidate))
+    })
+}
+
+fn dependency_state_dominates(
+    candidate: &ServiceDependencyImpact,
+    other: &ServiceDependencyImpact,
+) -> bool {
+    (candidate.severity > other.severity && candidate.depth <= other.depth)
+        || (candidate.severity >= other.severity && candidate.depth < other.depth)
+        || (candidate.severity == other.severity
+            && candidate.depth == other.depth
+            && candidate.path <= other.path)
+}
+
+fn dependency_impact_is_better_for_output(
+    candidate: &ServiceDependencyImpact,
+    existing: &ServiceDependencyImpact,
+) -> bool {
+    candidate.severity > existing.severity
+        || (candidate.severity == existing.severity
+            && (candidate.depth < existing.depth
+                || (candidate.depth == existing.depth && candidate.path < existing.path)))
 }
 
 fn validate_unit_name(name: &str) -> Result<()> {
@@ -1533,6 +2148,28 @@ mod tests {
         })
     }
 
+    fn dependency_show_record(
+        name: &str,
+        requires: &str,
+        requisite: &str,
+        binds_to: &str,
+        part_of: &str,
+        wants: &str,
+        after: &str,
+        before: &str,
+    ) -> String {
+        format!(
+            "Id={name}\nLoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nExecMainCode=1\nExecMainStatus=0\nStatusText=\nStatusErrno=0\nNRestarts=0\nLoadError=\nRequires={requires}\nRequisite={requisite}\nBindsTo={binds_to}\nPartOf={part_of}\nWants={wants}\nAfter={after}\nBefore={before}\n\n"
+        )
+    }
+
+    fn runtime_inventory(names: &[&str]) -> String {
+        names
+            .iter()
+            .map(|name| format!("{name} loaded active running {name}\n"))
+            .collect()
+    }
+
     #[test]
     fn merges_runtime_and_installed_inventory_with_fixed_commands() {
         let runner = FixtureRunner::new(vec![
@@ -1573,7 +2210,7 @@ mod tests {
         assert!(calls.iter().all(|call| call.4 == SERVICE_STDERR_LIMIT));
         assert_eq!(
             SHOW_PROPERTIES,
-            "Id,LoadState,ActiveState,SubState,UnitFileState,Description,Result,ExecMainCode,ExecMainStatus,StatusText,StatusErrno,NRestarts,LoadError,FragmentPath,Requires,Wants,After,Before"
+            "Id,LoadState,ActiveState,SubState,UnitFileState,Description,Result,ExecMainCode,ExecMainStatus,StatusText,StatusErrno,NRestarts,LoadError,FragmentPath,Requires,Requisite,BindsTo,PartOf,Wants,After,Before"
         );
     }
 
@@ -1682,12 +2319,43 @@ mod tests {
         ] {
             assert!(validate_unit_name(name).is_ok(), "{name}");
         }
+        for name in [
+            "network.target",
+            "demo.socket",
+            "-.mount",
+            "work.slice",
+            "checkpoint.snapshot",
+            "foo\\x2dbar.service",
+        ] {
+            assert!(validate_dependency_unit_name(name), "{name}");
+        }
+        for name in [
+            "foo\\bar.service",
+            "foo\\x2.service",
+            "foo\\xzz.service",
+            "foo\\.service",
+        ] {
+            assert!(!validate_dependency_unit_name(name), "{name}");
+        }
         assert!(ServiceQuery {
             limit: Some(0),
             ..ServiceQuery::default()
         }
         .validate()
         .is_err());
+        assert!(ServiceQuery {
+            impact_of: Some("../bad.service".to_string()),
+            ..ServiceQuery::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ServiceQuery {
+            name: Some("ssh.service".to_string()),
+            impact_of: Some("database.service".to_string()),
+            ..ServiceQuery::default()
+        }
+        .validate()
+        .is_ok());
         assert!(ServiceQuery {
             health_probes: vec![
                 TcpProbeRequest {
@@ -1707,7 +2375,7 @@ mod tests {
             "ssh.service",
         );
         assert_eq!(unit.requires, vec!["network.target"]);
-        assert_eq!(unit.after, vec!["network.target", "auditd.service"]);
+        assert_eq!(unit.after, vec!["auditd.service", "network.target"]);
         assert_eq!(unit.exec_main_status, Some(0));
     }
 
@@ -2229,6 +2897,825 @@ mod tests {
     }
 
     #[test]
+    fn analyzes_direct_transitive_and_ordering_dependency_impacts() {
+        let names = [
+            "a.service",
+            "after.service",
+            "before.service",
+            "bind.service",
+            "hard.service",
+            "ordering-child.service",
+            "part.service",
+            "requisite.service",
+            "soft.service",
+            "transitive.service",
+        ];
+        let mut show =
+            dependency_show_record("a.service", "", "", "", "", "", "", "before.service");
+        show.push_str(&dependency_show_record(
+            "hard.service",
+            "a.service network.target demo.socket -.mount work.slice checkpoint.snapshot",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "requisite.service",
+            "",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "bind.service",
+            "",
+            "",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "part.service",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "soft.service",
+            "",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "after.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "before.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "transitive.service",
+            "",
+            "",
+            "",
+            "",
+            "hard.service",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "ordering-child.service",
+            "after.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&names)),
+            output(""),
+            output(show),
+        ]);
+        let snapshot = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("dependency impact");
+        let analysis = snapshot.dependency_analysis.as_ref().expect("analysis");
+
+        assert!(analysis.target_found);
+        assert!(analysis.complete);
+        assert_eq!(analysis.collection_status, CollectionStatus::Complete);
+        assert_eq!(analysis.direct_total, 7);
+        assert_eq!(analysis.total, 8);
+        assert!(!analysis
+            .impacts
+            .iter()
+            .any(|impact| impact.service == "ordering-child.service"));
+        let impact = |service: &str| {
+            analysis
+                .impacts
+                .iter()
+                .find(|impact| impact.service == service)
+                .expect("service impact")
+        };
+        assert_eq!(
+            impact("hard.service").severity,
+            DependencyImpactSeverity::Hard
+        );
+        assert_eq!(
+            impact("requisite.service").reason,
+            DependencyImpactReason::RequisiteCondition
+        );
+        assert_eq!(
+            impact("bind.service").severity,
+            DependencyImpactSeverity::Lifecycle
+        );
+        assert_eq!(
+            impact("part.service").reason,
+            DependencyImpactReason::PartOfLifecycle
+        );
+        assert_eq!(
+            impact("soft.service").severity,
+            DependencyImpactSeverity::Soft
+        );
+        assert_eq!(
+            impact("after.service").severity,
+            DependencyImpactSeverity::Ordering
+        );
+        assert_eq!(
+            impact("before.service").reason,
+            DependencyImpactReason::OrderedBefore
+        );
+        assert_eq!(impact("transitive.service").depth, 2);
+        assert!(!impact("transitive.service").direct);
+        assert_eq!(
+            impact("transitive.service").severity,
+            DependencyImpactSeverity::Soft
+        );
+        assert_eq!(impact("transitive.service").path.len(), 2);
+        let hard = snapshot
+            .units
+            .iter()
+            .find(|unit| unit.name == "hard.service")
+            .expect("hard unit");
+        assert!(hard.requires.contains(&"network.target".to_string()));
+        assert!(hard.requires.contains(&"demo.socket".to_string()));
+        assert!(hard.requires.contains(&"-.mount".to_string()));
+        assert!(hard.requires.contains(&"work.slice".to_string()));
+        assert!(hard.requires.contains(&"checkpoint.snapshot".to_string()));
+        assert_eq!(hard.dependency_parse_failure_count, 0);
+    }
+
+    #[test]
+    fn dependency_impact_deduplicates_diamonds_and_detects_cycles() {
+        let names = ["a.service", "b.service", "c.service", "d.service"];
+        let mut diamond_show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        diamond_show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        diamond_show.push_str(&dependency_show_record(
+            "c.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        diamond_show.push_str(&dependency_show_record(
+            "d.service",
+            "b.service c.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let diamond_runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&names)),
+            output(""),
+            output(diamond_show),
+        ]);
+        let diamond = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &diamond_runner,
+        )
+        .expect("diamond dependency impact");
+        let diamond = diamond.dependency_analysis.expect("diamond analysis");
+        assert_eq!(diamond.total, 3);
+        let d = diamond
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "d.service")
+            .expect("deduplicated diamond");
+        assert_eq!(d.path[0].dependent, "b.service");
+
+        let mut cycle_show =
+            dependency_show_record("a.service", "b.service", "", "", "", "", "", "");
+        cycle_show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let cycle_runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["a.service", "b.service"])),
+            output(""),
+            output(cycle_show),
+        ]);
+        let cycle = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &cycle_runner,
+        )
+        .expect("cyclic dependency impact")
+        .dependency_analysis
+        .expect("cycle analysis");
+        assert!(cycle.cycle_detected);
+        assert_eq!(cycle.total, 1);
+        assert_eq!(cycle.impacts[0].service, "b.service");
+    }
+
+    #[test]
+    fn dependency_output_prefers_stronger_transitive_paths() {
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "c.service",
+            "b.service",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+            "",
+        ));
+        let runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["a.service", "b.service", "c.service"])),
+            output(""),
+            output(show),
+        ]);
+        let analysis = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("stronger transitive path")
+        .dependency_analysis
+        .expect("dependency analysis");
+        let c = analysis
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "c.service")
+            .expect("c impact");
+        assert_eq!(c.severity, DependencyImpactSeverity::Hard);
+        assert_eq!(c.depth, 2);
+        assert_eq!(c.path[0].dependent, "b.service");
+        assert!(c.has_direct_relation);
+        assert!(!c.selected_path_direct);
+        assert!(!c.direct);
+        assert_eq!(c.direct_relations, vec![DependencyRelationKind::Wants]);
+        assert_eq!(analysis.direct_total, 2);
+    }
+
+    #[test]
+    fn ordering_state_does_not_block_hard_propagation() {
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "c.service",
+            "b.service",
+            "",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "d.service",
+            "c.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&[
+                "a.service",
+                "b.service",
+                "c.service",
+                "d.service",
+            ])),
+            output(""),
+            output(show),
+        ]);
+        let analysis = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("ordering and hard paths")
+        .dependency_analysis
+        .expect("dependency analysis");
+        let c = analysis
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "c.service")
+            .expect("c impact");
+        assert_eq!(c.severity, DependencyImpactSeverity::Hard);
+        assert_eq!(c.depth, 2);
+        assert!(c.has_direct_relation);
+        assert!(!c.selected_path_direct);
+        assert_eq!(c.direct_relations, vec![DependencyRelationKind::After]);
+        assert_eq!(analysis.direct_total, 2);
+        let d = analysis
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "d.service")
+            .expect("d remains reachable");
+        assert_eq!(d.severity, DependencyImpactSeverity::Hard);
+        assert_eq!(d.depth, 3);
+    }
+
+    #[test]
+    fn dependency_traversal_keeps_shorter_weaker_state_at_depth_limit() {
+        let mut names = vec!["a.service".to_string(), "x.service".to_string()];
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        show.push_str(&dependency_show_record(
+            "x.service",
+            "n15.service",
+            "",
+            "",
+            "",
+            "a.service",
+            "",
+            "",
+        ));
+        let mut previous = "a.service".to_string();
+        for index in 1..=15 {
+            let name = format!("n{index:02}.service");
+            show.push_str(&dependency_show_record(
+                &name, &previous, "", "", "", "", "", "",
+            ));
+            names.push(name.clone());
+            previous = name;
+        }
+        names.push("y.service".to_string());
+        show.push_str(&dependency_show_record(
+            "y.service",
+            "x.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let runtime = names
+            .iter()
+            .map(|name| format!("{name} loaded active running {name}\n"))
+            .collect::<String>();
+        let runner = FixtureRunner::new(vec![output(runtime), output(""), output(show)]);
+        let analysis = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("non-dominated depth states")
+        .dependency_analysis
+        .expect("dependency analysis");
+        assert!(analysis.depth_truncated);
+        let x = analysis
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "x.service")
+            .expect("x impact");
+        assert_eq!(x.severity, DependencyImpactSeverity::Hard);
+        assert_eq!(x.depth, MAX_DEPENDENCY_IMPACT_DEPTH);
+        let y = analysis
+            .impacts
+            .iter()
+            .find(|impact| impact.service == "y.service")
+            .expect("short soft path reaches y");
+        assert_eq!(y.severity, DependencyImpactSeverity::Soft);
+        assert_eq!(y.depth, 2);
+    }
+
+    #[test]
+    fn dependency_traversal_budget_marks_known_lower_bound() {
+        let names = ["a.service", "b.service", "c.service", "d.service"];
+        let mut merged = parse_list_units_output(&runtime_inventory(&names), false).units;
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        for name in &names[1..] {
+            show.push_str(&dependency_show_record(
+                name,
+                "a.service",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ));
+        }
+        merge_show_units(&mut merged, parse_show_records_output(&show, false).units);
+
+        let analysis = analyze_service_dependency_impact_with_limits(
+            "a.service",
+            &merged,
+            MAX_SERVICE_LIMIT,
+            true,
+            true,
+            true,
+            false,
+            DependencyTraversalLimits {
+                accepted: 2,
+                queued: 8,
+                expanded: 8,
+            },
+        );
+        assert!(analysis.traversal_truncated);
+        assert!(analysis.total_unknown);
+        assert!(!analysis.complete);
+        assert_eq!(analysis.collection_status, CollectionStatus::Partial);
+        assert!(analysis.truncated);
+        assert_eq!(analysis.direct_total, 3);
+        assert_eq!(analysis.total, 2);
+        assert_eq!(analysis.returned_count, 2);
+        assert_eq!(analysis.omitted_count, 0);
+    }
+
+    #[test]
+    fn dependency_traversal_exact_budget_completes_and_next_operation_truncates() {
+        let mut root_only =
+            parse_list_units_output(&runtime_inventory(&["a.service"]), false).units;
+        merge_show_units(
+            &mut root_only,
+            parse_show_records_output(
+                &dependency_show_record("a.service", "", "", "", "", "", "", ""),
+                false,
+            )
+            .units,
+        );
+        let root_only = analyze_service_dependency_impact_with_limits(
+            "a.service",
+            &root_only,
+            MAX_SERVICE_LIMIT,
+            true,
+            true,
+            true,
+            false,
+            DependencyTraversalLimits {
+                accepted: 1,
+                queued: 1,
+                expanded: 1,
+            },
+        );
+        assert!(!root_only.traversal_truncated);
+        assert!(root_only.complete);
+        assert_eq!(root_only.total, 0);
+
+        fn analyze_chain(names: &[&str], show: String) -> ServiceDependencyAnalysis {
+            let mut merged = parse_list_units_output(&runtime_inventory(names), false).units;
+            merge_show_units(&mut merged, parse_show_records_output(&show, false).units);
+            analyze_service_dependency_impact_with_limits(
+                "a.service",
+                &merged,
+                MAX_SERVICE_LIMIT,
+                true,
+                true,
+                true,
+                false,
+                DependencyTraversalLimits {
+                    accepted: 1,
+                    queued: 2,
+                    expanded: 2,
+                },
+            )
+        }
+
+        let mut exact_show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        exact_show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let exact = analyze_chain(&["a.service", "b.service"], exact_show);
+        assert!(!exact.traversal_truncated);
+        assert!(!exact.total_unknown);
+        assert!(exact.complete);
+        assert_eq!(exact.collection_status, CollectionStatus::Complete);
+        assert_eq!(exact.total, 1);
+
+        let mut overflow_show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        overflow_show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        overflow_show.push_str(&dependency_show_record(
+            "c.service",
+            "b.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let overflow = analyze_chain(&["a.service", "b.service", "c.service"], overflow_show);
+        assert!(overflow.traversal_truncated);
+        assert!(overflow.total_unknown);
+        assert!(!overflow.complete);
+        assert_eq!(overflow.collection_status, CollectionStatus::Partial);
+        assert_eq!(overflow.total, 1);
+    }
+
+    #[test]
+    fn dependency_impact_reports_missing_and_malformed_inputs() {
+        let complete_b = dependency_show_record(
+            "b.service",
+            "a.service network.target bad/token.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut malformed_show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        malformed_show.push_str(&complete_b);
+        let malformed_runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["a.service", "b.service"])),
+            output(""),
+            output(malformed_show),
+        ]);
+        let malformed = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &malformed_runner,
+        )
+        .expect("malformed dependency input");
+        let b = malformed
+            .units
+            .iter()
+            .find(|unit| unit.name == "b.service")
+            .expect("b unit");
+        assert_eq!(b.dependency_parse_failure_count, 1);
+        assert!(b.requires.contains(&"network.target".to_string()));
+        assert!(
+            !malformed
+                .dependency_analysis
+                .as_ref()
+                .expect("malformed analysis")
+                .complete
+        );
+
+        let mut missing_show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        missing_show.push_str(
+            &dependency_show_record("b.service", "a.service", "", "", "", "", "", "")
+                .replace("PartOf=\n", ""),
+        );
+        let missing_runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["a.service", "b.service"])),
+            output(""),
+            output(missing_show),
+        ]);
+        let missing_property = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &missing_runner,
+        )
+        .expect("missing dependency property");
+        assert!(!missing_property.units[1].dependency_complete);
+        assert!(
+            !missing_property
+                .dependency_analysis
+                .as_ref()
+                .expect("missing property analysis")
+                .complete
+        );
+
+        let missing_target_runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["b.service"])),
+            output(""),
+            output(format!(
+                "{}{}",
+                dependency_show_record("b.service", "", "", "", "", "", "", ""),
+                dependency_show_record("missing.service", "", "", "", "", "", "", "")
+            )),
+        ]);
+        let missing_target_snapshot = query_services_with_runner(
+            &ServiceQuery {
+                impact_of: Some("missing.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &missing_target_runner,
+        )
+        .expect("missing impact target");
+        assert!(missing_target_snapshot
+            .units
+            .iter()
+            .any(|unit| unit.name == "missing.service"));
+        let missing_target = missing_target_snapshot
+            .dependency_analysis
+            .expect("missing target analysis");
+        assert!(!missing_target.target_found);
+        assert!(!missing_target.complete);
+        assert_eq!(missing_target.collection_status, CollectionStatus::Partial);
+    }
+
+    #[test]
+    fn dependency_impact_counts_before_limit_and_precedes_display_clearing() {
+        let names = ["a.service", "b.service", "c.service", "d.service"];
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        for name in &names[1..] {
+            show.push_str(&dependency_show_record(
+                name,
+                "a.service",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ));
+        }
+        let runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&names)),
+            output(""),
+            output(show),
+        ]);
+        let snapshot = query_services_with_runner(
+            &ServiceQuery {
+                name: Some("c.service".to_string()),
+                impact_of: Some("a.service".to_string()),
+                include_dependencies: false,
+                limit: Some(1),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("limited dependency impact");
+        let analysis = snapshot.dependency_analysis.as_ref().expect("analysis");
+        assert_eq!(analysis.total, 3);
+        assert_eq!(analysis.direct_total, 3);
+        assert_eq!(analysis.returned_count, 1);
+        assert_eq!(analysis.omitted_count, 2);
+        assert!(analysis.truncated);
+        assert_eq!(snapshot.units.len(), 1);
+        assert_eq!(snapshot.units[0].name, "c.service");
+        assert!(snapshot.units[0].requires.is_empty());
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(
+            calls[2].1,
+            vec![
+                "show",
+                SHOW_ALL_PATTERN,
+                "c.service",
+                "--all",
+                "--no-pager",
+                "--property",
+                SHOW_PROPERTIES,
+            ]
+        );
+    }
+
+    #[test]
+    fn name_and_impact_show_includes_exact_orphan_without_graph_trust() {
+        let mut show = dependency_show_record("a.service", "", "", "", "", "", "", "");
+        show.push_str(&dependency_show_record(
+            "b.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        show.push_str(&dependency_show_record(
+            "worker@42.service",
+            "a.service",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ));
+        let runner = FixtureRunner::new(vec![
+            output(runtime_inventory(&["a.service", "b.service"])),
+            output(""),
+            output(show),
+        ]);
+        let snapshot = query_services_with_runner(
+            &ServiceQuery {
+                name: Some("worker@42.service".to_string()),
+                impact_of: Some("a.service".to_string()),
+                ..ServiceQuery::default()
+            },
+            &runner,
+        )
+        .expect("batch and exact show");
+        assert_eq!(snapshot.units.len(), 1);
+        assert_eq!(snapshot.units[0].name, "worker@42.service");
+        let analysis = snapshot.dependency_analysis.as_ref().expect("analysis");
+        assert!(analysis.target_found);
+        assert!(analysis.complete);
+        assert_eq!(analysis.total, 1);
+        assert_eq!(analysis.impacts[0].service, "b.service");
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[2].1,
+            vec![
+                "show",
+                SHOW_ALL_PATTERN,
+                "worker@42.service",
+                "--all",
+                "--no-pager",
+                "--property",
+                SHOW_PROPERTIES,
+            ]
+        );
+    }
+
+    #[test]
     fn maps_all_typed_failure_reasons() {
         let mappings = [
             ("exit-code", ServiceProblemKind::ExitCode),
@@ -2547,7 +4034,46 @@ mod tests {
         );
         assert!(!snapshot.units[0].problem_complete);
         assert!(snapshot.units[0].problem_evidence.is_some());
+        assert!(snapshot.units[0].requisite.is_empty());
+        assert!(snapshot.units[0].binds_to.is_empty());
+        assert!(snapshot.units[0].part_of.is_empty());
+        assert!(!snapshot.units[0].dependency_complete);
+        assert!(snapshot.dependency_analysis.is_none());
         assert_eq!(snapshot.problem_units[0].name, "legacy.service");
+
+        let legacy_analysis = serde_json::json!({
+            "target": "a.service",
+            "target_found": true,
+            "collection_status": "complete",
+            "complete": true,
+            "direct_total": 1,
+            "total": 1,
+            "returned_count": 1,
+            "omitted_count": 0,
+            "cycle_detected": false,
+            "depth_truncated": false,
+            "truncated": false,
+            "impacts": [{
+                "service": "b.service",
+                "depth": 1,
+                "direct": true,
+                "severity": "hard",
+                "reason": "required_dependency",
+                "path": [{
+                    "dependency": "a.service",
+                    "dependent": "b.service",
+                    "relation": "requires",
+                    "severity": "hard"
+                }]
+            }]
+        });
+        let legacy_analysis = serde_json::from_value::<ServiceDependencyAnalysis>(legacy_analysis)
+            .expect("legacy dependency analysis");
+        assert!(!legacy_analysis.traversal_truncated);
+        assert!(!legacy_analysis.total_unknown);
+        assert!(!legacy_analysis.impacts[0].has_direct_relation);
+        assert!(!legacy_analysis.impacts[0].selected_path_direct);
+        assert!(legacy_analysis.impacts[0].direct_relations.is_empty());
 
         let previous_new_unit = serde_json::json!({
             "name": "prior.service",
