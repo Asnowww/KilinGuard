@@ -7,6 +7,7 @@
 mod command;
 pub mod context;
 pub mod error;
+pub mod http_probe;
 pub mod logs;
 pub mod model;
 pub mod network;
@@ -14,11 +15,13 @@ pub mod procfs;
 mod redaction;
 pub mod runtime;
 pub mod scheduler;
+mod service_ports;
 pub mod services;
 pub mod storage;
 
 pub use context::{build_alert_context, collect_context, ContextRequest};
 pub use error::{OsSenseError, Result};
+pub use http_probe::HttpProbeRequest;
 pub use logs::{
     query_logs, query_logs_with_summary_generator, render_log_summary_prompt, LogQuery,
     LogSummaryGenerator,
@@ -29,18 +32,19 @@ pub use model::{
     CpuCoreSnapshot, CpuSnapshot, DependencyImpactReason, DependencyImpactSeverity,
     DependencyRelationKind, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
     DnsResolutionSource, DnsResolutionStatus, DnsResolverStatus, FanReading, FirewallErrorKind,
-    FirewallStatus, HealthProbeResult, HwmonSensorReading, LoadAverage, LogEntry,
-    LogLlmSummaryOutput, LogPattern, LogPatternEvidence, LogQueryResult, LogSourceStatus,
-    LogSummary, LogSummaryBoundary, LogSummaryEvidence, LogSummaryMode, LogSummaryRequest,
-    LogSummaryTimeRange, MemorySnapshot, MetricSnapshot, NetworkAnomalyEvidence, NetworkBaseline,
-    NetworkBaselineEntry, NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot,
-    NetworkSnapshot, NetworkSourceStatus, OsContext, OsSampleMeta, PlatformInfo,
-    ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList,
-    RateStatus, ResourceDimension, SensorAvailability, ServiceDependencyAnalysis,
-    ServiceDependencyImpact, ServiceDependencyPathEdge, ServiceHealthStatus, ServiceProblem,
-    ServiceProblemEvidence, ServiceProblemKind, ServiceSnapshot, ServiceSource,
-    ServiceSourceStatus, ServiceUnit, TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus,
-    TemperatureReading, ThermalSnapshot,
+    FirewallStatus, HealthProbeResult, HttpProbeErrorKind, HttpProbeResult, HttpProbeStage,
+    HttpProbeStatus, HwmonSensorReading, LoadAverage, LogEntry, LogLlmSummaryOutput, LogPattern,
+    LogPatternEvidence, LogQueryResult, LogSourceStatus, LogSummary, LogSummaryBoundary,
+    LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange, MemorySnapshot,
+    MetricSnapshot, NetworkAnomalyEvidence, NetworkBaseline, NetworkBaselineEntry,
+    NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot, NetworkSnapshot,
+    NetworkSourceStatus, OsContext, OsSampleMeta, PlatformInfo, ProcessAnomalyEvidence,
+    ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
+    SensorAvailability, ServiceDependencyAnalysis, ServiceDependencyImpact,
+    ServiceDependencyPathEdge, ServiceHealthStatus, ServicePortBinding, ServicePortCollection,
+    ServicePortOwnershipStatus, ServicePortProtocol, ServiceProblem, ServiceProblemEvidence,
+    ServiceProblemKind, ServiceSnapshot, ServiceSource, ServiceSourceStatus, ServiceUnit,
+    TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus, TemperatureReading, ThermalSnapshot,
 };
 pub use network::{
     collect_network, NetworkQuery, TcpProbeRequest, MAX_NETWORK_BASELINE_ENTRIES,

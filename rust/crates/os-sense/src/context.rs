@@ -354,6 +354,23 @@ fn build_health_summary(
         ));
     }
     if let Some(services) = services {
+        let tcp_probe_ok = services
+            .health_probes
+            .iter()
+            .filter(|probe| probe.ok)
+            .count();
+        let http_probe_ok = services.http_probes.iter().filter(|probe| probe.ok).count();
+        let port_status = if services.port_collection.requested {
+            format!(
+                ", ports {:?} ({} returned, {} omitted, complete={})",
+                services.port_collection.status,
+                services.port_collection.returned_count,
+                services.port_collection.omitted_count,
+                services.port_collection.complete
+            )
+        } else {
+            String::new()
+        };
         let dependency_impact = services.dependency_analysis.as_ref().map_or_else(
             String::new,
             |analysis| {
@@ -384,6 +401,12 @@ fn build_health_summary(
         ));
         if let Some(summary) = parts.last_mut() {
             summary.push_str(&dependency_impact);
+            summary.push_str(&format!(
+                ", TCP probes {tcp_probe_ok}/{}, HTTP probes {http_probe_ok}/{}{}",
+                services.health_probes.len(),
+                services.http_probes.len(),
+                port_status
+            ));
         }
     }
     if parts.is_empty() {

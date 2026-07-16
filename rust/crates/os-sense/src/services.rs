@@ -6,15 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{run_limited_command, LimitedCommandOutput};
 use crate::error::{OsSenseError, Result};
+use crate::http_probe::{probe_http, validate_http_probe_request, HttpProbeRequest};
 use crate::model::{
     CollectionStatus, DependencyImpactReason, DependencyImpactSeverity, DependencyRelationKind,
     HealthProbeResult, ServiceDependencyAnalysis, ServiceDependencyImpact,
-    ServiceDependencyPathEdge, ServiceHealthStatus, ServiceProblem, ServiceProblemEvidence,
-    ServiceProblemKind, ServiceSnapshot, ServiceSource, ServiceSourceStatus, ServiceUnit,
+    ServiceDependencyPathEdge, ServiceHealthStatus, ServicePortCollection, ServicePortProtocol,
+    ServiceProblem, ServiceProblemEvidence, ServiceProblemKind, ServiceSnapshot, ServiceSource,
+    ServiceSourceStatus, ServiceUnit,
 };
 use crate::network::{probe_tcp, NetworkQuery, TcpProbeRequest};
 use crate::procfs::basic_meta;
 use crate::redaction::redact_sensitive_text;
+use crate::service_ports::{collect_service_ports, CollectedServicePorts};
 
 const MAX_SERVICE_LIMIT: usize = 4_096;
 const MAX_SERVICE_DETAIL_LIMIT: usize = 128;
@@ -81,6 +84,7 @@ pub struct ServiceQuery {
     pub include_dependencies: bool,
     pub include_ports: bool,
     pub health_probes: Vec<TcpProbeRequest>,
+    pub http_probes: Vec<HttpProbeRequest>,
     pub limit: Option<usize>,
 }
 
@@ -93,6 +97,7 @@ impl Default for ServiceQuery {
             include_dependencies: true,
             include_ports: false,
             health_probes: Vec::new(),
+            http_probes: Vec::new(),
             limit: Some(MAX_SERVICE_LIMIT),
         }
     }
@@ -114,9 +119,16 @@ impl ServiceQuery {
                 "service query limit must be between 1 and {MAX_SERVICE_LIMIT}"
             )));
         }
-        if self.health_probes.len() > MAX_HEALTH_PROBES {
+        let probe_count = self
+            .health_probes
+            .len()
+            .checked_add(self.http_probes.len())
+            .ok_or_else(|| {
+                OsSenseError::Configuration("service query probe count overflowed".to_string())
+            })?;
+        if probe_count > MAX_HEALTH_PROBES {
             return Err(OsSenseError::Configuration(format!(
-                "service query health_probes must not contain more than {MAX_HEALTH_PROBES} entries"
+                "service query health_probes and http_probes must not contain more than {MAX_HEALTH_PROBES} entries in total"
             )));
         }
         NetworkQuery {
@@ -124,6 +136,9 @@ impl ServiceQuery {
             ..NetworkQuery::default()
         }
         .validate()?;
+        for probe in &self.http_probes {
+            validate_http_probe_request(probe)?;
+        }
         Ok(())
     }
 }
@@ -140,6 +155,18 @@ trait ServiceCommandRunner {
 }
 
 struct SystemServiceCommandRunner;
+
+trait ServicePortCollector {
+    fn collect(&self) -> CollectedServicePorts;
+}
+
+struct SystemServicePortCollector;
+
+impl ServicePortCollector for SystemServicePortCollector {
+    fn collect(&self) -> CollectedServicePorts {
+        collect_service_ports()
+    }
+}
 
 impl ServiceCommandRunner for SystemServiceCommandRunner {
     fn run(
@@ -183,6 +210,14 @@ pub fn query_services(query: &ServiceQuery) -> Result<ServiceSnapshot> {
 fn query_services_with_runner(
     query: &ServiceQuery,
     runner: &dyn ServiceCommandRunner,
+) -> Result<ServiceSnapshot> {
+    query_services_with_collectors(query, runner, &SystemServicePortCollector)
+}
+
+fn query_services_with_collectors(
+    query: &ServiceQuery,
+    runner: &dyn ServiceCommandRunner,
+    port_collector: &dyn ServicePortCollector,
 ) -> Result<ServiceSnapshot> {
     query.validate()?;
     let mut warnings = Vec::new();
@@ -366,13 +401,31 @@ fn query_services_with_runner(
             unit.before.clear();
         }
     }
+    let mut port_collection = ServicePortCollection::default();
+    let mut known_port_binding_ids = BTreeSet::new();
     if query.include_ports {
-        push_service_warning(
-            &mut warnings,
-            &mut omitted_warning_count,
-            "service-to-port mapping requires FR-1.20 probing and is not part of FR-1.17 inventory"
-                .to_string(),
-        );
+        let mut collected = port_collector.collect();
+        known_port_binding_ids = collected.all_binding_ids.clone();
+        for unit in &mut units {
+            if let Some(bindings) = collected.services.remove(&unit.name) {
+                unit.port_binding_total = bindings.total;
+                unit.port_bindings = bindings.bindings;
+                unit.port_binding_returned_count = unit.port_bindings.len();
+                unit.port_binding_omitted_count = unit
+                    .port_binding_total
+                    .saturating_sub(unit.port_binding_returned_count);
+                unit.port_bindings_complete = bindings.complete;
+                unit.port_ownership_status = bindings.ownership_status;
+                unit.ports = unit
+                    .port_bindings
+                    .iter()
+                    .map(format_legacy_port_binding)
+                    .collect();
+            } else {
+                unit.port_bindings_complete = collected.collection.complete;
+            }
+        }
+        port_collection = collected.collection;
     }
 
     let total = units.len();
@@ -399,14 +452,36 @@ fn query_services_with_runner(
     let omitted_count = total.saturating_sub(limit);
     units.truncate(limit);
     let returned_count = units.len();
+    if query.include_ports {
+        let returned_binding_ids = serialized_port_binding_ids(
+            &units,
+            &failed_units,
+            &problem_units,
+            &port_collection.unowned_bindings,
+        );
+        port_collection.total = known_port_binding_ids.len();
+        port_collection.returned_count = returned_binding_ids
+            .intersection(&known_port_binding_ids)
+            .count();
+        port_collection.omitted_count = port_collection
+            .total
+            .saturating_sub(port_collection.returned_count);
+        port_collection.truncated |= port_collection.omitted_count > 0;
+        port_collection.complete &= port_collection.omitted_count == 0;
+        if !port_collection.complete && port_collection.status == CollectionStatus::Complete {
+            port_collection.status = CollectionStatus::Partial;
+        }
+    }
     let truncated = source_truncated
         || omitted_count > 0
         || failed_omitted_count > 0
         || problem_omitted_count > 0
+        || port_collection.truncated
         || dependency_analysis
             .as_ref()
             .is_some_and(|analysis| analysis.truncated);
     let health_probes = query.health_probes.iter().map(probe_tcp).collect();
+    let http_probes = query.http_probes.iter().map(probe_http).collect();
 
     Ok(ServiceSnapshot {
         meta: basic_meta("services", warnings),
@@ -431,8 +506,51 @@ fn query_services_with_runner(
         failed_units,
         problem_units,
         dependency_analysis,
+        port_collection,
         health_probes,
+        http_probes,
     })
+}
+
+fn format_legacy_port_binding(binding: &crate::model::ServicePortBinding) -> String {
+    let protocol = match binding.protocol {
+        ServicePortProtocol::Tcp => "tcp",
+        ServicePortProtocol::Tcp6 => "tcp6",
+        ServicePortProtocol::Udp => "udp",
+        ServicePortProtocol::Udp6 => "udp6",
+        ServicePortProtocol::Unknown => "unknown",
+    };
+    if binding.local_address.contains(':') {
+        format!("{protocol}:[{}]:{}", binding.local_address, binding.port)
+    } else {
+        format!("{protocol}:{}:{}", binding.local_address, binding.port)
+    }
+}
+
+fn serialized_port_binding_ids(
+    units: &[ServiceUnit],
+    failed_units: &[ServiceUnit],
+    problem_units: &[ServiceUnit],
+    unowned_bindings: &[crate::model::ServicePortBinding],
+) -> BTreeSet<String> {
+    units
+        .iter()
+        .chain(failed_units)
+        .chain(problem_units)
+        .flat_map(|unit| unit.port_bindings.iter())
+        .chain(unowned_bindings)
+        .map(port_binding_identity)
+        .collect()
+}
+
+fn port_binding_identity(binding: &crate::model::ServicePortBinding) -> String {
+    if !binding.binding_id.is_empty() {
+        return binding.binding_id.clone();
+    }
+    format!(
+        "legacy:{:?}:{}:{}:{}",
+        binding.protocol, binding.local_address, binding.port, binding.inode
+    )
 }
 
 fn collect_service_source<F>(
@@ -619,6 +737,12 @@ fn parse_list_units_output(content: &str, input_truncated: bool) -> ParsedServic
             dependency_omitted_count: 0,
             dependency_truncated: false,
             ports: Vec::new(),
+            port_bindings: Vec::new(),
+            port_binding_total: 0,
+            port_binding_returned_count: 0,
+            port_binding_omitted_count: 0,
+            port_bindings_complete: false,
+            port_ownership_status: Default::default(),
             health_status,
             problems,
             problem_evidence,
@@ -687,6 +811,12 @@ fn parse_list_unit_files_output(content: &str, input_truncated: bool) -> ParsedS
             dependency_omitted_count: 0,
             dependency_truncated: false,
             ports: Vec::new(),
+            port_bindings: Vec::new(),
+            port_binding_total: 0,
+            port_binding_returned_count: 0,
+            port_binding_omitted_count: 0,
+            port_bindings_complete: false,
+            port_ownership_status: Default::default(),
             health_status: ServiceHealthStatus::Inactive,
             problems: Vec::new(),
             problem_evidence: None,
@@ -1110,6 +1240,12 @@ fn parse_show_output(
         dependency_omitted_count: dependency_stats.omitted_count,
         dependency_truncated,
         ports: Vec::new(),
+        port_bindings: Vec::new(),
+        port_binding_total: 0,
+        port_binding_returned_count: 0,
+        port_binding_omitted_count: 0,
+        port_bindings_complete: false,
+        port_ownership_status: Default::default(),
         health_status,
         problems,
         problem_evidence,
@@ -2083,6 +2219,8 @@ fn summarize_probe(probe: &HealthProbeResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ServicePortBinding, ServicePortOwnershipStatus};
+    use crate::service_ports::ServiceBindings;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2121,6 +2259,92 @@ mod tests {
                 .expect("outputs")
                 .pop_front()
                 .expect("fixture output")
+        }
+    }
+
+    struct FixturePortCollector {
+        value: CollectedServicePorts,
+        calls: Mutex<usize>,
+    }
+
+    impl FixturePortCollector {
+        fn new(services: BTreeMap<String, ServiceBindings>) -> Self {
+            let all_binding_ids = services
+                .values()
+                .flat_map(|bindings| bindings.binding_ids.iter().cloned())
+                .collect();
+            Self {
+                value: CollectedServicePorts {
+                    services,
+                    all_binding_ids,
+                    collection: ServicePortCollection {
+                        requested: true,
+                        available: true,
+                        status: CollectionStatus::Complete,
+                        complete: true,
+                        ..ServicePortCollection::default()
+                    },
+                },
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    impl ServicePortCollector for FixturePortCollector {
+        fn collect(&self) -> CollectedServicePorts {
+            *self.calls.lock().expect("port calls") += 1;
+            self.value.clone()
+        }
+    }
+
+    fn fixture_service_binding(port: u16) -> ServiceBindings {
+        let binding_id = format!("100:tcp:127.0.0.1:{port}:{port}");
+        ServiceBindings {
+            bindings: vec![ServicePortBinding {
+                binding_id: binding_id.clone(),
+                network_namespace: Some(100),
+                protocol: ServicePortProtocol::Tcp,
+                local_address: "127.0.0.1".to_string(),
+                port,
+                inode: u64::from(port),
+                pids: vec![u32::from(port)],
+                pid_total: 1,
+                omitted_pid_count: 0,
+                unowned_pids: Vec::new(),
+                unowned_pid_total: 0,
+                omitted_unowned_pid_count: 0,
+                owner_services: Vec::new(),
+                owner_service_total: 1,
+                omitted_owner_service_count: 0,
+                ownership_complete: true,
+                ownership_status: ServicePortOwnershipStatus::Owned,
+            }],
+            binding_ids: BTreeSet::from([binding_id]),
+            total: 1,
+            complete: true,
+            ownership_status: ServicePortOwnershipStatus::Owned,
+        }
+    }
+
+    fn fixture_unowned_binding(port: u16) -> ServicePortBinding {
+        ServicePortBinding {
+            binding_id: format!("100:udp:0.0.0.0:{port}:{port}"),
+            network_namespace: Some(100),
+            protocol: ServicePortProtocol::Udp,
+            local_address: "0.0.0.0".to_string(),
+            port,
+            inode: u64::from(port),
+            pids: Vec::new(),
+            pid_total: 0,
+            omitted_pid_count: 0,
+            unowned_pids: Vec::new(),
+            unowned_pid_total: 0,
+            omitted_unowned_pid_count: 0,
+            owner_services: Vec::new(),
+            owner_service_total: 0,
+            omitted_owner_service_count: 0,
+            ownership_complete: false,
+            ownership_status: ServicePortOwnershipStatus::Unowned,
         }
     }
 
@@ -2277,6 +2501,163 @@ mod tests {
     }
 
     #[test]
+    fn port_collection_is_opt_in_and_counts_before_service_limit_and_name_filter() {
+        let disabled_ports = FixturePortCollector::new(BTreeMap::new());
+        let disabled_runner = FixtureRunner::new(vec![
+            output("a.service loaded active running A\n"),
+            output("a.service enabled\n"),
+            output(""),
+        ]);
+        let disabled = query_services_with_collectors(
+            &ServiceQuery::default(),
+            &disabled_runner,
+            &disabled_ports,
+        )
+        .expect("ports disabled");
+        assert!(!disabled.port_collection.requested);
+        assert_eq!(*disabled_ports.calls.lock().expect("port calls"), 0);
+
+        let all_ports = FixturePortCollector::new(BTreeMap::from([
+            ("a.service".to_string(), fixture_service_binding(8001)),
+            ("b.service".to_string(), fixture_service_binding(8002)),
+        ]));
+        let all_runner = FixtureRunner::new(vec![
+            output("a.service loaded active running A\nb.service loaded failed failed B\n"),
+            output("a.service enabled\nb.service enabled\n"),
+            output(""),
+        ]);
+        let all = query_services_with_collectors(
+            &ServiceQuery {
+                include_ports: true,
+                limit: Some(1),
+                ..ServiceQuery::default()
+            },
+            &all_runner,
+            &all_ports,
+        )
+        .expect("all ports");
+        assert_eq!(all.port_collection.total, 2);
+        assert_eq!(all.port_collection.returned_count, 2);
+        assert_eq!(all.port_collection.omitted_count, 0);
+        assert_eq!(
+            all.port_collection.total,
+            all.port_collection.returned_count + all.port_collection.omitted_count
+        );
+        assert_eq!(all.units[0].ports, ["tcp:127.0.0.1:8001"]);
+        assert_eq!(all.failed_units[0].name, "b.service");
+        assert_eq!(all.failed_units[0].port_bindings[0].port, 8002);
+        assert_eq!(*all_ports.calls.lock().expect("port calls"), 1);
+
+        let named_ports = FixturePortCollector::new(BTreeMap::from([
+            ("a.service".to_string(), fixture_service_binding(8001)),
+            ("b.service".to_string(), fixture_service_binding(8002)),
+        ]));
+        let named_runner = FixtureRunner::new(vec![
+            output("a.service loaded active running A\nb.service loaded active running B\n"),
+            output("a.service enabled\nb.service enabled\n"),
+            output(dependency_show_record(
+                "b.service",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            )),
+        ]);
+        let named = query_services_with_collectors(
+            &ServiceQuery {
+                name: Some("b.service".to_string()),
+                include_ports: true,
+                ..ServiceQuery::default()
+            },
+            &named_runner,
+            &named_ports,
+        )
+        .expect("named ports");
+        assert_eq!(named.total, 1);
+        assert_eq!(named.port_collection.total, 2);
+        assert_eq!(named.port_collection.returned_count, 1);
+        assert_eq!(named.port_collection.omitted_count, 1);
+        assert_eq!(named.units[0].name, "b.service");
+        assert_eq!(named.units[0].port_bindings[0].port, 8002);
+    }
+
+    #[test]
+    fn unowned_only_port_detail_keeps_snapshot_count_invariant() {
+        let unowned = fixture_unowned_binding(5353);
+        let port_collector = FixturePortCollector {
+            value: CollectedServicePorts {
+                services: BTreeMap::new(),
+                all_binding_ids: BTreeSet::from([unowned.binding_id.clone()]),
+                collection: ServicePortCollection {
+                    requested: true,
+                    available: true,
+                    status: CollectionStatus::Partial,
+                    complete: false,
+                    total: 1,
+                    returned_count: 1,
+                    unowned_count: 1,
+                    unowned_bindings: vec![unowned],
+                    unowned_returned_count: 1,
+                    ..ServicePortCollection::default()
+                },
+            },
+            calls: Mutex::new(0),
+        };
+        let runner = FixtureRunner::new(vec![
+            output("a.service loaded active running A\n"),
+            output("a.service enabled\n"),
+            output(""),
+        ]);
+        let snapshot = query_services_with_collectors(
+            &ServiceQuery {
+                include_ports: true,
+                ..ServiceQuery::default()
+            },
+            &runner,
+            &port_collector,
+        )
+        .expect("unowned-only ports");
+        assert_eq!(snapshot.port_collection.total, 1);
+        assert_eq!(snapshot.port_collection.returned_count, 1);
+        assert_eq!(snapshot.port_collection.omitted_count, 0);
+        assert_eq!(snapshot.port_collection.unowned_count, 1);
+        assert_eq!(snapshot.port_collection.unowned_bindings.len(), 1);
+    }
+
+    #[test]
+    fn shared_binding_is_counted_once_across_service_detail_arrays() {
+        let shared = fixture_service_binding(8080);
+        let port_collector = FixturePortCollector::new(BTreeMap::from([
+            ("a.service".to_string(), shared.clone()),
+            ("b.service".to_string(), shared),
+        ]));
+        let runner = FixtureRunner::new(vec![
+            output("a.service loaded active running A\nb.service loaded failed failed B\n"),
+            output("a.service enabled\nb.service enabled\n"),
+            output(""),
+        ]);
+        let snapshot = query_services_with_collectors(
+            &ServiceQuery {
+                include_ports: true,
+                limit: Some(1),
+                ..ServiceQuery::default()
+            },
+            &runner,
+            &port_collector,
+        )
+        .expect("shared binding");
+        assert_eq!(snapshot.port_collection.total, 1);
+        assert_eq!(snapshot.port_collection.returned_count, 1);
+        assert_eq!(snapshot.port_collection.omitted_count, 0);
+        assert_eq!(snapshot.units[0].port_bindings.len(), 1);
+        assert_eq!(snapshot.failed_units[0].port_bindings.len(), 1);
+        assert_eq!(snapshot.problem_units[0].port_bindings.len(), 1);
+    }
+
+    #[test]
     fn malformed_duplicates_conflicts_and_bounds_are_visible() {
         let mut runtime = String::new();
         runtime.push_str("dup.service loaded active running First\n");
@@ -2365,6 +2746,25 @@ mod tests {
                 };
                 MAX_HEALTH_PROBES + 1
             ],
+            ..ServiceQuery::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ServiceQuery {
+            health_probes: vec![
+                TcpProbeRequest {
+                    host: "localhost".to_string(),
+                    port: 8_000,
+                    timeout_ms: Some(10),
+                };
+                MAX_HEALTH_PROBES
+            ],
+            http_probes: vec![HttpProbeRequest {
+                url: "http://localhost/health".to_string(),
+                timeout_ms: Some(10),
+                expected_status_min: None,
+                expected_status_max: None,
+            }],
             ..ServiceQuery::default()
         }
         .validate()
@@ -4039,7 +4439,34 @@ mod tests {
         assert!(snapshot.units[0].part_of.is_empty());
         assert!(!snapshot.units[0].dependency_complete);
         assert!(snapshot.dependency_analysis.is_none());
+        assert!(snapshot.units[0].port_bindings.is_empty());
+        assert_eq!(snapshot.units[0].port_binding_total, 0);
+        assert!(!snapshot.units[0].port_bindings_complete);
+        assert!(!snapshot.port_collection.requested);
+        assert!(snapshot.http_probes.is_empty());
         assert_eq!(snapshot.problem_units[0].name, "legacy.service");
+
+        let previous_port_binding = serde_json::json!({
+            "protocol": "tcp",
+            "local_address": "127.0.0.1",
+            "port": 8080,
+            "inode": 42,
+            "pids": [7],
+            "pid_total": 1,
+            "omitted_pid_count": 0,
+            "owner_services": ["legacy.service"],
+            "owner_service_total": 1,
+            "omitted_owner_service_count": 0,
+            "ownership_complete": true,
+            "ownership_status": "owned"
+        });
+        let previous_port_binding =
+            serde_json::from_value::<ServicePortBinding>(previous_port_binding)
+                .expect("previous FR-1.20 binding");
+        assert!(previous_port_binding.binding_id.is_empty());
+        assert!(previous_port_binding.network_namespace.is_none());
+        assert!(previous_port_binding.unowned_pids.is_empty());
+        assert_eq!(previous_port_binding.unowned_pid_total, 0);
 
         let legacy_analysis = serde_json::json!({
             "target": "a.service",
@@ -4123,6 +4550,12 @@ mod tests {
         explicit["units"][0]["health_status"] = serde_json::json!("healthy");
         explicit["units"][0]["problems"] = serde_json::json!([]);
         explicit["units"][0]["problem_complete"] = serde_json::json!(true);
+        explicit["units"][0]["port_binding_total"] = serde_json::json!(7);
+        explicit["units"][0]["port_binding_returned_count"] = serde_json::json!(0);
+        explicit["units"][0]["port_binding_omitted_count"] = serde_json::json!(7);
+        explicit["units"][0]["port_bindings_complete"] = serde_json::json!(true);
+        explicit["port_collection"]["requested"] = serde_json::json!(true);
+        explicit["port_collection"]["total"] = serde_json::json!(7);
         let explicit =
             serde_json::from_value::<ServiceSnapshot>(explicit).expect("explicit new service JSON");
         assert_eq!(explicit.total, 0);
@@ -4135,6 +4568,11 @@ mod tests {
         assert!(!explicit.units[0].loaded);
         assert!(!explicit.units[0].runtime_present);
         assert!(explicit.units[0].sources.is_empty());
+        assert_eq!(explicit.units[0].port_binding_total, 7);
+        assert_eq!(explicit.units[0].port_binding_omitted_count, 7);
+        assert!(explicit.units[0].port_bindings_complete);
+        assert!(explicit.port_collection.requested);
+        assert_eq!(explicit.port_collection.total, 7);
         assert_eq!(
             explicit.units[0].health_status,
             ServiceHealthStatus::Healthy

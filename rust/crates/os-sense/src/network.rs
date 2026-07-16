@@ -779,10 +779,10 @@ fn is_valid_resolver_option(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-struct ParsedProcNet {
-    connections: Vec<NetworkConnection>,
-    parse_failure_count: usize,
-    truncated: bool,
+pub(crate) struct ParsedProcNet {
+    pub(crate) connections: Vec<NetworkConnection>,
+    pub(crate) parse_failure_count: usize,
+    pub(crate) truncated: bool,
 }
 
 fn collect_proc_net_connections(
@@ -853,7 +853,11 @@ fn collect_proc_net_connections(
     (out, statuses)
 }
 
-fn parse_proc_net_bytes(bytes: &[u8], protocol: &str, input_truncated: bool) -> ParsedProcNet {
+pub(crate) fn parse_proc_net_bytes(
+    bytes: &[u8],
+    protocol: &str,
+    input_truncated: bool,
+) -> ParsedProcNet {
     let mut connections = Vec::new();
     let mut parse_failure_count = 0usize;
     let mut truncated = input_truncated;
@@ -1065,7 +1069,7 @@ fn validate_nonblank_bounded(name: &str, value: &str, maximum_chars: usize) -> R
     Ok(())
 }
 
-fn validate_dns_target(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_dns_target(name: &str, value: &str) -> Result<()> {
     if !is_valid_dns_name(value, true) {
         return Err(OsSenseError::Configuration(format!(
             "network query {name} must be a valid IP literal, localhost, .local name, or conventional FQDN of at most 253 ASCII characters"
@@ -1150,18 +1154,18 @@ fn bounded_network_error(error: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct DnsResolution {
-    addresses: Vec<IpAddr>,
-    status: DnsResolutionStatus,
-    latency_ms: Option<u128>,
-    source: DnsResolutionSource,
-    truncated: bool,
-    omitted_address_count: usize,
-    parse_failure_count: usize,
-    error: Option<String>,
+pub(crate) struct DnsResolution {
+    pub(crate) addresses: Vec<IpAddr>,
+    pub(crate) status: DnsResolutionStatus,
+    pub(crate) latency_ms: Option<u128>,
+    pub(crate) source: DnsResolutionSource,
+    pub(crate) truncated: bool,
+    pub(crate) omitted_address_count: usize,
+    pub(crate) parse_failure_count: usize,
+    pub(crate) error: Option<String>,
 }
 
-trait DnsResolver {
+pub(crate) trait DnsResolver {
     fn resolve(&self, name: &str, timeout: Duration) -> DnsResolution;
 }
 
@@ -1192,7 +1196,7 @@ impl DnsCommandRunner for SystemDnsCommandRunner {
     }
 }
 
-struct SystemDnsResolver;
+pub(crate) struct SystemDnsResolver;
 
 impl DnsResolver for SystemDnsResolver {
     fn resolve(&self, name: &str, timeout: Duration) -> DnsResolution {
@@ -1373,7 +1377,7 @@ fn resolve_dns_with_runner(
     }
 }
 
-fn literal_dns_resolution(address: IpAddr) -> DnsResolution {
+pub(crate) fn literal_dns_resolution(address: IpAddr) -> DnsResolution {
     DnsResolution {
         addresses: vec![address],
         status: DnsResolutionStatus::Literal,
@@ -1386,7 +1390,7 @@ fn literal_dns_resolution(address: IpAddr) -> DnsResolution {
     }
 }
 
-fn interleave_and_limit_addresses(addresses: Vec<IpAddr>) -> (Vec<IpAddr>, usize) {
+pub(crate) fn interleave_and_limit_addresses(addresses: Vec<IpAddr>) -> (Vec<IpAddr>, usize) {
     let mut ipv4 = VecDeque::new();
     let mut ipv6 = VecDeque::new();
     let mut seen = BTreeSet::new();
@@ -2318,7 +2322,7 @@ fn bounded_firewall_error(error: &str) -> String {
     bounded_network_error(&redacted)
 }
 
-fn probe_ip_allowed(address: IpAddr) -> bool {
+pub(crate) fn probe_ip_allowed(address: IpAddr) -> bool {
     if address.is_unspecified() {
         return false;
     }

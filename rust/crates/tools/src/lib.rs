@@ -1486,7 +1486,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_service_status",
-            description: "Enumerate bounded Kylin Linux systemd services, identify typed health problems, and optionally analyze which services are directly or transitively affected when one service fails. Dependency impact distinguishes hard, lifecycle, soft, and ordering-only relationships without extra per-service commands.",
+            description: "Enumerate bounded Kylin Linux systemd services, identify typed health problems, optionally map listening TCP/UDP ports from procfs/cgroups, run up to five combined TCP/HTTP local-private health probes, and analyze dependency impact without per-service commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1494,10 +1494,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "impact_of": { "type": "string", "minLength": 9, "maxLength": 256, "pattern": "^[A-Za-z0-9_.@:\\\\-]+\\.service$", "description": "Analyze reverse dependency impact if this service becomes unavailable; independent from name filtering." },
                     "include_all": { "type": "boolean" },
                     "include_dependencies": { "type": "boolean" },
-                    "include_ports": { "type": "boolean" },
+                    "include_ports": { "type": "boolean", "description": "Run bounded Linux /proc socket, PID fd, and cgroup ownership collection. False performs no port ownership scan." },
                     "health_probes": {
                         "type": "array",
                         "maxItems": 5,
+                        "description": "TCP probes. TCP and HTTP probes are limited to five entries in total.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1506,6 +1507,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3000 }
                             },
                             "required": ["host", "port"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "http_probes": {
+                        "type": "array",
+                        "maxItems": 5,
+                        "description": "HTTP(S) GET probes. TCP and HTTP probes are limited to five entries in total; DNS results must satisfy the local/private/link-local policy.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^https?://" },
+                                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 5000 },
+                                "expected_status_min": { "type": "integer", "minimum": 100, "maximum": 599 },
+                                "expected_status_max": { "type": "integer", "minimum": 100, "maximum": 599 }
+                            },
+                            "required": ["url"],
                             "additionalProperties": false
                         }
                     },

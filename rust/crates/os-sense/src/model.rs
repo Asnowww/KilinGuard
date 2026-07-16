@@ -1213,7 +1213,11 @@ pub struct ServiceSnapshot {
     pub problem_units: Vec<ServiceUnit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_analysis: Option<ServiceDependencyAnalysis>,
+    #[serde(default)]
+    pub port_collection: ServicePortCollection,
     pub health_probes: Vec<HealthProbeResult>,
+    #[serde(default)]
+    pub http_probes: Vec<HttpProbeResult>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1318,6 +1322,204 @@ pub struct ServiceProblemEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceProblem {
     pub kind: ServiceProblemKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePortProtocol {
+    Tcp,
+    Tcp6,
+    Udp,
+    Udp6,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePortOwnershipStatus {
+    Owned,
+    Shared,
+    Partial,
+    Unowned,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServicePortBinding {
+    #[serde(default)]
+    pub binding_id: String,
+    #[serde(default)]
+    pub network_namespace: Option<u64>,
+    pub protocol: ServicePortProtocol,
+    pub local_address: String,
+    pub port: u16,
+    pub inode: u64,
+    #[serde(default)]
+    pub pids: Vec<u32>,
+    #[serde(default)]
+    pub pid_total: usize,
+    #[serde(default)]
+    pub omitted_pid_count: usize,
+    #[serde(default)]
+    pub unowned_pids: Vec<u32>,
+    #[serde(default)]
+    pub unowned_pid_total: usize,
+    #[serde(default)]
+    pub omitted_unowned_pid_count: usize,
+    #[serde(default)]
+    pub owner_services: Vec<String>,
+    #[serde(default)]
+    pub owner_service_total: usize,
+    #[serde(default)]
+    pub omitted_owner_service_count: usize,
+    #[serde(default)]
+    pub ownership_complete: bool,
+    #[serde(default)]
+    pub ownership_status: ServicePortOwnershipStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ServicePortCollection {
+    pub requested: bool,
+    pub available: bool,
+    pub status: CollectionStatus,
+    pub complete: bool,
+    pub truncated: bool,
+    pub total_unknown: bool,
+    pub total: usize,
+    pub returned_count: usize,
+    pub omitted_count: usize,
+    pub unowned_count: usize,
+    #[serde(default)]
+    pub unowned_bindings: Vec<ServicePortBinding>,
+    #[serde(default)]
+    pub unowned_returned_count: usize,
+    #[serde(default)]
+    pub unowned_omitted_count: usize,
+    #[serde(default)]
+    pub partial_ownership_count: usize,
+    pub shared_socket_count: usize,
+    pub duplicate_socket_count: usize,
+    pub parse_failure_count: usize,
+    pub permission_denied_count: usize,
+    pub process_disappeared_count: usize,
+    pub scanned_pid_count: usize,
+    pub scanned_fd_count: usize,
+    #[serde(default)]
+    pub scanned_network_namespace_count: usize,
+    #[serde(default)]
+    pub omitted_network_namespace_count: usize,
+    #[serde(default)]
+    pub network_namespace_total_unknown: bool,
+    pub error: Option<String>,
+}
+
+impl Default for ServicePortCollection {
+    fn default() -> Self {
+        Self {
+            requested: false,
+            available: false,
+            status: CollectionStatus::Partial,
+            complete: false,
+            truncated: false,
+            total_unknown: false,
+            total: 0,
+            returned_count: 0,
+            omitted_count: 0,
+            unowned_count: 0,
+            unowned_bindings: Vec::new(),
+            unowned_returned_count: 0,
+            unowned_omitted_count: 0,
+            partial_ownership_count: 0,
+            shared_socket_count: 0,
+            duplicate_socket_count: 0,
+            parse_failure_count: 0,
+            permission_denied_count: 0,
+            process_disappeared_count: 0,
+            scanned_pid_count: 0,
+            scanned_fd_count: 0,
+            scanned_network_namespace_count: 0,
+            omitted_network_namespace_count: 0,
+            network_namespace_total_unknown: false,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpProbeStatus {
+    Healthy,
+    UnexpectedStatus,
+    Failed,
+    TimedOut,
+    PolicyDenied,
+    ResolutionFailed,
+    InvalidTarget,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpProbeStage {
+    Validation,
+    Resolution,
+    Policy,
+    Connect,
+    Tls,
+    Http,
+    Status,
+    Complete,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpProbeErrorKind {
+    InvalidUrl,
+    ResolverUnavailable,
+    ResolutionTimedOut,
+    ResolutionFailed,
+    NoAddresses,
+    PolicyDenied,
+    ConnectFailed,
+    TlsFailed,
+    HttpFailed,
+    UnexpectedStatus,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpProbeResult {
+    pub target: String,
+    pub ok: bool,
+    pub latency_ms: Option<u128>,
+    pub status: HttpProbeStatus,
+    pub stage: HttpProbeStage,
+    pub error_kind: Option<HttpProbeErrorKind>,
+    pub status_code: Option<u16>,
+    pub expected_status_min: u16,
+    pub expected_status_max: u16,
+    #[serde(default)]
+    pub resolution_status: DnsResolutionStatus,
+    #[serde(default)]
+    pub resolution_source: DnsResolutionSource,
+    #[serde(default)]
+    pub resolved_addrs: Vec<String>,
+    #[serde(default)]
+    pub attempted_addrs: Vec<String>,
+    #[serde(default)]
+    pub selected_addr: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_address_count: usize,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1439,6 +1641,18 @@ pub struct ServiceUnit {
     pub dependency_truncated: bool,
     pub ports: Vec<String>,
     #[serde(default)]
+    pub port_bindings: Vec<ServicePortBinding>,
+    #[serde(default)]
+    pub port_binding_total: usize,
+    #[serde(default)]
+    pub port_binding_returned_count: usize,
+    #[serde(default)]
+    pub port_binding_omitted_count: usize,
+    #[serde(default)]
+    pub port_bindings_complete: bool,
+    #[serde(default)]
+    pub port_ownership_status: ServicePortOwnershipStatus,
+    #[serde(default)]
     pub health_status: ServiceHealthStatus,
     #[serde(default)]
     pub problems: Vec<ServiceProblem>,
@@ -1514,6 +1728,18 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             #[serde(default)]
             ports: Vec<String>,
             #[serde(default)]
+            port_bindings: Vec<ServicePortBinding>,
+            #[serde(default)]
+            port_binding_total: Option<usize>,
+            #[serde(default)]
+            port_binding_returned_count: Option<usize>,
+            #[serde(default)]
+            port_binding_omitted_count: Option<usize>,
+            #[serde(default)]
+            port_bindings_complete: Option<bool>,
+            #[serde(default)]
+            port_ownership_status: Option<ServicePortOwnershipStatus>,
+            #[serde(default)]
             health_status: Option<ServiceHealthStatus>,
             #[serde(default)]
             problems: Option<Vec<RawServiceProblem>>,
@@ -1583,6 +1809,13 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             .problem_evidence
             .or(legacy_problem_evidence)
             .or(inferred_problem_evidence);
+        let port_binding_total = raw.port_binding_total.unwrap_or(raw.port_bindings.len());
+        let port_binding_returned_count = raw
+            .port_binding_returned_count
+            .unwrap_or(raw.port_bindings.len());
+        let port_binding_omitted_count = raw
+            .port_binding_omitted_count
+            .unwrap_or_else(|| port_binding_total.saturating_sub(port_binding_returned_count));
 
         Ok(Self {
             name: raw.name,
@@ -1613,6 +1846,12 @@ impl<'de> Deserialize<'de> for ServiceUnit {
             dependency_omitted_count: raw.dependency_omitted_count,
             dependency_truncated: raw.dependency_truncated.unwrap_or(false),
             ports: raw.ports,
+            port_bindings: raw.port_bindings,
+            port_binding_total,
+            port_binding_returned_count,
+            port_binding_omitted_count,
+            port_bindings_complete: raw.port_bindings_complete.unwrap_or(false),
+            port_ownership_status: raw.port_ownership_status.unwrap_or_default(),
             health_status: raw.health_status.unwrap_or(inferred_health_status),
             problems,
             problem_evidence,
@@ -1670,7 +1909,11 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             #[serde(default)]
             dependency_analysis: Option<ServiceDependencyAnalysis>,
             #[serde(default)]
+            port_collection: ServicePortCollection,
+            #[serde(default)]
             health_probes: Vec<HealthProbeResult>,
+            #[serde(default)]
+            http_probes: Vec<HttpProbeResult>,
         }
 
         let raw = RawServiceSnapshot::deserialize(deserializer)?;
@@ -1777,7 +2020,9 @@ impl<'de> Deserialize<'de> for ServiceSnapshot {
             failed_units,
             problem_units,
             dependency_analysis: raw.dependency_analysis,
+            port_collection: raw.port_collection,
             health_probes: raw.health_probes,
+            http_probes: raw.http_probes,
         })
     }
 }
