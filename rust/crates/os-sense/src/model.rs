@@ -903,12 +903,224 @@ pub struct HealthProbeResult {
     pub omitted_address_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+const MAX_LEGACY_FIREWALL_ERROR_CHARS: usize = 256;
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct FirewallStatus {
+    #[serde(default)]
     pub backend: String,
+    #[serde(default)]
     pub available: bool,
-    pub status: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub status: CollectionStatus,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub rule_count: usize,
+    #[serde(default)]
     pub rules_sample: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_rule_count: usize,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<FirewallErrorKind>,
+}
+
+impl<'de> Deserialize<'de> for FirewallStatus {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireStatus {
+            Structured(CollectionStatus),
+            Legacy(String),
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            backend: String,
+            available: bool,
+            active: bool,
+            status: Option<WireStatus>,
+            command: Option<String>,
+            args: Vec<String>,
+            source: String,
+            rule_count: usize,
+            rules_sample: Vec<String>,
+            truncated: bool,
+            omitted_rule_count: usize,
+            exit_code: Option<i32>,
+            timed_out: bool,
+            error: Option<String>,
+            error_kind: Option<FirewallErrorKind>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let mut status = FirewallStatus {
+            backend: wire.backend,
+            available: wire.available,
+            active: wire.active,
+            status: match &wire.status {
+                Some(WireStatus::Structured(status)) => *status,
+                _ => CollectionStatus::default(),
+            },
+            command: wire.command,
+            args: wire.args,
+            source: wire.source,
+            rule_count: wire.rule_count,
+            rules_sample: wire.rules_sample,
+            truncated: wire.truncated,
+            omitted_rule_count: wire.omitted_rule_count,
+            exit_code: wire.exit_code,
+            timed_out: wire.timed_out,
+            error: wire.error,
+            error_kind: wire.error_kind,
+        };
+        let Some(WireStatus::Legacy(legacy)) = wire.status else {
+            normalize_deserialized_firewall_status(&mut status);
+            return Ok(status);
+        };
+        let normalized = legacy.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "running" => {
+                status.status = CollectionStatus::Complete;
+                status.active = true;
+                status.truncated = false;
+                status.timed_out = false;
+                status.error = None;
+                status.error_kind = None;
+            }
+            "not running" => {
+                status.status = CollectionStatus::Complete;
+                status.active = false;
+                status.truncated = false;
+                status.timed_out = false;
+                status.error = Some("firewalld is not running".to_string());
+                status.error_kind = Some(FirewallErrorKind::NotRunning);
+            }
+            "timed out" => {
+                status.status = CollectionStatus::Failed;
+                status.active = false;
+                status.truncated = false;
+                status.timed_out = true;
+                status.error = Some("firewall command timed out".to_string());
+                status.error_kind = Some(FirewallErrorKind::TimedOut);
+            }
+            "ok (output truncated)" | "ok(output truncated)" => {
+                status.status = CollectionStatus::Partial;
+                status.active = !status.rules_sample.is_empty();
+                status.rule_count = status.rule_count.max(status.rules_sample.len());
+                status.truncated = true;
+                status.timed_out = false;
+                status.error = None;
+                status.error_kind = None;
+            }
+            value if !status.available => {
+                status.status = CollectionStatus::Failed;
+                status.active = false;
+                status.error = Some(bounded_legacy_firewall_error(&legacy));
+                status.error_kind = Some(
+                    if value.contains("not found")
+                        || value.contains("no such file")
+                        || value.contains("cannot find")
+                    {
+                        FirewallErrorKind::CommandNotFound
+                    } else if value.contains("permission denied")
+                        || value.contains("operation not permitted")
+                    {
+                        FirewallErrorKind::PermissionDenied
+                    } else {
+                        FirewallErrorKind::CommandFailed
+                    },
+                );
+            }
+            value
+                if value.starts_with("failed")
+                    && (value.contains("permission denied")
+                        || value.contains("operation not permitted")) =>
+            {
+                status.status = CollectionStatus::Failed;
+                status.active = false;
+                status.truncated = false;
+                status.timed_out = false;
+                status.error = Some(bounded_legacy_firewall_error(&legacy));
+                status.error_kind = Some(FirewallErrorKind::PermissionDenied);
+            }
+            value if value.starts_with("failed") => {
+                status.status = CollectionStatus::Failed;
+                status.active = false;
+                status.truncated = false;
+                status.timed_out = false;
+                status.error = Some(bounded_legacy_firewall_error(&legacy));
+                status.error_kind = Some(FirewallErrorKind::CommandFailed);
+            }
+            _ => {
+                status.active = !status.rules_sample.is_empty();
+                if status.active {
+                    status.rule_count = status.rule_count.max(status.rules_sample.len());
+                    status.error_kind = None;
+                } else {
+                    status.rule_count = 0;
+                    status.omitted_rule_count = 0;
+                    status.error_kind = Some(FirewallErrorKind::EmptyRules);
+                }
+                status.status = if status.truncated {
+                    CollectionStatus::Partial
+                } else {
+                    CollectionStatus::Complete
+                };
+                status.timed_out = false;
+                status.error = None;
+            }
+        }
+        normalize_deserialized_firewall_status(&mut status);
+        Ok(status)
+    }
+}
+
+fn bounded_legacy_firewall_error(error: &str) -> String {
+    error
+        .chars()
+        .take(MAX_LEGACY_FIREWALL_ERROR_CHARS)
+        .collect()
+}
+
+fn normalize_deserialized_firewall_status(status: &mut FirewallStatus) {
+    status.rule_count = status.rule_count.max(status.rules_sample.len());
+    status.omitted_rule_count = status
+        .omitted_rule_count
+        .max(status.rule_count.saturating_sub(status.rules_sample.len()));
+    if status.status == CollectionStatus::Failed {
+        status.active = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallErrorKind {
+    CommandNotFound,
+    NotRunning,
+    PermissionDenied,
+    EmptyRules,
+    TimedOut,
+    CommandFailed,
+    InvalidOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

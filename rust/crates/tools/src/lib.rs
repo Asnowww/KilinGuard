@@ -1450,7 +1450,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_network_connections",
-            description: "Collect bounded Kylin Linux network state: active /proc/net connections, default /etc/resolv.conf health, fixed getent ahosts DNS checks, DNS-rebinding-safe local/private TCP reachability probes with a shared deadline, firewall state, and network anomalies.",
+            description: "Collect bounded Kylin Linux network state: active /proc/net connections, default /etc/resolv.conf health, fixed getent ahosts DNS checks, DNS-rebinding-safe local/private TCP reachability probes with a shared deadline, structured firewalld/nftables/iptables+ip6tables status using fixed commands, and network anomalies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1478,7 +1478,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "include_firewall": { "type": "boolean" }
+                    "include_firewall": { "type": "boolean", "description": "Run fixed, bounded firewall-cmd --state/--list-all-zones, nft list ruleset, iptables -S, and ip6tables -S probes. False executes none of these commands." }
                 },
                 "additionalProperties": false
             }),
@@ -1516,7 +1516,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_context_summary",
-            description: "Aggregate OS metrics, processes, logs, network, and services into a structured LLM context with health summary and intent-based dimension cropping.",
+            description: "Aggregate OS metrics, processes, logs, network, and services into a structured LLM context with health summary and intent-based dimension cropping; an explicit firewall intent includes bounded structured firewall status.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -11222,6 +11222,7 @@ printf 'pwsh:%s' "$1"
         assert!(network_spec.description.contains("/etc/resolv.conf"));
         assert!(network_spec.description.contains("getent ahosts"));
         assert!(network_spec.description.contains("DNS-rebinding-safe"));
+        assert!(network_spec.description.contains("iptables+ip6tables"));
         assert_eq!(
             network_spec.input_schema["properties"]["dns_names"]["maxItems"],
             8
@@ -11238,6 +11239,11 @@ printf 'pwsh:%s' "$1"
             network_spec.input_schema["properties"]["tcp_probes"]["items"]["properties"]
                 ["timeout_ms"]["maximum"],
             3000
+        );
+        assert!(
+            network_spec.input_schema["properties"]["include_firewall"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("ip6tables -S"))
         );
     }
 

@@ -70,6 +70,7 @@ pub(crate) fn collect_context_with(
     let network = if include_network {
         Some(collect_network(&NetworkQuery {
             limit: Some(100),
+            include_firewall: intent_requests_firewall(request.intent.as_deref()),
             ..NetworkQuery::default()
         })?)
     } else {
@@ -242,6 +243,10 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn intent_requests_firewall(intent: Option<&str>) -> bool {
+    intent.is_some_and(|intent| intent.to_ascii_lowercase().contains("firewall"))
+}
+
 fn build_health_summary(
     metrics: Option<&crate::model::MetricSnapshot>,
     processes: Option<&crate::model::ProcessList>,
@@ -300,8 +305,41 @@ fn build_health_summary(
         } else {
             String::new()
         };
+        let firewall = if network.firewall.is_empty() {
+            "firewall not collected".to_string()
+        } else {
+            let active = network
+                .firewall
+                .iter()
+                .filter(|status| status.active)
+                .count();
+            let partial = network
+                .firewall
+                .iter()
+                .filter(|status| status.status == crate::model::CollectionStatus::Partial)
+                .count();
+            let failed = network
+                .firewall
+                .iter()
+                .filter(|status| status.status == crate::model::CollectionStatus::Failed)
+                .count();
+            let rule_count = network.firewall.iter().fold(0usize, |total, status| {
+                total.saturating_add(status.rule_count)
+            });
+            let truncated = network
+                .firewall
+                .iter()
+                .filter(|status| status.truncated)
+                .count();
+            let omitted_rules = network.firewall.iter().fold(0usize, |total, status| {
+                total.saturating_add(status.omitted_rule_count)
+            });
+            format!(
+                "firewall {active} active, {partial} partial, {failed} failed, {rule_count} rules, {truncated} truncated backend(s), {omitted_rules} omitted rule(s)"
+            )
+        };
         parts.push(format!(
-            "network: {} matched connections ({} returned), {} anomalies{}, {:?}; DNS resolver {:?} with {} nameserver(s), {} DNS check(s), {} TCP probe(s)",
+            "network: {} matched connections ({} returned), {} anomalies{}, {:?}; DNS resolver {:?} with {} nameserver(s), {} DNS check(s), {} TCP probe(s); {firewall}",
             network.total,
             network.connections.len(),
             network.anomaly_total,
@@ -334,6 +372,8 @@ mod tests {
     fn crops_dimensions_by_network_intent() {
         let dims = dimensions_for_intent(Some("check dns and firewall"));
         assert_eq!(dims, vec!["network"]);
+        assert!(intent_requests_firewall(Some("check FIREWALL status")));
+        assert!(!intent_requests_firewall(Some("check dns")));
     }
 
     #[test]
@@ -356,7 +396,31 @@ mod tests {
             dns_resolver: crate::model::DnsResolverStatus::default(),
             dns_checks: Vec::new(),
             tcp_probes: Vec::new(),
-            firewall: Vec::new(),
+            firewall: vec![
+                crate::model::FirewallStatus {
+                    backend: "firewalld".to_string(),
+                    available: true,
+                    active: true,
+                    status: crate::model::CollectionStatus::Complete,
+                    rule_count: 5,
+                    ..crate::model::FirewallStatus::default()
+                },
+                crate::model::FirewallStatus {
+                    backend: "nftables".to_string(),
+                    available: true,
+                    active: false,
+                    status: crate::model::CollectionStatus::Partial,
+                    rule_count: 7,
+                    truncated: true,
+                    omitted_rule_count: 4,
+                    ..crate::model::FirewallStatus::default()
+                },
+                crate::model::FirewallStatus {
+                    backend: "iptables".to_string(),
+                    status: crate::model::CollectionStatus::Failed,
+                    ..crate::model::FirewallStatus::default()
+                },
+            ],
             anomalies: Vec::new(),
             anomaly_total: 35,
             anomalies_truncated: true,
@@ -365,5 +429,8 @@ mod tests {
         let summary = build_health_summary(None, None, None, Some(&network), None, 0);
         assert!(summary.contains("35 anomalies (3 omitted from returned details)"));
         assert!(summary.contains("DNS resolver Partial with 0 nameserver(s)"));
+        assert!(summary.contains(
+            "firewall 1 active, 1 partial, 1 failed, 12 rules, 1 truncated backend(s), 4 omitted rule(s)"
+        ));
     }
 }

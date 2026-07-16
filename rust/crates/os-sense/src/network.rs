@@ -13,11 +13,12 @@ use crate::command::{run_limited_command, LimitedCommandOutput};
 use crate::error::{OsSenseError, Result};
 use crate::model::{
     CollectionStatus, DnsCheck, DnsResolutionSource, DnsResolutionStatus, DnsResolverStatus,
-    FirewallStatus, HealthProbeResult, NetworkAnomaly, NetworkAnomalyEvidence, NetworkBaseline,
-    NetworkBaselineEntry, NetworkConnection, NetworkSnapshot, NetworkSourceStatus,
+    FirewallErrorKind, FirewallStatus, HealthProbeResult, NetworkAnomaly, NetworkAnomalyEvidence,
+    NetworkBaseline, NetworkBaselineEntry, NetworkConnection, NetworkSnapshot, NetworkSourceStatus,
     TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus,
 };
 use crate::procfs::basic_meta;
+use crate::redaction::redact_sensitive_text;
 
 const DEFAULT_CONNECTION_LIMIT: usize = 200;
 const MAX_CONNECTION_LIMIT: usize = 1000;
@@ -34,6 +35,11 @@ const MAX_RESOLV_NAMESERVERS: usize = 3;
 const MAX_RESOLV_SEARCH_DOMAINS: usize = 6;
 const MAX_RESOLV_OPTIONS: usize = 16;
 const MAX_RESOLV_OPTION_CHARS: usize = 64;
+const MAX_FIREWALL_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_FIREWALL_STDERR_BYTES: usize = 8 * 1024;
+const MAX_FIREWALL_OUTPUT_LINES: usize = 2_048;
+const MAX_FIREWALL_RULE_SAMPLES: usize = 32;
+const MAX_FIREWALL_RULE_CHARS: usize = 256;
 const MAX_NETWORK_WARNINGS: usize = 32;
 const MAX_NETWORK_ERROR_CHARS: usize = 256;
 const MAX_PROC_NET_BYTES_PER_SOURCE: usize = 512 * 1024;
@@ -274,6 +280,7 @@ pub fn collect_network(query: &NetworkQuery) -> Result<NetworkSnapshot> {
         &SystemDnsResolver,
         &SystemTcpConnector,
         &clock,
+        &SystemFirewallCommandRunner,
     )
 }
 
@@ -290,6 +297,7 @@ fn collect_network_with_reader(
         &SystemDnsResolver,
         &SystemTcpConnector,
         &clock,
+        &SystemFirewallCommandRunner,
     )
 }
 
@@ -301,6 +309,7 @@ fn collect_network_with_components(
     dns_resolver: &dyn DnsResolver,
     tcp_connector: &dyn TcpConnector,
     clock: &dyn ProbeClock,
+    firewall_runner: &dyn FirewallCommandRunner,
 ) -> Result<NetworkSnapshot> {
     query.validate()?;
     let filter = ValidatedNetworkFilter::from_query(query)?;
@@ -327,7 +336,7 @@ fn collect_network_with_components(
     let filter_complete = relevant_source_statuses
         .clone()
         .all(|status| status.status == CollectionStatus::Complete);
-    let collection_status =
+    let mut collection_status =
         if relevant_source_statuses.all(|status| status.status == CollectionStatus::Failed) {
             CollectionStatus::Failed
         } else if filter_complete {
@@ -355,10 +364,18 @@ fn collect_network_with_components(
         || dns_checks.iter().any(|check| check.truncated)
         || tcp_probes.iter().any(|probe| probe.truncated);
     let firewall = if query.include_firewall {
-        collect_firewall_status()
+        collect_firewall_status(firewall_runner)
     } else {
         Vec::new()
     };
+    if collection_status != CollectionStatus::Failed
+        && firewall
+            .iter()
+            .any(|status| status.status != CollectionStatus::Complete)
+    {
+        collection_status = CollectionStatus::Partial;
+    }
+    truncated |= firewall.iter().any(|status| status.truncated);
     let mut meta = basic_meta("network", warnings);
     if meta.warnings.len() > MAX_NETWORK_WARNINGS {
         omitted_warning_count = omitted_warning_count
@@ -1613,49 +1630,692 @@ fn finish_probe_timeout(
     result
 }
 
-fn collect_firewall_status() -> Vec<FirewallStatus> {
+trait FirewallCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> io::Result<LimitedCommandOutput>;
+}
+
+struct SystemFirewallCommandRunner;
+
+impl FirewallCommandRunner for SystemFirewallCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> io::Result<LimitedCommandOutput> {
+        run_limited_command(program, args, timeout, stdout_limit, stderr_limit)
+    }
+}
+
+#[derive(Default)]
+struct FirewallRuleAccumulator {
+    rule_count: usize,
+    rules_sample: Vec<String>,
+    truncated: bool,
+    invalid_output: bool,
+}
+
+impl FirewallRuleAccumulator {
+    fn observe_output(&mut self, output: &LimitedCommandOutput) {
+        self.truncated |= output.stdout_truncated || output.stderr_truncated;
+        self.invalid_output |= output.stdout.contains('\u{fffd}');
+    }
+
+    fn push_rule(&mut self, source: Option<&str>, raw: &str) {
+        let prefixed = source.map_or_else(|| raw.to_string(), |source| format!("{source}: {raw}"));
+        let (line, invalid) = sanitize_firewall_rule(&prefixed);
+        self.invalid_output |= invalid;
+        self.rule_count = self.rule_count.saturating_add(1);
+        if self.rules_sample.len() < MAX_FIREWALL_RULE_SAMPLES {
+            self.rules_sample.push(line);
+        }
+    }
+
+    fn apply(self, status: &mut FirewallStatus) {
+        status.rule_count = self.rule_count;
+        status.rules_sample = self.rules_sample;
+        status.omitted_rule_count = status.rule_count.saturating_sub(status.rules_sample.len());
+        status.truncated |= self.truncated;
+        if self.invalid_output && status.error_kind.is_none() {
+            status.error_kind = Some(FirewallErrorKind::InvalidOutput);
+            status.error = Some("firewall command output contained invalid text".to_string());
+        }
+    }
+}
+
+fn collect_firewall_status(runner: &dyn FirewallCommandRunner) -> Vec<FirewallStatus> {
     vec![
-        run_firewall_command("firewalld", "firewall-cmd", &["--state"]),
-        run_firewall_command("nftables", "nft", &["list", "ruleset"]),
-        run_firewall_command("iptables", "iptables", &["-S"]),
+        collect_firewalld_status(runner),
+        collect_nftables_status(runner),
+        collect_iptables_status(runner),
     ]
 }
 
-fn run_firewall_command(backend: &str, command: &str, args: &[&str]) -> FirewallStatus {
-    match run_limited_command(command, args, COMMAND_TIMEOUT, 64 * 1024, 16 * 1024) {
-        Ok(output) if output.success => FirewallStatus {
-            backend: backend.to_string(),
-            available: true,
-            status: if output.stdout_truncated {
-                "ok (output truncated)".to_string()
-            } else {
-                output
-                    .stdout
-                    .lines()
-                    .next()
-                    .unwrap_or("ok")
-                    .trim()
-                    .to_string()
-            },
-            rules_sample: output.stdout.lines().take(20).map(str::to_string).collect(),
-        },
-        Ok(output) => FirewallStatus {
-            backend: backend.to_string(),
-            available: true,
-            status: if output.timed_out {
-                "timed out".to_string()
-            } else {
-                format!("failed: {}", output.stderr.trim())
-            },
-            rules_sample: Vec::new(),
-        },
-        Err(error) => FirewallStatus {
-            backend: backend.to_string(),
-            available: false,
-            status: error.to_string(),
-            rules_sample: Vec::new(),
-        },
+fn collect_firewalld_status(runner: &dyn FirewallCommandRunner) -> FirewallStatus {
+    let mut status = firewall_status(
+        "firewalld",
+        Some("firewall-cmd"),
+        &["--state"],
+        "firewall-cmd",
+    );
+    let state_output = match run_firewall_command(runner, "firewall-cmd", &["--state"]) {
+        Ok(output) => output,
+        Err(error) => {
+            apply_firewall_io_failure(&mut status, "firewall-cmd --state", &error);
+            return status;
+        }
+    };
+    status.available = true;
+    status.exit_code = state_output.exit_code;
+    status.timed_out = state_output.timed_out;
+    status.truncated = state_output.stdout_truncated || state_output.stderr_truncated;
+    if state_output.timed_out {
+        apply_firewall_output_failure(&mut status, "firewall-cmd --state", &state_output);
+        return status;
     }
+    let state_text =
+        format!("{}\n{}", state_output.stdout, state_output.stderr).to_ascii_lowercase();
+    if state_text.contains("not running") {
+        status.active = false;
+        status.status = if status.truncated {
+            CollectionStatus::Partial
+        } else {
+            CollectionStatus::Complete
+        };
+        status.error_kind = Some(FirewallErrorKind::NotRunning);
+        status.error = Some("firewalld is not running".to_string());
+        return status;
+    }
+    if !state_output.success {
+        apply_firewall_output_failure(&mut status, "firewall-cmd --state", &state_output);
+        return status;
+    }
+    if state_output.stdout.trim() != "running" {
+        status.status = CollectionStatus::Partial;
+        status.error_kind = Some(FirewallErrorKind::InvalidOutput);
+        status.error = Some("firewall-cmd --state returned an unrecognized state".to_string());
+        return status;
+    }
+
+    status.active = true;
+    status.args.push("--list-all-zones".to_string());
+    let zones_output = match run_firewall_command(runner, "firewall-cmd", &["--list-all-zones"]) {
+        Ok(output) => output,
+        Err(error) => {
+            apply_firewall_io_failure(&mut status, "firewall-cmd --list-all-zones", &error);
+            status.status = CollectionStatus::Partial;
+            return status;
+        }
+    };
+    status.exit_code = zones_output.exit_code;
+    status.timed_out |= zones_output.timed_out;
+    status.truncated |= zones_output.stdout_truncated || zones_output.stderr_truncated;
+    if zones_output.timed_out || !zones_output.success {
+        apply_firewall_output_failure(&mut status, "firewall-cmd --list-all-zones", &zones_output);
+        status.status = CollectionStatus::Partial;
+        return status;
+    }
+
+    let mut rules = FirewallRuleAccumulator::default();
+    rules.observe_output(&zones_output);
+    parse_firewalld_rules(&zones_output.stdout, &mut rules);
+    rules.apply(&mut status);
+    finalize_successful_firewall_status(&mut status);
+    status
+}
+
+fn collect_nftables_status(runner: &dyn FirewallCommandRunner) -> FirewallStatus {
+    let mut status = firewall_status(
+        "nftables",
+        Some("nft"),
+        &["list", "ruleset"],
+        "nft list ruleset",
+    );
+    let output = match run_firewall_command(runner, "nft", &["list", "ruleset"]) {
+        Ok(output) => output,
+        Err(error) => {
+            apply_firewall_io_failure(&mut status, "nft list ruleset", &error);
+            return status;
+        }
+    };
+    status.available = true;
+    status.exit_code = output.exit_code;
+    status.timed_out = output.timed_out;
+    status.truncated = output.stdout_truncated || output.stderr_truncated;
+    if output.timed_out || !output.success {
+        apply_firewall_output_failure(&mut status, "nft list ruleset", &output);
+        return status;
+    }
+
+    let mut rules = FirewallRuleAccumulator::default();
+    rules.observe_output(&output);
+    parse_nftables_rules(&output.stdout, &mut rules);
+    rules.apply(&mut status);
+    status.active = status.rule_count > 0;
+    finalize_successful_firewall_status(&mut status);
+    status
+}
+
+fn collect_iptables_status(runner: &dyn FirewallCommandRunner) -> FirewallStatus {
+    let mut status = firewall_status("iptables", None, &[], "iptables -S; ip6tables -S");
+    let mut rules = FirewallRuleAccumulator::default();
+    let mut success_count = 0usize;
+    let mut output_exit_codes = Vec::new();
+    let mut errors = Vec::new();
+
+    for (source, command) in [("iptables", "iptables"), ("ip6tables", "ip6tables")] {
+        match run_firewall_command(runner, command, &["-S"]) {
+            Ok(output) => {
+                status.available = true;
+                status.timed_out |= output.timed_out;
+                status.truncated |= output.stdout_truncated || output.stderr_truncated;
+                output_exit_codes.push(output.exit_code);
+                if output.timed_out || !output.success {
+                    let (kind, error) = firewall_output_failure(source, &output);
+                    merge_firewall_error_kind(&mut status.error_kind, kind);
+                    errors.push(error);
+                } else {
+                    success_count = success_count.saturating_add(1);
+                    rules.observe_output(&output);
+                    parse_iptables_rules(source, &output.stdout, &mut rules);
+                }
+            }
+            Err(error) => {
+                let (available, timed_out, kind, error) = firewall_io_failure(source, &error);
+                status.available |= available;
+                status.timed_out |= timed_out;
+                merge_firewall_error_kind(&mut status.error_kind, kind);
+                errors.push(error);
+            }
+        }
+    }
+
+    status.exit_code = aggregate_firewall_exit_code(&output_exit_codes);
+    rules.apply(&mut status);
+    status.active = status.rule_count > 0;
+    if success_count == 0 {
+        status.status = CollectionStatus::Failed;
+    } else if success_count < 2 || status.truncated || status.error_kind.is_some() {
+        status.status = CollectionStatus::Partial;
+    } else {
+        status.status = CollectionStatus::Complete;
+    }
+    if !errors.is_empty() {
+        status.error = Some(bounded_firewall_error(&errors.join("; ")));
+    } else if status.rule_count == 0 {
+        status.error_kind = Some(FirewallErrorKind::EmptyRules);
+    }
+    status
+}
+
+fn firewall_status(
+    backend: &str,
+    command: Option<&str>,
+    args: &[&str],
+    source: &str,
+) -> FirewallStatus {
+    FirewallStatus {
+        backend: backend.to_string(),
+        command: command.map(str::to_string),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        source: source.to_string(),
+        ..FirewallStatus::default()
+    }
+}
+
+fn run_firewall_command(
+    runner: &dyn FirewallCommandRunner,
+    command: &str,
+    args: &[&str],
+) -> io::Result<LimitedCommandOutput> {
+    runner.run(
+        command,
+        args,
+        COMMAND_TIMEOUT,
+        MAX_FIREWALL_STDOUT_BYTES,
+        MAX_FIREWALL_STDERR_BYTES,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FirewalldRuleSection {
+    ForwardPorts,
+    SourcePorts,
+    RichRules,
+}
+
+fn parse_firewalld_rules(output: &str, rules: &mut FirewallRuleAccumulator) {
+    let mut in_zone = false;
+    let mut section = None;
+    for (index, raw) in output.lines().enumerate() {
+        if index >= MAX_FIREWALL_OUTPUT_LINES {
+            rules.truncated = true;
+            break;
+        }
+        if firewall_line_has_invalid_text(raw) {
+            rules.invalid_output = true;
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let indent = raw.len().saturating_sub(raw.trim_start().len());
+        if indent == 0 {
+            if !is_firewalld_zone_header(line) {
+                rules.invalid_output = true;
+            }
+            in_zone = true;
+            section = None;
+            continue;
+        }
+        if !in_zone || raw[..indent].contains('\t') {
+            rules.invalid_output = true;
+            continue;
+        }
+        if indent >= 4 {
+            match section {
+                Some(FirewalldRuleSection::ForwardPorts) if is_firewalld_port_mapping(line) => {
+                    rules.push_rule(None, &format!("forward-ports: {line}"));
+                }
+                Some(FirewalldRuleSection::SourcePorts) if is_firewalld_source_port(line) => {
+                    rules.push_rule(None, &format!("source-ports: {line}"));
+                }
+                Some(FirewalldRuleSection::RichRules) if line.starts_with("rule ") => {
+                    rules.push_rule(None, line);
+                }
+                _ => rules.invalid_output = true,
+            }
+            continue;
+        }
+        if indent != 2 {
+            rules.invalid_output = true;
+            continue;
+        }
+        section = None;
+        let Some((key, value)) = line.split_once(':') else {
+            rules.invalid_output = true;
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "target" | "interfaces" | "sources" | "icmp-block-inversion" => {}
+            "services" | "ports" | "protocols" | "icmp-blocks" => {
+                for item in value.split_whitespace() {
+                    rules.push_rule(None, &format!("{key}: {item}"));
+                }
+            }
+            "forward" | "masquerade" => match value {
+                "yes" => rules.push_rule(None, line),
+                "no" => {}
+                _ => rules.invalid_output = true,
+            },
+            "forward-ports" => {
+                section = Some(FirewalldRuleSection::ForwardPorts);
+                for item in value.split_whitespace() {
+                    if is_firewalld_port_mapping(item) {
+                        rules.push_rule(None, &format!("forward-ports: {item}"));
+                    } else {
+                        rules.invalid_output = true;
+                    }
+                }
+            }
+            "source-ports" => {
+                section = Some(FirewalldRuleSection::SourcePorts);
+                for item in value.split_whitespace() {
+                    if is_firewalld_source_port(item) {
+                        rules.push_rule(None, &format!("source-ports: {item}"));
+                    } else {
+                        rules.invalid_output = true;
+                    }
+                }
+            }
+            "rich rules" if value.is_empty() => {
+                section = Some(FirewalldRuleSection::RichRules);
+            }
+            "rich rules" => rules.invalid_output = true,
+            _ => rules.invalid_output = true,
+        }
+    }
+}
+
+fn is_firewalld_zone_header(line: &str) -> bool {
+    let name = line.strip_suffix(" (active)").unwrap_or(line);
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn is_firewalld_port_mapping(line: &str) -> bool {
+    line.starts_with("port=") && line.contains(":proto=")
+}
+
+fn is_firewalld_source_port(line: &str) -> bool {
+    let Some((port, protocol)) = line.split_once('/') else {
+        return false;
+    };
+    !port.is_empty()
+        && !protocol.is_empty()
+        && port
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        && protocol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+#[derive(Clone, Copy)]
+enum NftBlockKind {
+    Table,
+    Chain,
+    Structure,
+}
+
+#[derive(Clone, Copy)]
+struct NftBlock {
+    kind: NftBlockKind,
+    base_depth: usize,
+}
+
+fn parse_nftables_rules(output: &str, rules: &mut FirewallRuleAccumulator) {
+    let mut blocks: Vec<NftBlock> = Vec::new();
+    let mut brace_depth = 0usize;
+    for (index, raw) in output.lines().enumerate() {
+        if index >= MAX_FIREWALL_OUTPUT_LINES {
+            rules.truncated = true;
+            break;
+        }
+        if firewall_line_has_invalid_text(raw) {
+            rules.invalid_output = true;
+        }
+        let line = strip_nft_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let closing_only = line.chars().all(|character| matches!(character, '}' | ';'));
+        let current = blocks.last().map(|block| block.kind);
+        let declaration = match current {
+            None if is_nft_declaration(line, "table") => Some(NftBlockKind::Table),
+            Some(NftBlockKind::Table) if is_nft_declaration(line, "chain") => {
+                Some(NftBlockKind::Chain)
+            }
+            Some(NftBlockKind::Table)
+                if ["set", "map", "flowtable"]
+                    .iter()
+                    .any(|kind| is_nft_declaration(line, kind)) =>
+            {
+                Some(NftBlockKind::Structure)
+            }
+            _ => None,
+        };
+        if !closing_only && declaration.is_none() {
+            match current {
+                Some(NftBlockKind::Chain) if is_nft_base_chain_declaration(line) => {
+                    if !is_valid_nft_base_chain_declaration(line) {
+                        rules.invalid_output = true;
+                    } else if nft_line_has_policy(line) {
+                        rules.push_rule(None, line);
+                    }
+                }
+                Some(NftBlockKind::Chain) => rules.push_rule(None, line),
+                Some(NftBlockKind::Structure) => {}
+                _ => rules.invalid_output = true,
+            }
+        }
+
+        let (opens, closes) = nft_brace_counts(line);
+        if closes > brace_depth.saturating_add(opens) {
+            rules.invalid_output = true;
+            brace_depth = 0;
+            blocks.clear();
+            continue;
+        }
+        let base_depth = brace_depth;
+        brace_depth = brace_depth.saturating_add(opens).saturating_sub(closes);
+        if let Some(kind) = declaration {
+            if opens == 0 {
+                rules.invalid_output = true;
+            } else if brace_depth > base_depth {
+                blocks.push(NftBlock { kind, base_depth });
+            }
+        }
+        while blocks
+            .last()
+            .is_some_and(|block| brace_depth <= block.base_depth)
+        {
+            blocks.pop();
+        }
+    }
+    if !rules.truncated && (brace_depth != 0 || !blocks.is_empty()) {
+        rules.invalid_output = true;
+    }
+}
+
+fn strip_nft_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn is_nft_declaration(line: &str, kind: &str) -> bool {
+    let declaration = line.trim_end_matches([' ', '\t', '{']).trim_end();
+    let mut fields = declaration.split_whitespace();
+    fields.next() == Some(kind) && fields.next().is_some() && line.trim_end().ends_with('{')
+}
+
+fn is_nft_base_chain_declaration(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("type ") || line.starts_with("policy ")
+}
+
+fn is_valid_nft_base_chain_declaration(line: &str) -> bool {
+    let line = line.trim();
+    let policy_mentioned = line
+        .split_whitespace()
+        .any(|field| field.trim_end_matches(';') == "policy");
+    if line.starts_with("policy ") {
+        return nft_line_has_policy(line);
+    }
+    line.starts_with("type ")
+        && line.split_whitespace().any(|field| field == "hook")
+        && line.split_whitespace().any(|field| field == "priority")
+        && (!policy_mentioned || nft_line_has_policy(line))
+}
+
+fn nft_line_has_policy(line: &str) -> bool {
+    line.split(';').any(|statement| {
+        let mut fields = statement.split_whitespace();
+        fields.next() == Some("policy") && fields.next().is_some() && fields.next().is_none()
+    })
+}
+
+fn nft_brace_counts(line: &str) -> (usize, usize) {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    for character in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '{' if !quoted => opens = opens.saturating_add(1),
+            '}' if !quoted => closes = closes.saturating_add(1),
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
+fn parse_iptables_rules(source: &str, output: &str, rules: &mut FirewallRuleAccumulator) {
+    for (index, raw) in output.lines().enumerate() {
+        if index >= MAX_FIREWALL_OUTPUT_LINES {
+            rules.truncated = true;
+            break;
+        }
+        let line = raw.trim();
+        if line.starts_with("-P ") || line.starts_with("-A ") {
+            rules.push_rule(Some(source), line);
+        } else if line.starts_with("-N ") || line.is_empty() {
+        } else {
+            rules.invalid_output = true;
+        }
+    }
+}
+
+fn firewall_line_has_invalid_text(raw: &str) -> bool {
+    raw.chars()
+        .any(|character| character == '\u{fffd}' || (character.is_control() && character != '\t'))
+}
+
+fn sanitize_firewall_rule(raw: &str) -> (String, bool) {
+    let mut invalid = false;
+    let cleaned = raw
+        .chars()
+        .map(|character| {
+            if character == '\u{fffd}' || (character.is_control() && character != '\t') {
+                invalid = true;
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let redaction_limit = MAX_FIREWALL_RULE_CHARS.saturating_sub(16);
+    let redacted = redact_sensitive_text(cleaned.trim(), redaction_limit);
+    (
+        redacted.chars().take(MAX_FIREWALL_RULE_CHARS).collect(),
+        invalid,
+    )
+}
+
+fn finalize_successful_firewall_status(status: &mut FirewallStatus) {
+    if status.error_kind == Some(FirewallErrorKind::InvalidOutput) || status.truncated {
+        status.status = CollectionStatus::Partial;
+    } else {
+        status.status = CollectionStatus::Complete;
+    }
+    if status.rule_count == 0 && status.error_kind.is_none() {
+        status.error_kind = Some(FirewallErrorKind::EmptyRules);
+    }
+}
+
+fn apply_firewall_io_failure(status: &mut FirewallStatus, source: &str, error: &io::Error) {
+    let (available, timed_out, kind, error) = firewall_io_failure(source, error);
+    status.available |= available;
+    status.timed_out |= timed_out;
+    status.status = CollectionStatus::Failed;
+    status.error_kind = Some(kind);
+    status.error = Some(error);
+}
+
+fn firewall_io_failure(source: &str, error: &io::Error) -> (bool, bool, FirewallErrorKind, String) {
+    let (available, timed_out, kind) = match error.kind() {
+        io::ErrorKind::NotFound => (false, false, FirewallErrorKind::CommandNotFound),
+        io::ErrorKind::PermissionDenied => (true, false, FirewallErrorKind::PermissionDenied),
+        io::ErrorKind::TimedOut => (true, true, FirewallErrorKind::TimedOut),
+        _ => (false, false, FirewallErrorKind::CommandFailed),
+    };
+    (
+        available,
+        timed_out,
+        kind,
+        bounded_firewall_error(&format!("{source}: {error}")),
+    )
+}
+
+fn apply_firewall_output_failure(
+    status: &mut FirewallStatus,
+    source: &str,
+    output: &LimitedCommandOutput,
+) {
+    let (kind, error) = firewall_output_failure(source, output);
+    status.available = true;
+    status.timed_out |= output.timed_out;
+    status.truncated |= output.stdout_truncated || output.stderr_truncated;
+    status.exit_code = output.exit_code;
+    status.status = CollectionStatus::Failed;
+    status.error_kind = Some(kind);
+    status.error = Some(error);
+}
+
+fn firewall_output_failure(
+    source: &str,
+    output: &LimitedCommandOutput,
+) -> (FirewallErrorKind, String) {
+    let detail = format!("{}\n{}", output.stderr, output.stdout);
+    let lower = detail.to_ascii_lowercase();
+    let kind = if output.timed_out {
+        FirewallErrorKind::TimedOut
+    } else if lower.contains("permission denied") || lower.contains("operation not permitted") {
+        FirewallErrorKind::PermissionDenied
+    } else {
+        FirewallErrorKind::CommandFailed
+    };
+    let detail = detail.trim();
+    let error = if output.timed_out {
+        format!("{source}: command timed out")
+    } else if detail.is_empty() {
+        format!("{source}: command failed")
+    } else {
+        format!("{source}: {detail}")
+    };
+    (kind, bounded_firewall_error(&error))
+}
+
+fn merge_firewall_error_kind(
+    current: &mut Option<FirewallErrorKind>,
+    candidate: FirewallErrorKind,
+) {
+    let priority = |kind: FirewallErrorKind| match kind {
+        FirewallErrorKind::TimedOut => 7,
+        FirewallErrorKind::PermissionDenied => 6,
+        FirewallErrorKind::CommandFailed => 5,
+        FirewallErrorKind::CommandNotFound => 4,
+        FirewallErrorKind::InvalidOutput => 3,
+        FirewallErrorKind::NotRunning => 2,
+        FirewallErrorKind::EmptyRules => 1,
+    };
+    if current.is_none_or(|kind| priority(candidate) > priority(kind)) {
+        *current = Some(candidate);
+    }
+}
+
+fn aggregate_firewall_exit_code(codes: &[Option<i32>]) -> Option<i32> {
+    codes
+        .iter()
+        .flatten()
+        .copied()
+        .find(|code| *code != 0)
+        .or_else(|| codes.iter().flatten().copied().next())
+}
+
+fn bounded_firewall_error(error: &str) -> String {
+    let redacted = redact_sensitive_text(error, MAX_NETWORK_ERROR_CHARS.saturating_sub(16));
+    bounded_network_error(&redacted)
 }
 
 fn probe_ip_allowed(address: IpAddr) -> bool {
@@ -2151,6 +2811,69 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FirewallCommandCall {
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    }
+
+    struct FixtureFirewallStep {
+        program: String,
+        args: Vec<String>,
+        result: std::result::Result<LimitedCommandOutput, ErrorKind>,
+    }
+
+    struct FixtureFirewallCommandRunner {
+        steps: RefCell<VecDeque<FixtureFirewallStep>>,
+        calls: RefCell<Vec<FirewallCommandCall>>,
+    }
+
+    impl FixtureFirewallCommandRunner {
+        fn new(steps: Vec<FixtureFirewallStep>) -> Self {
+            Self {
+                steps: RefCell::new(VecDeque::from(steps)),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn assert_finished(&self) {
+            assert!(
+                self.steps.borrow().is_empty(),
+                "unused firewall fixture steps"
+            );
+        }
+    }
+
+    impl FirewallCommandRunner for FixtureFirewallCommandRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            timeout: Duration,
+            stdout_limit: usize,
+            stderr_limit: usize,
+        ) -> io::Result<LimitedCommandOutput> {
+            self.calls.borrow_mut().push(FirewallCommandCall {
+                program: program.to_string(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                timeout,
+                stdout_limit,
+                stderr_limit,
+            });
+            let step = self
+                .steps
+                .borrow_mut()
+                .pop_front()
+                .expect("fixture firewall command step");
+            assert_eq!(program, step.program);
+            assert_eq!(args, step.args);
+            step.result.map_err(io::Error::from)
+        }
+    }
+
     #[derive(Default)]
     struct FixtureProbeClock {
         elapsed_ms: Cell<u64>,
@@ -2272,6 +2995,18 @@ mod tests {
         }
     }
 
+    fn firewall_step(
+        program: &str,
+        args: &[&str],
+        result: std::result::Result<LimitedCommandOutput, ErrorKind>,
+    ) -> FixtureFirewallStep {
+        FixtureFirewallStep {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            result,
+        }
+    }
+
     fn resolved_fixture(addresses: &[&str]) -> DnsResolution {
         DnsResolution {
             addresses: addresses
@@ -2361,6 +3096,798 @@ mod tests {
             port_start: port,
             port_end: port,
         }
+    }
+
+    #[test]
+    fn firewall_collects_three_coexisting_backends_with_realistic_rules() {
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step(
+                "firewall-cmd",
+                &["--state"],
+                Ok(dns_command_output(true, "running\n", "")),
+            ),
+            firewall_step(
+                "firewall-cmd",
+                &["--list-all-zones"],
+                Ok(dns_command_output(
+                    true,
+                    concat!(
+                        "public (active)\n",
+                        "  target: default\n",
+                        "  interfaces: eth0\n",
+                        "  sources: 10.0.0.0/8\n",
+                        "  services: ssh dhcpv6-client\n",
+                        "  ports: 8443/tcp\n",
+                        "  protocols: icmp\n",
+                        "  forward: yes\n",
+                        "  masquerade: yes\n",
+                        "  forward-ports:\n",
+                        "    port=80:proto=tcp:toport=8080:toaddr=10.0.0.2\n",
+                        "  source-ports: 5353/udp\n",
+                        "  icmp-blocks: echo-request echo-reply\n",
+                        "  rich rules:\n",
+                        "    rule family=\"ipv4\" source address=\"10.0.0.0/8\" accept\n",
+                        "    rule family=\"ipv6\" service name=\"ssh\" accept\n",
+                    ),
+                    "",
+                )),
+            ),
+            firewall_step(
+                "nft",
+                &["list", "ruleset"],
+                Ok(dns_command_output(
+                    true,
+                    concat!(
+                        "table inet filter {\n",
+                        "  set blocked {\n",
+                        "    type ipv4_addr\n",
+                        "    elements = { 192.0.2.1, 192.0.2.2 }\n",
+                        "  }\n",
+                        "  map verdicts {\n",
+                        "    type ipv4_addr : verdict\n",
+                        "  }\n",
+                        "  flowtable fastpath {\n",
+                        "    hook ingress priority filter\n",
+                        "    devices = { eth0 }\n",
+                        "  }\n",
+                        "  chain input {\n",
+                        "    type filter hook input priority filter; policy drop;\n",
+                        "    # generated comment\n",
+                        "    ct state established,related accept\n",
+                        "  }\n",
+                        "}\n",
+                    ),
+                    "",
+                )),
+            ),
+            firewall_step(
+                "iptables",
+                &["-S"],
+                Ok(dns_command_output(
+                    true,
+                    concat!(
+                        "-P INPUT DROP\n",
+                        "-N CUSTOM\n",
+                        "-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n",
+                        "-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n",
+                    ),
+                    "",
+                )),
+            ),
+            firewall_step(
+                "ip6tables",
+                &["-S"],
+                Ok(dns_command_output(
+                    true,
+                    "-P INPUT DROP\n-A INPUT -p ipv6-icmp -j ACCEPT\n",
+                    "",
+                )),
+            ),
+        ]);
+
+        let statuses = collect_firewall_status(&runner);
+        runner.assert_finished();
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| status.backend.as_str())
+                .collect::<Vec<_>>(),
+            ["firewalld", "nftables", "iptables"]
+        );
+        assert!(statuses.iter().all(|status| status.available));
+        assert!(statuses.iter().all(|status| status.active));
+        assert!(statuses
+            .iter()
+            .all(|status| status.status == CollectionStatus::Complete));
+        assert_eq!(statuses[0].rule_count, 12);
+        assert_eq!(statuses[1].rule_count, 2);
+        assert_eq!(statuses[2].rule_count, 5);
+        assert!(statuses[0]
+            .rules_sample
+            .iter()
+            .all(|rule| !rule.starts_with("target:")
+                && !rule.starts_with("interfaces:")
+                && !rule.starts_with("sources:")
+                && !rule.starts_with("public")));
+        assert!(statuses[1]
+            .rules_sample
+            .iter()
+            .all(|rule| !rule.starts_with("table ") && !rule.starts_with("chain ")));
+        assert!(statuses[2]
+            .rules_sample
+            .iter()
+            .any(|rule| rule.starts_with("iptables: -A INPUT")));
+        assert!(statuses[2]
+            .rules_sample
+            .iter()
+            .any(|rule| rule.starts_with("ip6tables: -A INPUT")));
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 5);
+        assert!(calls.iter().all(|call| call.timeout == COMMAND_TIMEOUT));
+        assert!(calls
+            .iter()
+            .all(|call| call.stdout_limit == MAX_FIREWALL_STDOUT_BYTES));
+        assert!(calls
+            .iter()
+            .all(|call| call.stderr_limit == MAX_FIREWALL_STDERR_BYTES));
+    }
+
+    #[test]
+    fn firewalld_unknown_fields_and_dangling_rich_rules_are_partial() {
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step(
+                "firewall-cmd",
+                &["--state"],
+                Ok(dns_command_output(true, "running\n", "")),
+            ),
+            firewall_step(
+                "firewall-cmd",
+                &["--list-all-zones"],
+                Ok(dns_command_output(
+                    true,
+                    concat!(
+                        "public (active)\n",
+                        "  target: default\n",
+                        "    rule family=\"ipv4\" accept\n",
+                        "  unknown-item: value\n",
+                    ),
+                    "",
+                )),
+            ),
+        ]);
+        let status = collect_firewalld_status(&runner);
+        runner.assert_finished();
+        assert_eq!(status.status, CollectionStatus::Partial);
+        assert_eq!(status.error_kind, Some(FirewallErrorKind::InvalidOutput));
+        assert_eq!(status.rule_count, 0);
+        assert!(status.rules_sample.is_empty());
+    }
+
+    #[test]
+    fn inactive_firewalld_skips_zone_command_and_empty_rules_are_distinct() {
+        let mut inactive = dns_command_output(false, "not running\n", "");
+        inactive.exit_code = Some(252);
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step("firewall-cmd", &["--state"], Ok(inactive)),
+            firewall_step(
+                "nft",
+                &["list", "ruleset"],
+                Ok(dns_command_output(
+                    true,
+                    "table inet filter {\n  chain input {\n  }\n}\n",
+                    "",
+                )),
+            ),
+            firewall_step("iptables", &["-S"], Ok(dns_command_output(true, "", ""))),
+            firewall_step("ip6tables", &["-S"], Ok(dns_command_output(true, "", ""))),
+        ]);
+
+        let statuses = collect_firewall_status(&runner);
+        runner.assert_finished();
+        assert_eq!(runner.calls.borrow().len(), 4);
+        assert_eq!(statuses[0].status, CollectionStatus::Complete);
+        assert!(!statuses[0].active);
+        assert_eq!(statuses[0].error_kind, Some(FirewallErrorKind::NotRunning));
+        assert_eq!(statuses[0].args, ["--state"]);
+        for status in &statuses[1..] {
+            assert_eq!(status.status, CollectionStatus::Complete);
+            assert!(!status.active);
+            assert_eq!(status.error_kind, Some(FirewallErrorKind::EmptyRules));
+        }
+    }
+
+    #[test]
+    fn nft_empty_structures_are_inactive_and_syntax_errors_are_partial() {
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step(
+                "nft",
+                &["list", "ruleset"],
+                Ok(dns_command_output(
+                    true,
+                    concat!(
+                        "table inet filter {\n",
+                        "  chain input {\n",
+                        "    type filter hook input priority filter; policy drop;\n",
+                        "    ct state established,related accept\n",
+                        "  }\n",
+                    ),
+                    "",
+                )),
+            ),
+            firewall_step(
+                "nft",
+                &["list", "ruleset"],
+                Ok(dns_command_output(true, "flush ruleset\n", "")),
+            ),
+        ]);
+
+        let unbalanced = collect_nftables_status(&runner);
+        assert!(unbalanced.active);
+        assert_eq!(unbalanced.rule_count, 2);
+        assert_eq!(unbalanced.status, CollectionStatus::Partial);
+        assert_eq!(
+            unbalanced.error_kind,
+            Some(FirewallErrorKind::InvalidOutput)
+        );
+        let top_level_unknown = collect_nftables_status(&runner);
+        runner.assert_finished();
+        assert!(!top_level_unknown.active);
+        assert_eq!(top_level_unknown.rule_count, 0);
+        assert_eq!(top_level_unknown.status, CollectionStatus::Partial);
+        assert_eq!(
+            top_level_unknown.error_kind,
+            Some(FirewallErrorKind::InvalidOutput)
+        );
+    }
+
+    #[test]
+    fn iptables_counts_duplicates_ignores_chains_and_rejects_unknown_rows() {
+        let long_rule = format!(
+            "-A INPUT -m comment --comment token=supersecret {} -j ACCEPT\n",
+            "x".repeat(MAX_FIREWALL_RULE_CHARS * 2)
+        );
+        let mut duplicate_rules = String::from("-N CUSTOM\n");
+        for _ in 0..40 {
+            duplicate_rules.push_str(&long_rule);
+        }
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step(
+                "iptables",
+                &["-S"],
+                Ok(dns_command_output(true, duplicate_rules, "")),
+            ),
+            firewall_step("ip6tables", &["-S"], Ok(dns_command_output(true, "", ""))),
+            firewall_step(
+                "iptables",
+                &["-S"],
+                Ok(dns_command_output(
+                    true,
+                    "-N CUSTOM\n-P INPUT DROP\n-X CUSTOM\n",
+                    "",
+                )),
+            ),
+            firewall_step("ip6tables", &["-S"], Ok(dns_command_output(true, "", ""))),
+        ]);
+
+        let duplicates = collect_iptables_status(&runner);
+        assert_eq!(duplicates.status, CollectionStatus::Complete);
+        assert!(duplicates.active);
+        assert!(!duplicates.truncated);
+        assert_eq!(duplicates.rule_count, 40);
+        assert_eq!(duplicates.rules_sample.len(), MAX_FIREWALL_RULE_SAMPLES);
+        assert_eq!(
+            duplicates.omitted_rule_count,
+            duplicates.rule_count - duplicates.rules_sample.len()
+        );
+        assert!(duplicates.rules_sample.iter().all(|rule| {
+            rule.starts_with("iptables: -A INPUT")
+                && rule.chars().count() <= MAX_FIREWALL_RULE_CHARS
+        }));
+        let rendered = duplicates.rules_sample.join("\n");
+        assert!(rendered.contains("token=[REDACTED]"));
+        assert!(!rendered.contains("supersecret"));
+
+        let unknown = collect_iptables_status(&runner);
+        runner.assert_finished();
+        assert_eq!(unknown.status, CollectionStatus::Partial);
+        assert_eq!(unknown.error_kind, Some(FirewallErrorKind::InvalidOutput));
+        assert_eq!(unknown.rule_count, 1);
+        assert_eq!(unknown.rules_sample, ["iptables: -P INPUT DROP"]);
+    }
+
+    #[test]
+    fn firewall_failures_are_classified_and_isolated_by_backend() {
+        let permission = dns_command_output(false, "", "Operation not permitted");
+        let mut timed_out = dns_command_output(false, "", "late");
+        timed_out.exit_code = None;
+        timed_out.timed_out = true;
+        let runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step("firewall-cmd", &["--state"], Err(ErrorKind::NotFound)),
+            firewall_step("nft", &["list", "ruleset"], Ok(permission)),
+            firewall_step("iptables", &["-S"], Ok(timed_out)),
+            firewall_step(
+                "ip6tables",
+                &["-S"],
+                Ok(dns_command_output(
+                    true,
+                    "-P INPUT DROP\n-A INPUT -p ipv6-icmp -j ACCEPT\n",
+                    "",
+                )),
+            ),
+        ]);
+
+        let statuses = collect_firewall_status(&runner);
+        runner.assert_finished();
+        assert_eq!(statuses[0].status, CollectionStatus::Failed);
+        assert!(!statuses[0].available);
+        assert_eq!(
+            statuses[0].error_kind,
+            Some(FirewallErrorKind::CommandNotFound)
+        );
+        assert_eq!(statuses[1].status, CollectionStatus::Failed);
+        assert!(statuses[1].available);
+        assert_eq!(
+            statuses[1].error_kind,
+            Some(FirewallErrorKind::PermissionDenied)
+        );
+        assert_eq!(statuses[2].status, CollectionStatus::Partial);
+        assert!(statuses[2].available);
+        assert!(statuses[2].active);
+        assert!(statuses[2].timed_out);
+        assert_eq!(statuses[2].error_kind, Some(FirewallErrorKind::TimedOut));
+        assert_eq!(statuses[2].rule_count, 2);
+    }
+
+    #[test]
+    fn firewall_output_is_redacted_and_hard_bounded() {
+        let mut output = String::from("table inet filter {\n  chain input {\n");
+        output.push_str(&format!(
+            "    tcp dport 443 token=supersecret {} \u{fffd} accept\n",
+            "x".repeat(MAX_FIREWALL_RULE_CHARS * 2)
+        ));
+        for index in 1..=MAX_FIREWALL_OUTPUT_LINES + 10 {
+            output.push_str(&format!(
+                "    tcp dport {} accept\n",
+                10_000usize.saturating_add(index)
+            ));
+        }
+        output.push_str("  }\n}\n");
+        let mut command_output = dns_command_output(true, output, "");
+        command_output.stdout_truncated = true;
+        let runner = FixtureFirewallCommandRunner::new(vec![firewall_step(
+            "nft",
+            &["list", "ruleset"],
+            Ok(command_output),
+        )]);
+
+        let status = collect_nftables_status(&runner);
+        runner.assert_finished();
+        assert_eq!(status.status, CollectionStatus::Partial);
+        assert_eq!(status.error_kind, Some(FirewallErrorKind::InvalidOutput));
+        assert!(status.truncated);
+        assert_eq!(status.rule_count, MAX_FIREWALL_OUTPUT_LINES - 2);
+        assert_eq!(status.rules_sample.len(), MAX_FIREWALL_RULE_SAMPLES);
+        assert_eq!(
+            status.omitted_rule_count,
+            status.rule_count - status.rules_sample.len()
+        );
+        assert!(status
+            .rules_sample
+            .iter()
+            .all(|rule| rule.chars().count() <= MAX_FIREWALL_RULE_CHARS));
+        let rendered = status.rules_sample.join("\n");
+        assert!(rendered.contains("token=[REDACTED]"));
+        assert!(!rendered.contains("supersecret"));
+    }
+
+    #[test]
+    fn firewall_legacy_json_defaults_structured_fields() {
+        struct LegacyCase {
+            name: &'static str,
+            backend: &'static str,
+            available: bool,
+            legacy_status: &'static str,
+            rules_sample: &'static [&'static str],
+            input_truncated: bool,
+            expected_status: CollectionStatus,
+            active: bool,
+            truncated: bool,
+            timed_out: bool,
+            error_kind: Option<FirewallErrorKind>,
+            error: Option<&'static str>,
+        }
+
+        let cases = [
+            LegacyCase {
+                name: "running",
+                backend: "firewalld",
+                available: true,
+                legacy_status: "running",
+                rules_sample: &["legacy rule"],
+                input_truncated: true,
+                expected_status: CollectionStatus::Complete,
+                active: true,
+                truncated: false,
+                timed_out: false,
+                error_kind: None,
+                error: None,
+            },
+            LegacyCase {
+                name: "not running",
+                backend: "firewalld",
+                available: true,
+                legacy_status: "not running",
+                rules_sample: &["legacy rule"],
+                input_truncated: true,
+                expected_status: CollectionStatus::Complete,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::NotRunning),
+                error: Some("firewalld is not running"),
+            },
+            LegacyCase {
+                name: "timed out",
+                backend: "nftables",
+                available: true,
+                legacy_status: "timed out",
+                rules_sample: &["legacy partial rule"],
+                input_truncated: true,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: true,
+                error_kind: Some(FirewallErrorKind::TimedOut),
+                error: Some("firewall command timed out"),
+            },
+            LegacyCase {
+                name: "truncated output with rules",
+                backend: "iptables",
+                available: true,
+                legacy_status: "ok(output truncated)",
+                rules_sample: &["-P INPUT ACCEPT", "-A INPUT -j ACCEPT"],
+                input_truncated: false,
+                expected_status: CollectionStatus::Partial,
+                active: true,
+                truncated: true,
+                timed_out: false,
+                error_kind: None,
+                error: None,
+            },
+            LegacyCase {
+                name: "failed permission denied",
+                backend: "iptables",
+                available: true,
+                legacy_status: "failed: Permission denied",
+                rules_sample: &["legacy partial rule"],
+                input_truncated: true,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::PermissionDenied),
+                error: Some("failed: Permission denied"),
+            },
+            LegacyCase {
+                name: "legacy nft first output line",
+                backend: "nftables",
+                available: true,
+                legacy_status: "table inet filter {",
+                rules_sample: &["table inet filter {", "  chain input {"],
+                input_truncated: false,
+                expected_status: CollectionStatus::Complete,
+                active: true,
+                truncated: false,
+                timed_out: false,
+                error_kind: None,
+                error: None,
+            },
+            LegacyCase {
+                name: "legacy iptables first output line",
+                backend: "iptables",
+                available: true,
+                legacy_status: "-P INPUT ACCEPT",
+                rules_sample: &["-P INPUT ACCEPT", "-A INPUT -j ACCEPT"],
+                input_truncated: false,
+                expected_status: CollectionStatus::Complete,
+                active: true,
+                truncated: false,
+                timed_out: false,
+                error_kind: None,
+                error: None,
+            },
+            LegacyCase {
+                name: "legacy nft truncated field",
+                backend: "nftables",
+                available: true,
+                legacy_status: "table inet filter {",
+                rules_sample: &["table inet filter {", "  chain input {"],
+                input_truncated: true,
+                expected_status: CollectionStatus::Partial,
+                active: true,
+                truncated: true,
+                timed_out: false,
+                error_kind: None,
+                error: None,
+            },
+            LegacyCase {
+                name: "legacy empty successful output",
+                backend: "iptables",
+                available: true,
+                legacy_status: "ok",
+                rules_sample: &[],
+                input_truncated: false,
+                expected_status: CollectionStatus::Complete,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::EmptyRules),
+                error: None,
+            },
+            LegacyCase {
+                name: "legacy command not found",
+                backend: "nftables",
+                available: false,
+                legacy_status: "No such file or directory",
+                rules_sample: &[],
+                input_truncated: false,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::CommandNotFound),
+                error: Some("No such file or directory"),
+            },
+            LegacyCase {
+                name: "legacy prefixed command not found",
+                backend: "nftables",
+                available: false,
+                legacy_status: "failed: cannot find nft executable",
+                rules_sample: &[],
+                input_truncated: false,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::CommandNotFound),
+                error: Some("failed: cannot find nft executable"),
+            },
+            LegacyCase {
+                name: "legacy unavailable permission denied",
+                backend: "iptables",
+                available: false,
+                legacy_status: "Permission denied while starting command",
+                rules_sample: &[],
+                input_truncated: false,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::PermissionDenied),
+                error: Some("Permission denied while starting command"),
+            },
+            LegacyCase {
+                name: "legacy unavailable command failure",
+                backend: "iptables",
+                available: false,
+                legacy_status: "unable to launch firewall helper",
+                rules_sample: &[],
+                input_truncated: false,
+                expected_status: CollectionStatus::Failed,
+                active: false,
+                truncated: false,
+                timed_out: false,
+                error_kind: Some(FirewallErrorKind::CommandFailed),
+                error: Some("unable to launch firewall helper"),
+            },
+        ];
+        for case in cases {
+            let legacy: FirewallStatus = serde_json::from_value(serde_json::json!({
+                "backend": case.backend,
+                "available": case.available,
+                "active": false,
+                "status": case.legacy_status,
+                "rule_count": 0,
+                "rules_sample": case.rules_sample,
+                "truncated": case.input_truncated,
+                "omitted_rule_count": 0,
+                "timed_out": false,
+                "error": "stale error",
+                "error_kind": "command_failed"
+            }))
+            .expect("legacy firewall status");
+            assert_eq!(legacy.status, case.expected_status, "{}", case.name);
+            assert_eq!(legacy.active, case.active, "{}", case.name);
+            assert_eq!(legacy.truncated, case.truncated, "{}", case.name);
+            assert_eq!(legacy.timed_out, case.timed_out, "{}", case.name);
+            assert_eq!(legacy.error_kind, case.error_kind, "{}", case.name);
+            assert_eq!(legacy.error.as_deref(), case.error, "{}", case.name);
+            assert!(
+                legacy.rule_count >= legacy.rules_sample.len(),
+                "{}",
+                case.name
+            );
+            assert!(
+                legacy.omitted_rule_count
+                    >= legacy.rule_count.saturating_sub(legacy.rules_sample.len()),
+                "{}",
+                case.name
+            );
+            if case.rules_sample.is_empty() && case.available {
+                assert_eq!(legacy.rule_count, 0, "{}", case.name);
+            }
+            if legacy.status == CollectionStatus::Failed {
+                assert!(!legacy.active, "{}", case.name);
+            }
+        }
+
+        let long_error = format!("legacy launch failure: {}", "x".repeat(512));
+        let unavailable: FirewallStatus = serde_json::from_value(serde_json::json!({
+            "available": false,
+            "status": long_error,
+        }))
+        .expect("bounded legacy firewall error");
+        let error = unavailable.error.expect("legacy error text");
+        assert_eq!(unavailable.status, CollectionStatus::Failed);
+        assert_eq!(
+            unavailable.error_kind,
+            Some(FirewallErrorKind::CommandFailed)
+        );
+        assert_eq!(error.chars().count(), MAX_NETWORK_ERROR_CHARS);
+        assert!(long_error.starts_with(&error));
+
+        let normalized_structured: FirewallStatus = serde_json::from_value(serde_json::json!({
+            "available": true,
+            "active": true,
+            "status": "failed",
+            "rule_count": 5,
+            "rules_sample": ["rule one", "rule two"],
+            "omitted_rule_count": 0,
+        }))
+        .expect("normalize structured firewall status");
+        assert!(!normalized_structured.active);
+        assert_eq!(normalized_structured.rule_count, 5);
+        assert_eq!(normalized_structured.omitted_rule_count, 3);
+
+        let structured = FirewallStatus {
+            backend: "nftables".to_string(),
+            available: true,
+            active: true,
+            status: CollectionStatus::Partial,
+            command: Some("nft".to_string()),
+            args: vec!["list".to_string(), "ruleset".to_string()],
+            source: "nft list ruleset".to_string(),
+            rule_count: 7,
+            rules_sample: vec!["policy drop".to_string()],
+            truncated: false,
+            omitted_rule_count: 6,
+            exit_code: Some(0),
+            timed_out: true,
+            error: Some("structured error".to_string()),
+            error_kind: Some(FirewallErrorKind::CommandFailed),
+        };
+        let round_trip: FirewallStatus = serde_json::from_value(
+            serde_json::to_value(&structured).expect("serialize structured firewall status"),
+        )
+        .expect("deserialize structured firewall status");
+        assert_eq!(round_trip, structured);
+    }
+
+    #[test]
+    fn include_firewall_false_executes_no_firewall_commands() {
+        let reader = FixtureNetworkFileReader::complete();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&[]));
+        let clock = FixtureProbeClock::default();
+        let connector = FixtureTcpConnector::new(&clock, Vec::new());
+        let firewall_runner = FixtureFirewallCommandRunner::new(Vec::new());
+        let snapshot = collect_network_with_components(
+            &NetworkQuery::default(),
+            &reader,
+            None,
+            &resolver,
+            &connector,
+            &clock,
+            &firewall_runner,
+        )
+        .expect("network snapshot without firewall");
+        assert!(snapshot.firewall.is_empty());
+        assert!(firewall_runner.calls.borrow().is_empty());
+        firewall_runner.assert_finished();
+    }
+
+    #[test]
+    fn included_firewall_failures_and_partial_results_degrade_snapshot_status() {
+        let query = NetworkQuery {
+            include_firewall: true,
+            ..NetworkQuery::default()
+        };
+
+        let reader = FixtureNetworkFileReader::complete();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&[]));
+        let clock = FixtureProbeClock::default();
+        let connector = FixtureTcpConnector::new(&clock, Vec::new());
+        let all_failed_runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step("firewall-cmd", &["--state"], Err(ErrorKind::NotFound)),
+            firewall_step("nft", &["list", "ruleset"], Err(ErrorKind::NotFound)),
+            firewall_step("iptables", &["-S"], Err(ErrorKind::NotFound)),
+            firewall_step("ip6tables", &["-S"], Err(ErrorKind::NotFound)),
+        ]);
+        let all_failed = collect_network_with_components(
+            &query,
+            &reader,
+            None,
+            &resolver,
+            &connector,
+            &clock,
+            &all_failed_runner,
+        )
+        .expect("snapshot with failed firewall backends");
+        all_failed_runner.assert_finished();
+        assert_eq!(all_failed.collection_status, CollectionStatus::Partial);
+        assert!(all_failed
+            .firewall
+            .iter()
+            .all(|status| status.status == CollectionStatus::Failed));
+
+        let reader = FixtureNetworkFileReader::complete();
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&[]));
+        let clock = FixtureProbeClock::default();
+        let connector = FixtureTcpConnector::new(&clock, Vec::new());
+        let mut inactive = dns_command_output(false, "not running\n", "");
+        inactive.exit_code = Some(252);
+        let one_partial_runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step("firewall-cmd", &["--state"], Ok(inactive)),
+            firewall_step(
+                "nft",
+                &["list", "ruleset"],
+                Ok(dns_command_output(
+                    true,
+                    "table inet filter {\n  chain input {\n  }\n",
+                    "",
+                )),
+            ),
+            firewall_step("iptables", &["-S"], Ok(dns_command_output(true, "", ""))),
+            firewall_step("ip6tables", &["-S"], Ok(dns_command_output(true, "", ""))),
+        ]);
+        let one_partial = collect_network_with_components(
+            &query,
+            &reader,
+            None,
+            &resolver,
+            &connector,
+            &clock,
+            &one_partial_runner,
+        )
+        .expect("snapshot with one partial firewall backend");
+        one_partial_runner.assert_finished();
+        assert_eq!(one_partial.collection_status, CollectionStatus::Partial);
+        assert_eq!(one_partial.firewall[0].status, CollectionStatus::Complete);
+        assert_eq!(one_partial.firewall[1].status, CollectionStatus::Partial);
+        assert_eq!(one_partial.firewall[2].status, CollectionStatus::Complete);
+
+        let reader = FixtureNetworkFileReader::default()
+            .with_text(RESOLV_CONF_PATH, "nameserver 127.0.0.53\n");
+        let resolver = FixtureDnsResolver::new(resolved_fixture(&[]));
+        let clock = FixtureProbeClock::default();
+        let connector = FixtureTcpConnector::new(&clock, Vec::new());
+        let failed_source_runner = FixtureFirewallCommandRunner::new(vec![
+            firewall_step("firewall-cmd", &["--state"], Err(ErrorKind::NotFound)),
+            firewall_step("nft", &["list", "ruleset"], Err(ErrorKind::NotFound)),
+            firewall_step("iptables", &["-S"], Err(ErrorKind::NotFound)),
+            firewall_step("ip6tables", &["-S"], Err(ErrorKind::NotFound)),
+        ]);
+        let failed_source = collect_network_with_components(
+            &query,
+            &reader,
+            None,
+            &resolver,
+            &connector,
+            &clock,
+            &failed_source_runner,
+        )
+        .expect("failed socket collection remains failed");
+        failed_source_runner.assert_finished();
+        assert_eq!(failed_source.collection_status, CollectionStatus::Failed);
     }
 
     #[test]
