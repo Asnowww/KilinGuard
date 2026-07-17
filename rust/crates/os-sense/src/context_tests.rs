@@ -1,4 +1,9 @@
 use super::*;
+use crate::model::{
+    ContextCpuPayload, ContextDiskPayload, ContextLoadPayload, ContextLogPayload,
+    ContextMemoryPayload, ContextNetworkInterfacePayload, ContextNetworkPayload, ContextPage,
+    ContextProcessPayload, ContextServicePayload, ContextThermalPayload,
+};
 use serde_json::{json, Value};
 
 fn meta_json(source: &str, collected_at_ms: u64) -> Value {
@@ -161,6 +166,30 @@ fn dimension(context: &LlmOsContext, wanted: ContextDimension) -> &ContextDimens
         .expect("dimension metadata")
 }
 
+fn complete_dimension_metadata(wanted: ContextDimension) -> ContextDimensionMetadata {
+    ContextDimensionMetadata {
+        dimension: wanted,
+        status: ContextDimensionStatus::Complete,
+        requested: true,
+        sources: Vec::new(),
+        collected_at_ms: Some(200),
+        complete: true,
+        truncated: false,
+        total_unknown: false,
+        total: 1,
+        returned_count: 1,
+        omitted_count: 0,
+        errors: Vec::new(),
+        capabilities: Vec::new(),
+    }
+}
+
+fn selection_dims(selection: &ContextSelectionMetadata) -> Vec<ContextDimension> {
+    let mut dims = selection.selected_dimensions.clone();
+    dims.sort();
+    dims
+}
+
 fn process_item(pid: u32, name: &str) -> crate::model::ProcessInfo {
     serde_json::from_value(json!({
         "pid": pid,
@@ -260,6 +289,616 @@ fn crops_dimensions_by_network_intent() {
 fn health_intent_collects_all_dimensions() {
     let dims = dimensions_for_intent(Some("overall health"));
     assert_eq!(dims, all_dimensions());
+}
+
+#[test]
+fn specific_dimensions_win_before_broad_health_or_status_terms() {
+    let cpu = select_context_dimensions(Some("cpu health"));
+    assert_eq!(selection_dims(&cpu), vec![ContextDimension::Cpu]);
+    assert_eq!(cpu.profile, ContextSelectionProfile::CpuLoad);
+    assert_eq!(cpu.fallback_reason, None);
+
+    let services = select_context_dimensions(Some("service status"));
+    assert_eq!(selection_dims(&services), vec![ContextDimension::Services]);
+    assert_eq!(services.profile, ContextSelectionProfile::Services);
+    assert_eq!(services.fallback_reason, None);
+
+    let chinese_services = select_context_dimensions(Some("服务状态"));
+    assert_eq!(
+        selection_dims(&chinese_services),
+        vec![ContextDimension::Services]
+    );
+
+    let broad = select_context_dimensions(Some("overall status diagnosis"));
+    assert_eq!(selection_dims(&broad), ContextDimension::ALL.to_vec());
+    assert_eq!(
+        broad.fallback_reason,
+        Some(ContextSelectionFallbackReason::HealthIntent)
+    );
+}
+
+#[test]
+fn intent_selection_supports_chinese_english_and_unknown_fallback_without_echoing_intent() {
+    let cpu = select_context_dimensions(Some("check CPU load"));
+    assert_eq!(selection_dims(&cpu), vec![ContextDimension::Cpu]);
+    assert_eq!(cpu.profile, ContextSelectionProfile::CpuLoad);
+    assert_eq!(cpu.matched_terms, vec!["cpu_load"]);
+
+    let chinese = select_context_dimensions(Some("查看网络流量和进程PID"));
+    assert_eq!(
+        selection_dims(&chinese),
+        vec![
+            ContextDimension::NetworkMetrics,
+            ContextDimension::Processes
+        ]
+    );
+    assert_eq!(chinese.profile, ContextSelectionProfile::Mixed);
+
+    let health = select_context_dimensions(Some("整体健康状态巡检"));
+    assert_eq!(selection_dims(&health), ContextDimension::ALL.to_vec());
+    assert_eq!(
+        health.fallback_reason,
+        Some(ContextSelectionFallbackReason::HealthIntent)
+    );
+
+    let unknown = select_context_dimensions(Some(
+        "token=topsecret Authorization: Bearer signed https://host/path?api_key=secret /etc/shadow",
+    ));
+    assert_eq!(selection_dims(&unknown), ContextDimension::ALL.to_vec());
+    assert_eq!(unknown.profile, ContextSelectionProfile::UnknownFallback);
+    assert_eq!(
+        unknown.fallback_reason,
+        Some(ContextSelectionFallbackReason::UnknownIntent)
+    );
+    let metadata_json = serde_json::to_string(&unknown).expect("selection JSON");
+    assert!(!metadata_json.contains("topsecret"));
+    assert!(!metadata_json.contains("Authorization"));
+    assert!(!metadata_json.contains("/etc/shadow"));
+    assert!(!metadata_json.contains("api_key"));
+}
+
+#[test]
+fn intent_selection_uses_word_boundaries_for_common_false_positives() {
+    let selected = select_context_dimensions(Some("cpu support catalog remember stupid"));
+    assert_eq!(selection_dims(&selected), vec![ContextDimension::Cpu]);
+    assert!(!selected
+        .selected_dimensions
+        .contains(&ContextDimension::Network));
+    assert!(!selected
+        .selected_dimensions
+        .contains(&ContextDimension::Logs));
+    assert!(!selected
+        .selected_dimensions
+        .contains(&ContextDimension::Memory));
+    assert!(!selected
+        .selected_dimensions
+        .contains(&ContextDimension::Processes));
+}
+
+#[test]
+fn context_request_include_overrides_are_deterministic() {
+    let request = ContextRequest {
+        intent: Some("overall health".to_string()),
+        include_metrics: Some(false),
+        include_logs: Some(false),
+        include_services: Some(true),
+        ..ContextRequest::default()
+    };
+    let selection = context_selection_for_request(&request);
+    assert!(!selection.contains(ContextDimension::Cpu));
+    assert!(!selection.contains(ContextDimension::Memory));
+    assert!(!selection.contains(ContextDimension::Disk));
+    assert!(!selection.contains(ContextDimension::Thermal));
+    assert!(!selection.contains(ContextDimension::NetworkMetrics));
+    assert!(!selection.contains(ContextDimension::Logs));
+    assert!(selection.contains(ContextDimension::Network));
+    assert!(selection.contains(ContextDimension::Processes));
+    assert!(selection.contains(ContextDimension::Services));
+    assert_eq!(selection.metadata.profile, ContextSelectionProfile::Mixed);
+    assert_eq!(selection.metadata.fallback_reason, None);
+    assert_eq!(
+        selection.metadata.explicit_overrides,
+        vec![
+            "include_logs=false",
+            "include_metrics=false",
+            "include_services=true"
+        ]
+    );
+}
+
+#[test]
+fn context_request_include_overrides_recompute_selection_profile_and_fallback() {
+    let health_cropped = context_selection_for_request(&ContextRequest {
+        intent: Some("overall health".to_string()),
+        include_metrics: Some(false),
+        include_logs: Some(false),
+        ..ContextRequest::default()
+    });
+    assert_eq!(
+        selection_dims(&health_cropped.metadata),
+        vec![
+            ContextDimension::Network,
+            ContextDimension::Processes,
+            ContextDimension::Services
+        ]
+    );
+    assert_eq!(
+        health_cropped.metadata.profile,
+        ContextSelectionProfile::Mixed
+    );
+    assert_eq!(health_cropped.metadata.fallback_reason, None);
+
+    let cpu_plus_metrics = context_selection_for_request(&ContextRequest {
+        intent: Some("cpu".to_string()),
+        include_metrics: Some(true),
+        ..ContextRequest::default()
+    });
+    assert_eq!(
+        selection_dims(&cpu_plus_metrics.metadata),
+        vec![
+            ContextDimension::Cpu,
+            ContextDimension::Memory,
+            ContextDimension::Disk,
+            ContextDimension::Thermal,
+            ContextDimension::NetworkMetrics
+        ]
+    );
+    assert_eq!(
+        cpu_plus_metrics.metadata.profile,
+        ContextSelectionProfile::Mixed
+    );
+    assert_eq!(cpu_plus_metrics.metadata.fallback_reason, None);
+
+    let health = context_selection_for_request(&ContextRequest {
+        intent: Some("overall health".to_string()),
+        ..ContextRequest::default()
+    });
+    assert_eq!(
+        selection_dims(&health.metadata),
+        ContextDimension::ALL.to_vec()
+    );
+    assert_eq!(health.metadata.profile, ContextSelectionProfile::All);
+    assert_eq!(
+        health.metadata.fallback_reason,
+        Some(ContextSelectionFallbackReason::HealthIntent)
+    );
+
+    let unknown = context_selection_for_request(&ContextRequest {
+        intent: Some("unclassified operational question".to_string()),
+        ..ContextRequest::default()
+    });
+    assert_eq!(
+        selection_dims(&unknown.metadata),
+        ContextDimension::ALL.to_vec()
+    );
+    assert_eq!(
+        unknown.metadata.profile,
+        ContextSelectionProfile::UnknownFallback
+    );
+    assert_eq!(
+        unknown.metadata.fallback_reason,
+        Some(ContextSelectionFallbackReason::UnknownIntent)
+    );
+}
+
+#[test]
+fn context_request_include_overrides_can_select_no_dimensions_without_falling_back_to_all() {
+    let selection = context_selection_for_request(&ContextRequest {
+        intent: Some("overall health".to_string()),
+        include_metrics: Some(false),
+        include_processes: Some(false),
+        include_logs: Some(false),
+        include_network: Some(false),
+        include_services: Some(false),
+        ..ContextRequest::default()
+    });
+    assert!(selection.metadata.selected_dimensions.is_empty());
+    assert!(selection.dimensions.is_empty());
+    assert_eq!(selection.metadata.profile, ContextSelectionProfile::None);
+    assert_eq!(selection.metadata.fallback_reason, None);
+    assert_eq!(
+        selection.metadata.explicit_overrides,
+        vec![
+            "include_logs=false",
+            "include_metrics=false",
+            "include_network=false",
+            "include_processes=false",
+            "include_services=false"
+        ]
+    );
+}
+
+#[test]
+fn trim_llm_context_for_intent_filters_nine_dimensions_payload_and_evidence() {
+    let mut context = LlmOsContext {
+        status: ContextDimensionStatus::Complete,
+        complete: true,
+        dimensions: ContextDimension::ALL
+            .into_iter()
+            .map(complete_dimension_metadata)
+            .collect(),
+        payload: ContextPayload {
+            metrics: Some(ContextMetricsPayload {
+                cpu: ContextCpuPayload {
+                    usage_percent: Some(91.0),
+                    cpu_count: 8,
+                    sample_interval_ms: Some(1000),
+                },
+                memory: ContextMemoryPayload {
+                    total_kb: 100,
+                    available_kb: 10,
+                    used_kb: 90,
+                    used_percent: Some(90.0),
+                    swap_total_kb: 50,
+                    swap_used_kb: 20,
+                },
+                load: Some(ContextLoadPayload {
+                    one: 1.0,
+                    five: 2.0,
+                    fifteen: 3.0,
+                    runnable_tasks: Some(1),
+                    total_tasks: Some(2),
+                }),
+                disks: ContextPage {
+                    total: 1,
+                    returned_count: 1,
+                    omitted_count: 0,
+                    total_unknown: false,
+                    truncated: false,
+                    items: vec![ContextDiskPayload {
+                        mount_point: "/".to_string(),
+                        filesystem: "ext4".to_string(),
+                        total_bytes: Some(10),
+                        available_bytes: Some(2),
+                        used_percent: Some(80),
+                    }],
+                },
+                disk_devices: ContextPage::default(),
+                network_interfaces: ContextPage {
+                    total: 1,
+                    returned_count: 1,
+                    omitted_count: 0,
+                    total_unknown: false,
+                    truncated: false,
+                    items: vec![ContextNetworkInterfacePayload {
+                        name: "eth0".to_string(),
+                        receive_bytes_per_sec: Some(1.0),
+                        transmit_bytes_per_sec: Some(2.0),
+                        receive_errors_total: 0,
+                        transmit_errors_total: 0,
+                        receive_dropped_total: 0,
+                        transmit_dropped_total: 0,
+                    }],
+                },
+                thermal_sensors: ContextPage {
+                    total: 1,
+                    returned_count: 1,
+                    omitted_count: 0,
+                    total_unknown: false,
+                    truncated: false,
+                    items: vec![ContextThermalPayload {
+                        source: "hwmon".to_string(),
+                        label: Some("cpu".to_string()),
+                        value: 55000,
+                        unit: "millidegree_celsius".to_string(),
+                    }],
+                },
+            }),
+            processes: Some(ContextProcessPayload::default()),
+            logs: Some(ContextLogPayload::default()),
+            network: Some(ContextNetworkPayload::default()),
+            services: Some(ContextServicePayload::default()),
+        },
+        evidence: vec![
+            ContextEvidence {
+                id: "disk-warning".to_string(),
+                dimension: ContextDimension::Disk,
+                kind: ContextEvidenceKind::MetricAlert,
+                severity: "warning".to_string(),
+                subject: None,
+                message: "disk high".to_string(),
+                count: 1,
+            },
+            ContextEvidence {
+                id: "log-warning".to_string(),
+                dimension: ContextDimension::Logs,
+                kind: ContextEvidenceKind::LogPattern,
+                severity: "warning".to_string(),
+                subject: None,
+                message: "log high".to_string(),
+                count: 1,
+            },
+        ],
+        ..LlmOsContext::default()
+    };
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+    let original = context.clone();
+
+    let focused = trim_llm_context_for_intent(&context, Some("disk IO")).llm_context;
+    assert_eq!(
+        focused
+            .dimensions
+            .iter()
+            .map(|dimension| dimension.dimension)
+            .collect::<Vec<_>>(),
+        vec![ContextDimension::Disk]
+    );
+    let metrics = focused.payload.metrics.as_ref().expect("disk metrics");
+    assert_eq!(metrics.disks.items.len(), 1);
+    assert_eq!(metrics.cpu.usage_percent, None);
+    assert_eq!(metrics.memory.total_kb, 0);
+    assert!(metrics.load.is_none());
+    assert!(metrics.network_interfaces.items.is_empty());
+    assert!(metrics.thermal_sensors.items.is_empty());
+    assert!(focused.payload.processes.is_none());
+    assert!(focused.payload.logs.is_none());
+    assert!(focused.payload.network.is_none());
+    assert!(focused.payload.services.is_none());
+    assert_eq!(focused.evidence.len(), 1);
+    assert_eq!(focused.evidence[0].id, "disk-warning");
+    assert_eq!(focused.evidence_total, 1);
+    assert_eq!(focused.evidence_returned_count, 1);
+    assert_eq!(focused.evidence_omitted_count, 0);
+    assert_eq!(focused.status, ContextDimensionStatus::Complete);
+    assert!(focused.complete);
+    assert!(!focused.truncated);
+    let focused_json = serde_json::to_value(&focused).expect("focused JSON");
+    let metrics_json = focused_json["payload"]["metrics"]
+        .as_object()
+        .expect("metrics JSON object");
+    assert!(!metrics_json.contains_key("cpu"));
+    assert!(!metrics_json.contains_key("memory"));
+    assert!(!metrics_json.contains_key("network_interfaces"));
+    assert!(!metrics_json.contains_key("thermal_sensors"));
+    assert!(metrics_json.contains_key("disks"));
+    assert_eq!(context, original, "pure trim must not mutate input");
+}
+
+#[test]
+fn metrics_payload_skips_unselected_defaults_without_dropping_real_zero_values() {
+    let metrics = ContextMetricsPayload {
+        cpu: ContextCpuPayload {
+            usage_percent: Some(0.0),
+            ..ContextCpuPayload::default()
+        },
+        memory: ContextMemoryPayload {
+            used_percent: Some(0.0),
+            ..ContextMemoryPayload::default()
+        },
+        ..ContextMetricsPayload::default()
+    };
+    let value = serde_json::to_value(metrics).expect("metrics JSON");
+    let object = value.as_object().expect("metrics object");
+    assert!(object.contains_key("cpu"));
+    assert!(object.contains_key("memory"));
+    assert!(!object.contains_key("disks"));
+    assert!(!object.contains_key("network_interfaces"));
+    assert_eq!(value["cpu"]["usage_percent"], 0.0);
+    assert_eq!(value["memory"]["used_percent"], 0.0);
+}
+
+#[test]
+fn focused_context_recomputes_global_flags_from_selected_dimensions_and_evidence_omissions() {
+    let mut context = LlmOsContext {
+        status: ContextDimensionStatus::Partial,
+        complete: false,
+        truncated: true,
+        total_unknown: true,
+        dimensions: vec![
+            complete_dimension_metadata(ContextDimension::Cpu),
+            ContextDimensionMetadata {
+                dimension: ContextDimension::Logs,
+                status: ContextDimensionStatus::Partial,
+                requested: true,
+                complete: false,
+                truncated: true,
+                total_unknown: true,
+                total: 10,
+                returned_count: 1,
+                omitted_count: 9,
+                ..complete_dimension_metadata(ContextDimension::Logs)
+            },
+        ],
+        ..LlmOsContext::default()
+    };
+
+    let focused = trim_llm_context_for_intent(&context, Some("cpu")).llm_context;
+    assert_eq!(focused.status, ContextDimensionStatus::Complete);
+    assert!(focused.complete);
+    assert!(!focused.truncated);
+    assert!(!focused.total_unknown);
+    assert_eq!(focused.evidence_omitted_count, 0);
+
+    context.evidence_omitted_count = 3;
+    context.evidence_total = 3;
+    let conservative = trim_llm_context_for_intent(&context, Some("cpu")).llm_context;
+    assert_eq!(conservative.evidence_omitted_count, 3);
+    assert_eq!(conservative.evidence_total, 3);
+    assert_eq!(conservative.status, ContextDimensionStatus::Partial);
+    assert!(!conservative.complete);
+    assert!(conservative.truncated);
+    assert!(conservative.total_unknown);
+}
+
+#[test]
+fn selection_metadata_deserialize_is_normalized_and_focus_ignores_input_selection_bloat() {
+    let metadata: ContextSelectionMetadata = serde_json::from_value(json!({
+        "schema": "evil token=topsecret",
+        "version": 999,
+        "profile": "mixed",
+        "selected_dimensions": ["logs", "cpu", "cpu"],
+        "matched_terms": ["cpu_load", "token=topsecret", "logs", "health", "/etc/shadow"],
+        "explicit_overrides": [
+            "include_logs=false",
+            "token=topsecret",
+            "include_network=maybe",
+            "include_metrics=true"
+        ],
+        "intent_provided": true
+    }))
+    .expect("selection metadata JSON");
+    assert_eq!(metadata.schema, "os-sense.context-selection");
+    assert_eq!(metadata.version, 1);
+    assert_eq!(
+        metadata.selected_dimensions,
+        vec![ContextDimension::Cpu, ContextDimension::Logs]
+    );
+    assert_eq!(metadata.profile, ContextSelectionProfile::Mixed);
+    assert_eq!(metadata.fallback_reason, None);
+    assert_eq!(metadata.matched_terms, vec!["cpu_load", "health", "logs"]);
+    assert_eq!(
+        metadata.explicit_overrides,
+        vec!["include_logs=false", "include_metrics=true"]
+    );
+    let metadata_json = serde_json::to_string(&metadata).expect("normalized metadata JSON");
+    assert!(!metadata_json.contains("topsecret"));
+    assert!(!metadata_json.contains("/etc/shadow"));
+
+    let unknown: ContextSelectionMetadata = serde_json::from_value(json!({
+        "profile": "logs",
+        "selected_dimensions": ["cpu"],
+        "fallback_reason": "unknown_intent"
+    }))
+    .expect("unknown fallback metadata");
+    assert_eq!(unknown.profile, ContextSelectionProfile::UnknownFallback);
+    assert_eq!(
+        unknown.fallback_reason,
+        Some(ContextSelectionFallbackReason::UnknownIntent)
+    );
+    assert_eq!(unknown.selected_dimensions, ContextDimension::ALL.to_vec());
+
+    let overridden_fallback: ContextSelectionMetadata = serde_json::from_value(json!({
+        "profile": "all",
+        "selected_dimensions": ["network", "services"],
+        "fallback_reason": "health_intent",
+        "explicit_overrides": ["include_metrics=false"]
+    }))
+    .expect("overridden fallback metadata");
+    assert_eq!(
+        overridden_fallback.selected_dimensions,
+        vec![ContextDimension::Network, ContextDimension::Services]
+    );
+    assert_eq!(overridden_fallback.profile, ContextSelectionProfile::Mixed);
+    assert_eq!(overridden_fallback.fallback_reason, None);
+
+    let mut context = LlmOsContext {
+        status: ContextDimensionStatus::Complete,
+        complete: true,
+        dimensions: vec![complete_dimension_metadata(ContextDimension::Cpu)],
+        selection: ContextSelectionMetadata {
+            matched_terms: vec!["token=program_secret".repeat(1_000)],
+            explicit_overrides: vec!["Authorization: Bearer program_secret".repeat(1_000)],
+            ..ContextSelectionMetadata::default()
+        },
+        ..LlmOsContext::default()
+    };
+    context.selection.selected_dimensions = ContextDimension::ALL.repeat(200);
+    let focused = trim_llm_context_for_intent(&context, Some("cpu")).llm_context;
+    assert_eq!(focused.selection.matched_terms, vec!["cpu_load"]);
+    let focused_json = serde_json::to_string(&focused).expect("focused context JSON");
+    assert!(!focused_json.contains("program_secret"));
+    assert!(focused_json.len() < MAX_LLM_CONTEXT_JSON_BYTES);
+}
+
+#[test]
+fn collection_focus_filters_legacy_alerts_before_building_alert_context() {
+    let mut inputs = complete_inputs();
+    let mut metrics = metrics_fixture();
+    metrics.alerts = vec![
+        Alert {
+            dimension: "cpu".to_string(),
+            subject: Some("total".to_string()),
+            severity: "warning".to_string(),
+            message: "cpu selected".to_string(),
+            value: 95.0,
+            threshold: 90.0,
+        },
+        Alert {
+            dimension: "memory".to_string(),
+            subject: Some("total".to_string()),
+            severity: "warning".to_string(),
+            message: "memory must not leak".to_string(),
+            value: 95.0,
+            threshold: 90.0,
+        },
+        Alert {
+            dimension: "disk".to_string(),
+            subject: Some("/secret".to_string()),
+            severity: "warning".to_string(),
+            message: "disk must not leak".to_string(),
+            value: 95.0,
+            threshold: 90.0,
+        },
+    ];
+    inputs.metrics = ContextInput::Collected(metrics);
+    let selection = context_selection_for_request(&ContextRequest {
+        intent: Some("cpu health".to_string()),
+        ..ContextRequest::default()
+    });
+    let mut context = aggregate_context(inputs);
+    let focused = trim_llm_context_with_selection(&context.llm_context, &selection);
+    context.llm_context = focused.llm_context;
+    context.dimensions = legacy_groups_from_selection(&selection)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    filter_alerts_for_selection(&mut context.alerts, &selection);
+    populate_legacy_context_consumers(&mut context);
+
+    assert_eq!(context.alerts.len(), 1);
+    assert_eq!(context.alerts[0].dimension, "cpu");
+    let alert_context = context.alert_context.expect("cpu alert context");
+    let alert_json = serde_json::to_string(&alert_context).expect("alert context JSON");
+    assert!(alert_json.contains("cpu selected"));
+    assert!(!alert_json.contains("memory must not leak"));
+    assert!(!alert_json.contains("disk must not leak"));
+    assert!(!alert_json.contains("/secret"));
+    assert_eq!(
+        context.health_summary.covered_dimensions,
+        vec![ContextDimension::Cpu]
+    );
+}
+
+#[test]
+fn trim_llm_context_summary_is_deterministic_and_based_on_focused_context() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence.push(ContextEvidence {
+        id: "logs-warning".to_string(),
+        dimension: ContextDimension::Logs,
+        kind: ContextEvidenceKind::LogPattern,
+        severity: "warning".to_string(),
+        subject: None,
+        message: "log pattern".to_string(),
+        count: 1,
+    });
+    context.evidence.push(ContextEvidence {
+        id: "cpu-warning".to_string(),
+        dimension: ContextDimension::Cpu,
+        kind: ContextEvidenceKind::MetricAlert,
+        severity: "warning".to_string(),
+        subject: None,
+        message: "cpu high".to_string(),
+        count: 1,
+    });
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+
+    let first = trim_llm_context_for_intent(&context, Some("logs and journal")).llm_context;
+    let second = trim_llm_context_for_intent(&context, Some("logs and journal")).llm_context;
+    assert_eq!(first, second);
+    assert_eq!(
+        first
+            .evidence
+            .iter()
+            .map(|evidence| evidence.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["logs-warning"]
+    );
+    let summary = summarize_llm_context(&first);
+    assert_eq!(summary.covered_dimensions, vec![ContextDimension::Logs]);
+    assert_eq!(summary.evidence_ids, vec!["logs-warning"]);
+    assert_eq!(summary.health_status, ContextHealthStatus::Degraded);
 }
 
 #[test]

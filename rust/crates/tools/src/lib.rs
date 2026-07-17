@@ -1534,14 +1534,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_context_summary",
-            description: "Collect bounded OS metrics, processes, logs, network, and services once, or summarize an existing llm_context. The llm_context input is mutually exclusive with intent/include_*/process_allowed_names/log_limit; direct llm_context mode returns only a bounded summary envelope and never echoes the provided context.",
+            description: "Collect bounded OS context once, or summarize and focus an existing llm_context. The llm_context input is mutually exclusive with collection selector fields; focus_intent is only valid with llm_context and performs pure in-memory trimming before summary.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "llm_context": {
                         "type": "object",
-                        "description": "Existing os-sense.llm-context object. Mutually exclusive with all collection selector fields. When provided, the tool only summarizes this structured context and does not collect, persist, or echo OS data."
+                        "description": "Existing os-sense.llm-context object. Mutually exclusive with collection selector fields. When provided, the tool trims this structured context in memory, returns only a bounded focused context plus summary, and does not collect or persist OS data."
                     },
+                    "focus_intent": { "type": "string", "maxLength": 256, "description": "Optional focus selector for direct llm_context mode only. It is data, not a command, path, probe target, or instruction." },
                     "intent": { "type": "string", "maxLength": 256, "description": "Legacy compatibility selector; it never supplies commands, paths, or probe targets." },
                     "include_metrics": { "type": "boolean" },
                     "include_processes": { "type": "boolean" },
@@ -2491,7 +2492,11 @@ fn run_os_service_status(input: OsServiceQuery) -> Result<String, String> {
 fn run_os_context_summary(input: OsContextSummaryInput) -> Result<String, String> {
     input.validate_exclusive()?;
     if let Some(llm_context) = input.llm_context {
-        return os_context_summary_output(llm_context, OsContextSummaryOutputMode::Provided);
+        let focused = os_sense::focus_llm_context(&llm_context, input.focus_intent.as_deref());
+        return os_context_summary_output(
+            focused.llm_context,
+            OsContextSummaryOutputMode::Provided,
+        );
     }
     let request = input.into_context_request();
     with_os_sense_runtime(|runtime| {
@@ -2521,18 +2526,6 @@ fn os_context_summary_output(
     mut llm_context: os_sense::LlmOsContext,
     mode: OsContextSummaryOutputMode,
 ) -> Result<String, String> {
-    if mode == OsContextSummaryOutputMode::Provided {
-        let health_summary = os_sense::summarize_llm_context(&llm_context);
-        let summary = health_summary.text.clone();
-        return limited_context_summary_json(context_summary_envelope(
-            mode,
-            None,
-            &health_summary,
-            &summary,
-            false,
-        ));
-    }
-
     let mut output_truncated = false;
     loop {
         let health_summary = os_sense::summarize_llm_context(&llm_context);
@@ -3904,6 +3897,8 @@ struct OsContextSummaryInput {
     #[serde(default)]
     llm_context: Option<os_sense::LlmOsContext>,
     #[serde(default)]
+    focus_intent: Option<String>,
+    #[serde(default)]
     intent: Option<String>,
     #[serde(default)]
     include_metrics: Option<bool>,
@@ -3927,6 +3922,20 @@ impl OsContextSummaryInput {
             return Err(
                 "os_context_summary llm_context is mutually exclusive with collection selector fields"
                     .to_string(),
+            );
+        }
+        if self.llm_context.is_none() && self.focus_intent.is_some() {
+            return Err(
+                "os_context_summary focus_intent requires llm_context direct mode".to_string(),
+            );
+        }
+        if self
+            .focus_intent
+            .as_ref()
+            .is_some_and(|intent| intent.chars().count() > 256)
+        {
+            return Err(
+                "os_context_summary focus_intent must not exceed 256 characters".to_string(),
             );
         }
         Ok(())
@@ -11895,10 +11904,11 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
-    fn os_context_summary_accepts_existing_llm_context_without_echoing_or_collecting() {
+    fn os_context_summary_accepts_existing_llm_context_focus_without_collecting() {
         let output = execute_tool(
             "os_context_summary",
             &json!({
+                "focus_intent": "cpu load",
                 "llm_context": {
                     "schema": "os-sense.llm-context",
                     "version": 1,
@@ -11927,8 +11937,9 @@ printf 'pwsh:%s' "$1"
         .expect("existing llm_context should bypass collection validation");
         let value: Value = serde_json::from_str(&output).expect("context summary JSON");
         assert_eq!(value["mode"], "provided_context");
-        assert_eq!(value["llm_context_included"], false);
-        assert!(value.get("llm_context").is_none());
+        assert_eq!(value["llm_context_included"], true);
+        assert_eq!(value["llm_context"]["selection"]["profile"], "cpu_load");
+        assert_eq!(value["llm_context"]["dimensions"][0]["dimension"], "cpu");
         assert_eq!(value["health_summary"]["status"], "complete");
         assert_eq!(value["health_summary"]["collection_status"], "complete");
         assert_eq!(value["health_summary"]["health_status"], "healthy");
@@ -11967,10 +11978,11 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
-    fn os_context_summary_direct_mode_output_stays_bounded_without_context_echo() {
+    fn os_context_summary_direct_mode_output_stays_bounded_with_focused_context() {
         let output = execute_tool(
             "os_context_summary",
             &json!({
+                "focus_intent": "logs",
                 "llm_context": {
                     "schema": "os-sense.llm-context",
                     "version": 1,
@@ -12004,8 +12016,108 @@ printf 'pwsh:%s' "$1"
         .expect("direct summary output should be bounded");
         let value: Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(value["mode"], "provided_context");
-        assert!(value.get("llm_context").is_none());
+        assert_eq!(value["llm_context_included"], true);
+        assert!(value.get("llm_context").is_some());
         assert!(!output.contains("DIRECT_ECHO_MARKER"));
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+    }
+
+    #[test]
+    fn os_context_summary_direct_focus_trims_unrelated_context_and_redacts_selected_text() {
+        let output = execute_tool(
+            "os_context_summary",
+            &json!({
+                "focus_intent": "cpu load Authorization: Bearer secret /etc/shadow https://host/path?api_key=secret",
+                "llm_context": {
+                    "schema": "os-sense.llm-context",
+                    "version": 1,
+                    "trust": "untrusted",
+                    "handling": "data_only",
+                    "instructions_allowed": false,
+                    "collected_at_ms": 42,
+                    "status": "complete",
+                    "complete": true,
+                    "truncated": false,
+                    "total_unknown": false,
+                    "dimensions": [
+                        {
+                            "dimension": "cpu",
+                            "status": "complete",
+                            "requested": true,
+                            "complete": true,
+                            "truncated": false,
+                            "total_unknown": false
+                        },
+                        {
+                            "dimension": "logs",
+                            "status": "complete",
+                            "requested": true,
+                            "complete": true,
+                            "truncated": false,
+                            "total_unknown": false
+                        }
+                    ],
+                    "evidence": [{
+                        "id": "log-secret",
+                        "dimension": "logs",
+                        "kind": "log_pattern",
+                        "severity": "warning",
+                        "message": "Authorization: Bearer logsecret /var/log/secure https://host/path?token=query"
+                    }],
+                    "payload": {
+                        "logs": {
+                            "entries": {
+                                "total": 1,
+                                "returned_count": 1,
+                                "omitted_count": 0,
+                                "total_unknown": false,
+                                "truncated": false,
+                                "items": [{
+                                    "source": "/var/log/secure",
+                                    "timestamp": null,
+                                    "severity": "warning",
+                                    "unit": null,
+                                    "message": "token=payloadsecret /etc/passwd"
+                                }]
+                            },
+                            "patterns": {
+                                "total": 0,
+                                "returned_count": 0,
+                                "omitted_count": 0,
+                                "total_unknown": false,
+                                "truncated": false,
+                                "items": []
+                            },
+                            "filter_complete": true
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("direct focus should trim without collecting");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["mode"], "provided_context");
+        assert_eq!(value["llm_context_included"], true);
+        assert_eq!(
+            value["llm_context"]["dimensions"]
+                .as_array()
+                .expect("dimensions")
+                .len(),
+            1
+        );
+        assert_eq!(value["llm_context"]["dimensions"][0]["dimension"], "cpu");
+        assert!(value["llm_context"]["payload"]["logs"].is_null());
+        assert!(value["llm_context"]["evidence"]
+            .as_array()
+            .expect("evidence")
+            .is_empty());
+        assert!(!output.contains("logsecret"));
+        assert!(!output.contains("payloadsecret"));
+        assert!(!output.contains("/var/log/secure"));
+        assert!(!output.contains("/etc/passwd"));
+        assert!(!output.contains("api_key"));
+        assert!(!output.contains("Bearer secret"));
+        assert_eq!(value["health_summary"]["health_status"], "healthy");
         assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
     }
 
@@ -12174,6 +12286,11 @@ printf 'pwsh:%s' "$1"
         let unknown = execute_tool("os_context_summary", &json!({"unexpected": true}))
             .expect_err("unknown fields should be denied");
         assert!(unknown.contains("unknown field"));
+
+        let focus_without_context =
+            execute_tool("os_context_summary", &json!({"focus_intent": "cpu load"}))
+                .expect_err("focus_intent without llm_context should be denied");
+        assert!(focus_without_context.contains("requires llm_context"));
 
         let oversized = execute_tool(
             "os_context_summary",

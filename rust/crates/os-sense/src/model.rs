@@ -2304,13 +2304,27 @@ pub struct ContextPayload {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ContextMetricsPayload {
+    #[serde(default, skip_serializing_if = "is_default")]
     pub cpu: ContextCpuPayload,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub memory: ContextMemoryPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<ContextLoadPayload>,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub disks: ContextPage<ContextDiskPayload>,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub disk_devices: ContextPage<ContextDiskDevicePayload>,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub network_interfaces: ContextPage<ContextNetworkInterfacePayload>,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub thermal_sensors: ContextPage<ContextThermalPayload>,
+}
+
+fn is_default<T>(value: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    value == &T::default()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -2494,6 +2508,285 @@ pub struct ContextServicePayload {
     pub http_probes: ContextPage<ContextProbePayload>,
     pub failed_filter_complete: bool,
     pub problem_filter_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSelectionProfile {
+    #[default]
+    None,
+    All,
+    CpuLoad,
+    Memory,
+    DiskStorage,
+    Thermal,
+    NetworkTraffic,
+    NetworkConnectivity,
+    Processes,
+    Logs,
+    Services,
+    Mixed,
+    UnknownFallback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSelectionFallbackReason {
+    HealthIntent,
+    UnknownIntent,
+    EmptyIntent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextSelectionMetadata {
+    pub schema: String,
+    pub version: u32,
+    pub profile: ContextSelectionProfile,
+    pub selected_dimensions: Vec<ContextDimension>,
+    pub matched_terms: Vec<String>,
+    pub fallback_reason: Option<ContextSelectionFallbackReason>,
+    pub intent_provided: bool,
+    pub intent_truncated: bool,
+    pub explicit_overrides: Vec<String>,
+}
+
+impl Default for ContextSelectionMetadata {
+    fn default() -> Self {
+        Self {
+            schema: "os-sense.context-selection".to_string(),
+            version: 1,
+            profile: ContextSelectionProfile::None,
+            selected_dimensions: Vec::new(),
+            matched_terms: Vec::new(),
+            fallback_reason: None,
+            intent_provided: false,
+            intent_truncated: false,
+            explicit_overrides: Vec::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextSelectionMetadata {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawContextSelectionMetadata::deserialize(deserializer)?;
+        Ok(normalize_context_selection_metadata(raw))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawContextSelectionMetadata {
+    schema: String,
+    version: u32,
+    profile: ContextSelectionProfile,
+    selected_dimensions: Vec<ContextDimension>,
+    matched_terms: Vec<String>,
+    fallback_reason: Option<ContextSelectionFallbackReason>,
+    intent_provided: bool,
+    intent_truncated: bool,
+    explicit_overrides: Vec<String>,
+}
+
+impl Default for RawContextSelectionMetadata {
+    fn default() -> Self {
+        let defaults = ContextSelectionMetadata::default();
+        Self {
+            schema: defaults.schema,
+            version: defaults.version,
+            profile: defaults.profile,
+            selected_dimensions: defaults.selected_dimensions,
+            matched_terms: defaults.matched_terms,
+            fallback_reason: defaults.fallback_reason,
+            intent_provided: defaults.intent_provided,
+            intent_truncated: defaults.intent_truncated,
+            explicit_overrides: defaults.explicit_overrides,
+        }
+    }
+}
+
+fn normalize_context_selection_metadata(
+    raw: RawContextSelectionMetadata,
+) -> ContextSelectionMetadata {
+    let mut selected_dimensions = raw.selected_dimensions;
+    selected_dimensions.sort();
+    selected_dimensions.dedup();
+    if selected_dimensions.len() > ContextDimension::ALL.len() {
+        selected_dimensions.truncate(ContextDimension::ALL.len());
+    }
+
+    let mut matched_terms = raw
+        .matched_terms
+        .into_iter()
+        .filter_map(|term| canonical_context_selection_term(&term).map(str::to_string))
+        .collect::<Vec<_>>();
+    matched_terms.sort();
+    matched_terms.dedup();
+    matched_terms.truncate(16);
+
+    let mut explicit_overrides = raw
+        .explicit_overrides
+        .into_iter()
+        .filter_map(|override_value| {
+            canonical_context_selection_override(&override_value).map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    explicit_overrides.sort();
+    explicit_overrides.dedup();
+    explicit_overrides.truncate(8);
+    let has_explicit_overrides = !explicit_overrides.is_empty();
+
+    let (profile, fallback_reason) = normalize_context_selection_profile(
+        raw.profile,
+        raw.fallback_reason,
+        &mut selected_dimensions,
+        has_explicit_overrides,
+    );
+
+    ContextSelectionMetadata {
+        schema: "os-sense.context-selection".to_string(),
+        version: 1,
+        profile,
+        selected_dimensions,
+        matched_terms,
+        fallback_reason,
+        intent_provided: raw.intent_provided,
+        intent_truncated: raw.intent_truncated,
+        explicit_overrides,
+    }
+}
+
+fn normalize_context_selection_profile(
+    raw_profile: ContextSelectionProfile,
+    raw_fallback: Option<ContextSelectionFallbackReason>,
+    selected_dimensions: &mut Vec<ContextDimension>,
+    has_explicit_overrides: bool,
+) -> (
+    ContextSelectionProfile,
+    Option<ContextSelectionFallbackReason>,
+) {
+    if has_explicit_overrides {
+        if selected_dimensions.is_empty() {
+            return (ContextSelectionProfile::None, None);
+        }
+        if selected_dimensions.len() == ContextDimension::ALL.len() {
+            return match raw_fallback {
+                Some(ContextSelectionFallbackReason::UnknownIntent) => (
+                    ContextSelectionProfile::UnknownFallback,
+                    Some(ContextSelectionFallbackReason::UnknownIntent),
+                ),
+                Some(ContextSelectionFallbackReason::HealthIntent) => (
+                    ContextSelectionProfile::All,
+                    Some(ContextSelectionFallbackReason::HealthIntent),
+                ),
+                Some(ContextSelectionFallbackReason::EmptyIntent) => (
+                    ContextSelectionProfile::All,
+                    Some(ContextSelectionFallbackReason::EmptyIntent),
+                ),
+                None => (ContextSelectionProfile::All, None),
+            };
+        }
+        return (profile_for_selected_dimensions(selected_dimensions), None);
+    }
+
+    match raw_fallback {
+        Some(ContextSelectionFallbackReason::HealthIntent) => {
+            *selected_dimensions = ContextDimension::ALL.to_vec();
+            return (
+                ContextSelectionProfile::All,
+                Some(ContextSelectionFallbackReason::HealthIntent),
+            );
+        }
+        Some(ContextSelectionFallbackReason::EmptyIntent) => {
+            *selected_dimensions = ContextDimension::ALL.to_vec();
+            return (
+                ContextSelectionProfile::All,
+                Some(ContextSelectionFallbackReason::EmptyIntent),
+            );
+        }
+        Some(ContextSelectionFallbackReason::UnknownIntent) => {
+            *selected_dimensions = ContextDimension::ALL.to_vec();
+            return (
+                ContextSelectionProfile::UnknownFallback,
+                Some(ContextSelectionFallbackReason::UnknownIntent),
+            );
+        }
+        None => {}
+    }
+
+    if selected_dimensions.is_empty() {
+        return match raw_profile {
+            ContextSelectionProfile::All => {
+                *selected_dimensions = ContextDimension::ALL.to_vec();
+                (ContextSelectionProfile::All, None)
+            }
+            ContextSelectionProfile::UnknownFallback => {
+                *selected_dimensions = ContextDimension::ALL.to_vec();
+                (
+                    ContextSelectionProfile::UnknownFallback,
+                    Some(ContextSelectionFallbackReason::UnknownIntent),
+                )
+            }
+            _ => (ContextSelectionProfile::None, None),
+        };
+    }
+
+    (profile_for_selected_dimensions(selected_dimensions), None)
+}
+
+fn profile_for_selected_dimensions(dimensions: &[ContextDimension]) -> ContextSelectionProfile {
+    if dimensions.len() == ContextDimension::ALL.len() {
+        return ContextSelectionProfile::All;
+    }
+    if dimensions.len() != 1 {
+        return ContextSelectionProfile::Mixed;
+    }
+    match dimensions[0] {
+        ContextDimension::Cpu => ContextSelectionProfile::CpuLoad,
+        ContextDimension::Memory => ContextSelectionProfile::Memory,
+        ContextDimension::Disk => ContextSelectionProfile::DiskStorage,
+        ContextDimension::Thermal => ContextSelectionProfile::Thermal,
+        ContextDimension::NetworkMetrics => ContextSelectionProfile::NetworkTraffic,
+        ContextDimension::Network => ContextSelectionProfile::NetworkConnectivity,
+        ContextDimension::Processes => ContextSelectionProfile::Processes,
+        ContextDimension::Logs => ContextSelectionProfile::Logs,
+        ContextDimension::Services => ContextSelectionProfile::Services,
+    }
+}
+
+fn canonical_context_selection_term(value: &str) -> Option<&'static str> {
+    match value {
+        "health" => Some("health"),
+        "cpu_load" => Some("cpu_load"),
+        "memory" => Some("memory"),
+        "disk_storage" => Some("disk_storage"),
+        "thermal" => Some("thermal"),
+        "network_traffic" => Some("network_traffic"),
+        "network_connectivity" => Some("network_connectivity"),
+        "processes" => Some("processes"),
+        "logs" => Some("logs"),
+        "services" => Some("services"),
+        _ => None,
+    }
+}
+
+fn canonical_context_selection_override(value: &str) -> Option<&'static str> {
+    match value {
+        "include_metrics=true" => Some("include_metrics=true"),
+        "include_metrics=false" => Some("include_metrics=false"),
+        "include_processes=true" => Some("include_processes=true"),
+        "include_processes=false" => Some("include_processes=false"),
+        "include_logs=true" => Some("include_logs=true"),
+        "include_logs=false" => Some("include_logs=false"),
+        "include_network=true" => Some("include_network=true"),
+        "include_network=false" => Some("include_network=false"),
+        "include_services=true" => Some("include_services=true"),
+        "include_services=false" => Some("include_services=false"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2962,6 +3255,8 @@ pub struct LlmOsContext {
     pub dimensions: Vec<ContextDimensionMetadata>,
     pub evidence: Vec<ContextEvidence>,
     pub payload: ContextPayload,
+    #[serde(default)]
+    pub selection: ContextSelectionMetadata,
 }
 
 impl Default for LlmOsContext {
@@ -3002,6 +3297,7 @@ impl Default for LlmOsContext {
                 .collect(),
             evidence: Vec::new(),
             payload: ContextPayload::default(),
+            selection: ContextSelectionMetadata::default(),
         }
     }
 }
@@ -3295,6 +3591,7 @@ fn legacy_llm_context(
         dimensions: statuses,
         evidence: Vec::new(),
         payload: ContextPayload::default(),
+        selection: ContextSelectionMetadata::default(),
     }
 }
 

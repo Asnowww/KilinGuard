@@ -21,8 +21,9 @@ pub mod services;
 pub mod storage;
 
 pub use context::{
-    aggregate_context, build_alert_context, collect_context, summarize_context,
-    summarize_llm_context, ContextInput, ContextInputs, ContextRequest,
+    aggregate_context, build_alert_context, collect_context, focus_llm_context,
+    select_context_dimensions, summarize_context, summarize_llm_context,
+    trim_llm_context_for_intent, ContextFocusResult, ContextInput, ContextInputs, ContextRequest,
     CONTEXT_HEALTH_SUMMARY_SCHEMA, CONTEXT_HEALTH_SUMMARY_SCHEMA_VERSION, CONTEXT_SCHEMA,
     CONTEXT_SCHEMA_VERSION, MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES,
     MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS, MAX_LLM_CONTEXT_JSON_BYTES,
@@ -43,7 +44,8 @@ pub use model::{
     ContextHealthSummaryMode, ContextLoadPayload, ContextLogEntryPayload, ContextLogPatternPayload,
     ContextLogPayload, ContextMemoryPayload, ContextMetricsPayload, ContextNetworkInterfacePayload,
     ContextNetworkPayload, ContextPage, ContextPayload, ContextProbePayload, ContextProcessItem,
-    ContextProcessPayload, ContextServicePayload, ContextServicePortPayload,
+    ContextProcessPayload, ContextSelectionFallbackReason, ContextSelectionMetadata,
+    ContextSelectionProfile, ContextServicePayload, ContextServicePortPayload,
     ContextServiceUnitPayload, ContextThermalPayload, ContextTimeWindow, CorruptSampleDetail,
     CpuCoreSnapshot, CpuSnapshot, DependencyImpactReason, DependencyImpactSeverity,
     DependencyRelationKind, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,

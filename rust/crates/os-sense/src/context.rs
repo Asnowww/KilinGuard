@@ -12,8 +12,10 @@ use crate::model::{
     Alert, AlertContext, CollectionStatus, ContextCapability, ContextCapabilityMetadata,
     ContextDimension, ContextDimensionMetadata, ContextDimensionStatus, ContextEvidence,
     ContextEvidenceKind, ContextHealthStatus, ContextHealthSummary, ContextHealthSummaryMode,
-    ContextTimeWindow, LlmOsContext, LogQueryResult, MetricSnapshot, NetworkSnapshot, OsContext,
-    ProcessList, ResourceDimension, ServiceHealthStatus, ServiceSnapshot,
+    ContextMetricsPayload, ContextPayload, ContextSelectionFallbackReason,
+    ContextSelectionMetadata, ContextSelectionProfile, ContextTimeWindow, LlmOsContext,
+    LogQueryResult, MetricSnapshot, NetworkSnapshot, OsContext, ProcessList, ResourceDimension,
+    ServiceHealthStatus, ServiceSnapshot,
 };
 use crate::network::{collect_network, NetworkQuery};
 use crate::procfs::{basic_meta, MetricsThresholds, ProcessQuery, ProcfsCollector};
@@ -54,6 +56,28 @@ pub struct ContextRequest {
     pub include_services: Option<bool>,
     pub process_allowed_names: Vec<String>,
     pub log_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextFocusResult {
+    pub llm_context: LlmOsContext,
+    pub selection: ContextSelectionMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct ContextIntentSelection {
+    dimensions: BTreeSet<ContextDimension>,
+    metadata: ContextSelectionMetadata,
+}
+
+impl ContextIntentSelection {
+    fn contains(&self, dimension: ContextDimension) -> bool {
+        self.dimensions.contains(&dimension)
+    }
+
+    fn selects_all(&self) -> bool {
+        self.dimensions.len() == ContextDimension::ALL.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -891,6 +915,764 @@ impl ContextRequest {
 }
 
 #[must_use]
+pub fn select_context_dimensions(intent: Option<&str>) -> ContextSelectionMetadata {
+    context_intent_selection(intent).metadata
+}
+
+#[must_use]
+pub fn trim_llm_context_for_intent(
+    context: &LlmOsContext,
+    intent: Option<&str>,
+) -> ContextFocusResult {
+    let selection = context_intent_selection(intent);
+    trim_llm_context_with_selection(context, &selection)
+}
+
+#[must_use]
+pub fn focus_llm_context(context: &LlmOsContext, focus_intent: Option<&str>) -> ContextFocusResult {
+    trim_llm_context_for_intent(context, focus_intent)
+}
+
+fn context_selection_for_request(request: &ContextRequest) -> ContextIntentSelection {
+    let mut selection = context_intent_selection(request.intent.as_deref());
+    apply_context_include_override(
+        &mut selection,
+        request.include_metrics,
+        &[
+            ContextDimension::Cpu,
+            ContextDimension::Memory,
+            ContextDimension::Disk,
+            ContextDimension::Thermal,
+            ContextDimension::NetworkMetrics,
+        ],
+        "include_metrics",
+    );
+    apply_context_include_override(
+        &mut selection,
+        request.include_processes,
+        &[ContextDimension::Processes],
+        "include_processes",
+    );
+    apply_context_include_override(
+        &mut selection,
+        request.include_logs,
+        &[ContextDimension::Logs],
+        "include_logs",
+    );
+    apply_context_include_override(
+        &mut selection,
+        request.include_network,
+        &[ContextDimension::Network],
+        "include_network",
+    );
+    apply_context_include_override(
+        &mut selection,
+        request.include_services,
+        &[ContextDimension::Services],
+        "include_services",
+    );
+    normalize_context_selection_metadata(&mut selection);
+    selection
+}
+
+fn apply_context_include_override(
+    selection: &mut ContextIntentSelection,
+    include: Option<bool>,
+    dimensions: &[ContextDimension],
+    label: &str,
+) {
+    let Some(include) = include else {
+        return;
+    };
+    selection
+        .metadata
+        .explicit_overrides
+        .push(format!("{label}={include}"));
+    for dimension in dimensions {
+        if include {
+            selection.dimensions.insert(*dimension);
+        } else {
+            selection.dimensions.remove(dimension);
+        }
+    }
+}
+
+fn context_intent_selection(intent: Option<&str>) -> ContextIntentSelection {
+    let mut metadata = ContextSelectionMetadata::default();
+    metadata.intent_provided = intent.is_some();
+    let Some(intent) = intent else {
+        metadata.profile = ContextSelectionProfile::All;
+        metadata.fallback_reason = Some(ContextSelectionFallbackReason::EmptyIntent);
+        return all_context_selection(metadata);
+    };
+
+    let (bounded_intent, intent_truncated) = bounded_intent(intent);
+    metadata.intent_truncated = intent_truncated;
+    if bounded_intent.trim().is_empty() {
+        metadata.profile = ContextSelectionProfile::All;
+        metadata.fallback_reason = Some(ContextSelectionFallbackReason::EmptyIntent);
+        return all_context_selection(metadata);
+    }
+
+    let lower = bounded_intent.to_lowercase();
+    let tokens = intent_tokens(&lower);
+    let mut dimensions = BTreeSet::new();
+    let mut profiles = BTreeSet::new();
+    let mut matched_terms = BTreeSet::new();
+
+    add_dimension_if(
+        token_any(
+            &tokens,
+            &["cpu", "load", "loads", "processor", "processors"],
+        ) || chinese_any(&lower, &["负载", "处理器"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Cpu,
+        ContextSelectionProfile::CpuLoad,
+        "cpu_load",
+    );
+    add_dimension_if(
+        token_any(&tokens, &["memory", "mem", "ram", "swap"])
+            || chinese_any(&lower, &["内存", "交换分区", "交换空间"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Memory,
+        ContextSelectionProfile::Memory,
+        "memory",
+    );
+    add_dimension_if(
+        token_any(
+            &tokens,
+            &[
+                "disk",
+                "disks",
+                "storage",
+                "filesystem",
+                "filesystems",
+                "fs",
+                "io",
+                "iops",
+                "mount",
+                "mounts",
+                "partition",
+                "partitions",
+            ],
+        ) || token_pair(&tokens, "file", "system")
+            || lower.contains("i/o")
+            || chinese_any(&lower, &["磁盘", "存储", "文件系统", "分区", "挂载"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Disk,
+        ContextSelectionProfile::DiskStorage,
+        "disk_storage",
+    );
+    add_dimension_if(
+        token_any(
+            &tokens,
+            &[
+                "thermal",
+                "temperature",
+                "temperatures",
+                "temp",
+                "sensor",
+                "sensors",
+                "fan",
+                "fans",
+                "heat",
+            ],
+        ) || chinese_any(&lower, &["温度", "温控", "传感器", "风扇", "散热"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Thermal,
+        ContextSelectionProfile::Thermal,
+        "thermal",
+    );
+
+    let network_word =
+        token_any(&tokens, &["network", "net", "networking"]) || chinese_any(&lower, &["网络"]);
+    let network_traffic = token_any(
+        &tokens,
+        &[
+            "traffic",
+            "bandwidth",
+            "throughput",
+            "interface",
+            "interfaces",
+            "nic",
+            "rx",
+            "tx",
+        ],
+    ) || chinese_any(&lower, &["流量", "带宽", "吞吐", "网卡", "收发"]);
+    let network_connectivity = token_any(
+        &tokens,
+        &[
+            "connection",
+            "connections",
+            "connectivity",
+            "socket",
+            "sockets",
+            "listen",
+            "listening",
+            "dns",
+            "resolver",
+            "port",
+            "ports",
+            "firewall",
+            "tcp",
+            "udp",
+        ],
+    ) || chinese_any(
+        &lower,
+        &["连接", "套接字", "监听", "解析", "端口", "防火墙"],
+    );
+    add_dimension_if(
+        network_traffic || (network_word && !network_connectivity),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::NetworkMetrics,
+        ContextSelectionProfile::NetworkTraffic,
+        "network_traffic",
+    );
+    add_dimension_if(
+        network_connectivity || (network_word && !network_traffic),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Network,
+        ContextSelectionProfile::NetworkConnectivity,
+        "network_connectivity",
+    );
+    add_dimension_if(
+        token_any(&tokens, &["process", "processes", "pid", "pids"])
+            || chinese_any(&lower, &["进程"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Processes,
+        ContextSelectionProfile::Processes,
+        "processes",
+    );
+    add_dimension_if(
+        token_any(
+            &tokens,
+            &[
+                "log", "logs", "journal", "journald", "dmesg", "auth", "audit",
+            ],
+        ) || chinese_any(&lower, &["日志", "认证", "鉴权", "登录"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Logs,
+        ContextSelectionProfile::Logs,
+        "logs",
+    );
+    add_dimension_if(
+        token_any(
+            &tokens,
+            &["service", "services", "systemd", "unit", "units"],
+        ) || chinese_any(&lower, &["服务", "单元"]),
+        &mut dimensions,
+        &mut profiles,
+        &mut matched_terms,
+        ContextDimension::Services,
+        ContextSelectionProfile::Services,
+        "services",
+    );
+
+    if dimensions.is_empty() && is_health_context_intent(&lower, &tokens) {
+        metadata.profile = ContextSelectionProfile::All;
+        metadata.fallback_reason = Some(ContextSelectionFallbackReason::HealthIntent);
+        metadata.matched_terms.push("health".to_string());
+        return all_context_selection(metadata);
+    }
+
+    metadata.matched_terms = matched_terms.into_iter().collect();
+    metadata.profile = if dimensions.is_empty() {
+        ContextSelectionProfile::UnknownFallback
+    } else if profiles.len() == 1 {
+        profiles
+            .into_iter()
+            .next()
+            .unwrap_or(ContextSelectionProfile::UnknownFallback)
+    } else {
+        ContextSelectionProfile::Mixed
+    };
+    if dimensions.is_empty() {
+        metadata.fallback_reason = Some(ContextSelectionFallbackReason::UnknownIntent);
+        return all_context_selection(metadata);
+    }
+    let mut selection = ContextIntentSelection {
+        dimensions,
+        metadata,
+    };
+    normalize_context_selection_metadata(&mut selection);
+    selection
+}
+
+fn all_context_selection(metadata: ContextSelectionMetadata) -> ContextIntentSelection {
+    let mut selection = ContextIntentSelection {
+        dimensions: ContextDimension::ALL.into_iter().collect(),
+        metadata,
+    };
+    normalize_context_selection_metadata(&mut selection);
+    selection
+}
+
+fn normalize_context_selection_metadata(selection: &mut ContextIntentSelection) {
+    selection.metadata.schema = "os-sense.context-selection".to_string();
+    selection.metadata.version = 1;
+    selection.metadata.selected_dimensions = selection.dimensions.iter().copied().collect();
+    selection.metadata.selected_dimensions.sort();
+    selection.metadata.selected_dimensions.dedup();
+    let (profile, fallback_reason) = normalized_profile_for_context_selection(
+        &selection.metadata.selected_dimensions,
+        selection.metadata.fallback_reason,
+    );
+    selection.metadata.profile = profile;
+    selection.metadata.fallback_reason = fallback_reason;
+    selection.metadata.matched_terms.sort();
+    selection.metadata.matched_terms.dedup();
+    selection.metadata.matched_terms.truncate(16);
+    selection.metadata.explicit_overrides.sort();
+    selection.metadata.explicit_overrides.dedup();
+    selection.metadata.explicit_overrides.truncate(8);
+}
+
+fn normalized_profile_for_context_selection(
+    dimensions: &[ContextDimension],
+    fallback_reason: Option<ContextSelectionFallbackReason>,
+) -> (
+    ContextSelectionProfile,
+    Option<ContextSelectionFallbackReason>,
+) {
+    if dimensions.is_empty() {
+        return (ContextSelectionProfile::None, None);
+    }
+    if dimensions.len() == ContextDimension::ALL.len() {
+        return match fallback_reason {
+            Some(ContextSelectionFallbackReason::UnknownIntent) => (
+                ContextSelectionProfile::UnknownFallback,
+                Some(ContextSelectionFallbackReason::UnknownIntent),
+            ),
+            Some(ContextSelectionFallbackReason::HealthIntent) => (
+                ContextSelectionProfile::All,
+                Some(ContextSelectionFallbackReason::HealthIntent),
+            ),
+            Some(ContextSelectionFallbackReason::EmptyIntent) => (
+                ContextSelectionProfile::All,
+                Some(ContextSelectionFallbackReason::EmptyIntent),
+            ),
+            None => (ContextSelectionProfile::All, None),
+        };
+    }
+    (profile_for_context_selection_dimensions(dimensions), None)
+}
+
+fn profile_for_context_selection_dimensions(
+    dimensions: &[ContextDimension],
+) -> ContextSelectionProfile {
+    if dimensions.len() != 1 {
+        return ContextSelectionProfile::Mixed;
+    }
+    match dimensions[0] {
+        ContextDimension::Cpu => ContextSelectionProfile::CpuLoad,
+        ContextDimension::Memory => ContextSelectionProfile::Memory,
+        ContextDimension::Disk => ContextSelectionProfile::DiskStorage,
+        ContextDimension::Thermal => ContextSelectionProfile::Thermal,
+        ContextDimension::NetworkMetrics => ContextSelectionProfile::NetworkTraffic,
+        ContextDimension::Network => ContextSelectionProfile::NetworkConnectivity,
+        ContextDimension::Processes => ContextSelectionProfile::Processes,
+        ContextDimension::Logs => ContextSelectionProfile::Logs,
+        ContextDimension::Services => ContextSelectionProfile::Services,
+    }
+}
+
+fn bounded_intent(intent: &str) -> (String, bool) {
+    let mut bounded = String::new();
+    let mut truncated = false;
+    for (index, ch) in intent.chars().enumerate() {
+        if index >= 256 {
+            truncated = true;
+            break;
+        }
+        bounded.push(if ch.is_control() { ' ' } else { ch });
+    }
+    (bounded, truncated)
+}
+
+fn intent_tokens(intent: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in intent.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn token_any(tokens: &[String], wanted: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        wanted.iter().any(|candidate| token == candidate) && !token_is_negated(tokens, index)
+    })
+}
+
+fn token_pair(tokens: &[String], left: &str, right: &str) -> bool {
+    tokens.windows(2).enumerate().any(|(index, pair)| {
+        pair[0] == left && pair[1] == right && !token_is_negated(tokens, index)
+    })
+}
+
+fn token_is_negated(tokens: &[String], index: usize) -> bool {
+    index > 0
+        && matches!(
+            tokens[index - 1].as_str(),
+            "no" | "not" | "without" | "exclude" | "excluding" | "skip" | "except"
+        )
+}
+
+fn chinese_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn is_health_context_intent(value: &str, tokens: &[String]) -> bool {
+    token_any(
+        tokens,
+        &[
+            "health",
+            "healthy",
+            "summary",
+            "summarize",
+            "status",
+            "diagnose",
+            "diagnosis",
+            "diagnostic",
+            "diagnostics",
+            "anomaly",
+            "anomalies",
+            "abnormal",
+            "inspection",
+            "inspect",
+            "checkup",
+            "overview",
+        ],
+    ) || chinese_any(
+        value,
+        &[
+            "健康", "摘要", "状态", "诊断", "异常", "巡检", "体检", "总览", "整体",
+        ],
+    )
+}
+
+fn add_dimension_if(
+    condition: bool,
+    dimensions: &mut BTreeSet<ContextDimension>,
+    profiles: &mut BTreeSet<ContextSelectionProfile>,
+    matched_terms: &mut BTreeSet<String>,
+    dimension: ContextDimension,
+    profile: ContextSelectionProfile,
+    matched_term: &str,
+) {
+    if condition {
+        dimensions.insert(dimension);
+        profiles.insert(profile);
+        matched_terms.insert(matched_term.to_string());
+    }
+}
+
+fn trim_llm_context_with_selection(
+    context: &LlmOsContext,
+    selection: &ContextIntentSelection,
+) -> ContextFocusResult {
+    let dimensions = context
+        .dimensions
+        .iter()
+        .filter(|dimension| selection.contains(dimension.dimension))
+        .cloned()
+        .collect::<Vec<_>>();
+    let payload = trim_context_payload(&context.payload, selection);
+    let original_matching_evidence = context
+        .evidence
+        .iter()
+        .filter(|evidence| selection.contains(evidence.dimension))
+        .count();
+    let evidence = context
+        .evidence
+        .iter()
+        .filter(|evidence| selection.contains(evidence.dimension))
+        .cloned()
+        .collect();
+    let mut llm_context = LlmOsContext {
+        schema: bounded_identifier(&context.schema),
+        version: context.version,
+        trust: bounded_identifier(&context.trust),
+        handling: bounded_identifier(&context.handling),
+        instructions_allowed: context.instructions_allowed,
+        collected_at_ms: context.collected_at_ms,
+        time_window: context.time_window.clone(),
+        status: ContextDimensionStatus::NotRequested,
+        complete: false,
+        truncated: false,
+        total_unknown: false,
+        metadata_omitted_count: if selection.selects_all() {
+            context.metadata_omitted_count
+        } else {
+            0
+        },
+        evidence_total: 0,
+        evidence_returned_count: 0,
+        evidence_omitted_count: 0,
+        dimensions,
+        evidence,
+        payload,
+        selection: ContextSelectionMetadata::default(),
+    };
+    llm_context
+        .dimensions
+        .sort_by_key(|dimension| dimension.dimension);
+    sanitize_llm_context_for_output(&mut llm_context);
+    llm_context.evidence.sort_by(|left, right| {
+        evidence_severity_rank(&left.severity)
+            .cmp(&evidence_severity_rank(&right.severity))
+            .then_with(|| left.dimension.cmp(&right.dimension))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    llm_context
+        .evidence
+        .dedup_by(|left, right| left.dimension == right.dimension && left.id == right.id);
+    let evidence_dedup_omitted =
+        original_matching_evidence.saturating_sub(llm_context.evidence.len());
+    let inherited_evidence_omitted = inherited_selected_evidence_omitted(context, selection);
+    llm_context.evidence_returned_count = llm_context.evidence.len();
+    llm_context.evidence_omitted_count =
+        inherited_evidence_omitted.saturating_add(evidence_dedup_omitted);
+    llm_context.evidence_total = llm_context
+        .evidence_returned_count
+        .saturating_add(llm_context.evidence_omitted_count);
+    sync_context_counts_from_payload(&mut llm_context);
+    llm_context.status = aggregate_status(&llm_context.dimensions);
+    llm_context.truncated = (selection.selects_all() && context.truncated)
+        || llm_context
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.truncated)
+        || llm_context.evidence_omitted_count > 0
+        || llm_context.metadata_omitted_count > 0;
+    llm_context.total_unknown = (selection.selects_all() && context.total_unknown)
+        || llm_context
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.total_unknown)
+        || llm_context.evidence_omitted_count > 0
+        || llm_context.metadata_omitted_count > 0;
+    llm_context.complete = llm_context.status == ContextDimensionStatus::Complete
+        && !llm_context.truncated
+        && !llm_context.total_unknown;
+    llm_context.selection = selection.metadata.clone();
+    if llm_context.truncated {
+        mark_context_output_partial(&mut llm_context);
+    }
+    enforce_llm_json_limit(&mut llm_context);
+    ContextFocusResult {
+        selection: llm_context.selection.clone(),
+        llm_context,
+    }
+}
+
+fn inherited_selected_evidence_omitted(
+    context: &LlmOsContext,
+    _selection: &ContextIntentSelection,
+) -> usize {
+    context.evidence_omitted_count
+}
+
+fn filter_alerts_for_selection(alerts: &mut Vec<Alert>, selection: &ContextIntentSelection) {
+    alerts.retain(|alert| alert_matches_selection(alert, selection));
+}
+
+fn alert_matches_selection(alert: &Alert, selection: &ContextIntentSelection) -> bool {
+    match alert.dimension.to_ascii_lowercase().as_str() {
+        "cpu" | "load" => selection.contains(ContextDimension::Cpu),
+        "memory" | "mem" | "swap" => selection.contains(ContextDimension::Memory),
+        "disk" | "storage" | "filesystem" | "fs" | "io" => {
+            selection.contains(ContextDimension::Disk)
+        }
+        "thermal" | "temperature" | "temp" | "fan" => selection.contains(ContextDimension::Thermal),
+        "network_metrics" | "network-interface" | "interface" | "traffic" | "bandwidth" => {
+            selection.contains(ContextDimension::NetworkMetrics)
+        }
+        "network" | "dns" | "connection" | "connections" | "port" | "firewall" => {
+            selection.contains(ContextDimension::Network)
+        }
+        "process" | "processes" | "pid" => selection.contains(ContextDimension::Processes),
+        "log" | "logs" | "journal" | "dmesg" | "auth" => selection.contains(ContextDimension::Logs),
+        "service" | "services" | "systemd" | "unit" => {
+            selection.contains(ContextDimension::Services)
+        }
+        _ => selection.selects_all(),
+    }
+}
+
+fn trim_context_payload(
+    payload: &ContextPayload,
+    selection: &ContextIntentSelection,
+) -> ContextPayload {
+    let mut trimmed = ContextPayload::default();
+    if let Some(metrics) = &payload.metrics {
+        let mut selected_metrics = ContextMetricsPayload::default();
+        let mut has_metrics = false;
+        if selection.contains(ContextDimension::Cpu) {
+            selected_metrics.cpu = metrics.cpu.clone();
+            selected_metrics.load = metrics.load.clone();
+            has_metrics = true;
+        }
+        if selection.contains(ContextDimension::Memory) {
+            selected_metrics.memory = metrics.memory.clone();
+            has_metrics = true;
+        }
+        if selection.contains(ContextDimension::Disk) {
+            selected_metrics.disks = metrics.disks.clone();
+            selected_metrics.disk_devices = metrics.disk_devices.clone();
+            has_metrics = true;
+        }
+        if selection.contains(ContextDimension::NetworkMetrics) {
+            selected_metrics.network_interfaces = metrics.network_interfaces.clone();
+            has_metrics = true;
+        }
+        if selection.contains(ContextDimension::Thermal) {
+            selected_metrics.thermal_sensors = metrics.thermal_sensors.clone();
+            has_metrics = true;
+        }
+        if has_metrics {
+            trimmed.metrics = Some(selected_metrics);
+        }
+    }
+    if selection.contains(ContextDimension::Processes) {
+        trimmed.processes = payload.processes.clone();
+    }
+    if selection.contains(ContextDimension::Logs) {
+        trimmed.logs = payload.logs.clone();
+    }
+    if selection.contains(ContextDimension::Network) {
+        trimmed.network = payload.network.clone();
+    }
+    if selection.contains(ContextDimension::Services) {
+        trimmed.services = payload.services.clone();
+    }
+    trimmed
+}
+
+fn sanitize_llm_context_for_output(context: &mut LlmOsContext) {
+    for dimension in &mut context.dimensions {
+        for source in &mut dimension.sources {
+            *source = sanitize_context_string(source);
+        }
+        for error in &mut dimension.errors {
+            *error = sanitize_context_string(error);
+        }
+    }
+    for evidence in &mut context.evidence {
+        evidence.id = bounded_identifier(&sanitize_context_string(&evidence.id));
+        evidence.severity = bounded_identifier(&sanitize_context_string(&evidence.severity));
+        evidence.subject = evidence
+            .subject
+            .as_deref()
+            .map(sanitize_context_string)
+            .filter(|value| !value.is_empty());
+        evidence.message = sanitize_context_string(&evidence.message);
+    }
+    sanitize_payload_strings(&mut context.payload);
+}
+
+fn sanitize_payload_strings(payload: &mut ContextPayload) {
+    let Ok(mut value) = serde_json::to_value(&*payload) else {
+        return;
+    };
+    sanitize_json_strings(&mut value);
+    if let Ok(sanitized) = serde_json::from_value(value) {
+        *payload = sanitized;
+    }
+}
+
+fn sanitize_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = sanitize_context_string(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_json_strings(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                sanitize_json_strings(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_context_string(value: &str) -> String {
+    let normalized = value
+        .split_whitespace()
+        .map(sanitize_context_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_text(&normalized)
+}
+
+fn sanitize_context_token(token: &str) -> String {
+    let without_query = strip_context_query(token);
+    if is_context_path_token(&without_query) {
+        "[REDACTED_PATH]".to_string()
+    } else {
+        without_query
+    }
+}
+
+fn strip_context_query(token: &str) -> String {
+    let Some(index) = token.find('?') else {
+        return token.to_string();
+    };
+    let head = &token[..index];
+    if head.contains("://") || token[index + 1..].contains('=') {
+        format!("{head}?[REDACTED]")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_context_path_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if trimmed.contains("://") {
+        return false;
+    }
+    trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || (trimmed.len() >= 3
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':'
+            && matches!(trimmed.as_bytes()[2], b'\\' | b'/'))
+}
+
+#[must_use]
 pub fn collect_context(request: &ContextRequest) -> Result<OsContext> {
     let mut collector = ProcfsCollector::default();
     collect_context_with(request, &mut collector, &MetricsThresholds::default())
@@ -902,22 +1684,16 @@ pub(crate) fn collect_context_with(
     thresholds: &MetricsThresholds,
 ) -> Result<OsContext> {
     request.validate()?;
-    let wanted = dimensions_for_intent(request.intent.as_deref());
-    let include_metrics = request
-        .include_metrics
-        .unwrap_or_else(|| wanted.contains(&"metrics"));
-    let include_processes = request
-        .include_processes
-        .unwrap_or_else(|| wanted.contains(&"processes"));
-    let include_logs = request
-        .include_logs
-        .unwrap_or_else(|| wanted.contains(&"logs"));
-    let include_network = request
-        .include_network
-        .unwrap_or_else(|| wanted.contains(&"network"));
-    let include_services = request
-        .include_services
-        .unwrap_or_else(|| wanted.contains(&"services"));
+    let selection = context_selection_for_request(request);
+    let include_metrics = selection.contains(ContextDimension::Cpu)
+        || selection.contains(ContextDimension::Memory)
+        || selection.contains(ContextDimension::Disk)
+        || selection.contains(ContextDimension::Thermal)
+        || selection.contains(ContextDimension::NetworkMetrics);
+    let include_processes = selection.contains(ContextDimension::Processes);
+    let include_logs = selection.contains(ContextDimension::Logs);
+    let include_network = selection.contains(ContextDimension::Network);
+    let include_services = selection.contains(ContextDimension::Services);
 
     let mut inputs = ContextInputs::new(crate::procfs::now_ms());
     if include_metrics {
@@ -969,6 +1745,13 @@ pub(crate) fn collect_context_with(
     }
 
     let mut context = aggregate_context(inputs);
+    let focused = trim_llm_context_with_selection(&context.llm_context, &selection);
+    context.llm_context = focused.llm_context;
+    context.dimensions = legacy_groups_from_selection(&selection)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    filter_alerts_for_selection(&mut context.alerts, &selection);
     populate_legacy_context_consumers(&mut context);
     Ok(context)
 }
@@ -1107,6 +1890,7 @@ pub fn aggregate_context(mut inputs: ContextInputs) -> OsContext {
         dimensions: statuses,
         evidence,
         payload,
+        selection: ContextSelectionMetadata::default(),
     };
     if llm_context.truncated {
         mark_context_output_partial(&mut llm_context);
@@ -4045,49 +4829,39 @@ pub fn build_alert_context(alerts: &[Alert], generated_at_ms: u64) -> Option<Ale
     })
 }
 
+#[cfg(test)]
 fn dimensions_for_intent(intent: Option<&str>) -> Vec<&'static str> {
-    let Some(intent) = intent else {
-        return all_dimensions();
-    };
-    let lower = intent.to_ascii_lowercase();
-    let mut dims = Vec::new();
-    if contains_any(
-        &lower,
-        &["cpu", "mem", "memory", "disk", "load", "resource"],
-    ) {
-        dims.push("metrics");
-    }
-    if contains_any(&lower, &["process", "pid"]) {
-        dims.push("processes");
-    }
-    if contains_any(&lower, &["log", "journal", "dmesg", "auth"]) {
-        dims.push("logs");
-    }
-    if contains_any(
-        &lower,
-        &["network", "dns", "port", "connection", "firewall"],
-    ) {
-        dims.push("network");
-    }
-    if contains_any(&lower, &["service", "systemd", "unit"]) {
-        dims.push("services");
-    }
-    if contains_any(
-        &lower,
-        &["health", "summary", "status", "diagnose", "anomaly"],
-    ) || dims.is_empty()
-    {
-        return all_dimensions();
-    }
-    dims
+    let selection = context_intent_selection(intent);
+    legacy_groups_from_selection(&selection)
 }
 
 fn all_dimensions() -> Vec<&'static str> {
     vec!["metrics", "processes", "logs", "network", "services"]
 }
 
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
+fn legacy_groups_from_selection(selection: &ContextIntentSelection) -> Vec<&'static str> {
+    let mut groups = Vec::new();
+    if selection.contains(ContextDimension::Cpu)
+        || selection.contains(ContextDimension::Memory)
+        || selection.contains(ContextDimension::Disk)
+        || selection.contains(ContextDimension::Thermal)
+        || selection.contains(ContextDimension::NetworkMetrics)
+    {
+        groups.push("metrics");
+    }
+    if selection.contains(ContextDimension::Processes) {
+        groups.push("processes");
+    }
+    if selection.contains(ContextDimension::Logs) {
+        groups.push("logs");
+    }
+    if selection.contains(ContextDimension::Network) {
+        groups.push("network");
+    }
+    if selection.contains(ContextDimension::Services) {
+        groups.push("services");
+    }
+    groups
 }
 
 fn build_health_summary(
