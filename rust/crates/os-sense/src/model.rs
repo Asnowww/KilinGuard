@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::redaction::redact_sensitive_text;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceDimension {
@@ -2534,6 +2536,410 @@ const fn default_context_evidence_count() -> usize {
     1
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextHealthSummaryMode {
+    #[default]
+    RuleBased,
+    Llm,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextHealthStatus {
+    Healthy,
+    Degraded,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for ContextHealthStatus {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "healthy" => Ok(Self::Healthy),
+            "degraded" => Ok(Self::Degraded),
+            "failed" => Ok(Self::Failed),
+            "unknown" | "partial" => Ok(Self::Unknown),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["healthy", "degraded", "failed", "unknown", "partial"],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContextHealthSummary {
+    pub schema: String,
+    pub version: u32,
+    pub mode: ContextHealthSummaryMode,
+    pub generated_at_ms: u64,
+    /// Legacy-compatible collection status for the summarized context.
+    pub status: ContextDimensionStatus,
+    pub collection_status: ContextDimensionStatus,
+    pub health_status: ContextHealthStatus,
+    pub complete: bool,
+    pub context_truncated: bool,
+    pub text_truncated: bool,
+    pub truncated: bool,
+    pub total_unknown: bool,
+    pub covered_dimensions: Vec<ContextDimension>,
+    pub evidence_ids: Vec<String>,
+    pub metadata_omitted_count: usize,
+    pub evidence_omitted_count: usize,
+    pub summary_omitted_count: usize,
+    pub omitted_count: usize,
+    pub failure_reason: Option<String>,
+    pub text: String,
+}
+
+impl Default for ContextHealthSummary {
+    fn default() -> Self {
+        Self {
+            schema: "os-sense.health-summary".to_string(),
+            version: 1,
+            mode: ContextHealthSummaryMode::RuleBased,
+            generated_at_ms: 0,
+            status: ContextDimensionStatus::NotRequested,
+            collection_status: ContextDimensionStatus::NotRequested,
+            health_status: ContextHealthStatus::Unknown,
+            complete: false,
+            context_truncated: false,
+            text_truncated: false,
+            truncated: false,
+            total_unknown: false,
+            covered_dimensions: Vec::new(),
+            evidence_ids: Vec::new(),
+            metadata_omitted_count: 0,
+            evidence_omitted_count: 0,
+            summary_omitted_count: 0,
+            omitted_count: 0,
+            failure_reason: None,
+            text: String::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextHealthSummary {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawContextHealthSummaryForNormalize::deserialize(deserializer)?;
+        Ok(normalize_context_health_summary(raw))
+    }
+}
+
+fn normalize_context_health_summary(
+    raw: RawContextHealthSummaryForNormalize,
+) -> ContextHealthSummary {
+    let collection_status = raw.collection_status.unwrap_or(raw.status);
+    let (text, normalized_text_truncated) = normalize_health_summary_text(&raw.text);
+    let (covered_dimensions, covered_omitted) =
+        normalize_health_summary_dimensions(raw.covered_dimensions);
+    let (evidence_ids, evidence_omitted) = normalize_health_summary_ids(raw.evidence_ids);
+    let summary_omitted_count = raw
+        .summary_omitted_count
+        .saturating_add(covered_omitted)
+        .saturating_add(evidence_omitted);
+    let metadata_omitted_count = raw.metadata_omitted_count;
+    let evidence_omitted_count = raw.evidence_omitted_count;
+    let minimum_omitted = metadata_omitted_count
+        .max(evidence_omitted_count)
+        .saturating_add(summary_omitted_count);
+    let text_truncated = raw.text_truncated || normalized_text_truncated;
+    let context_truncated = raw.context_truncated.unwrap_or(raw.truncated);
+    let truncated =
+        raw.truncated || context_truncated || text_truncated || summary_omitted_count > 0;
+    let total_unknown = raw.total_unknown || summary_omitted_count > 0;
+    let health_status = normalize_deserialized_health_status(
+        raw.health_status,
+        collection_status,
+        raw.complete,
+        truncated,
+        total_unknown,
+    );
+    ContextHealthSummary {
+        schema: if raw.schema.is_empty() {
+            "os-sense.health-summary".to_string()
+        } else {
+            raw.schema
+        },
+        version: if raw.version == 0 { 1 } else { raw.version },
+        mode: raw.mode,
+        generated_at_ms: raw.generated_at_ms,
+        status: collection_status,
+        collection_status,
+        health_status,
+        complete: raw.complete && !truncated && !total_unknown,
+        context_truncated,
+        text_truncated,
+        truncated,
+        total_unknown,
+        covered_dimensions,
+        evidence_ids,
+        metadata_omitted_count,
+        evidence_omitted_count,
+        summary_omitted_count,
+        omitted_count: raw
+            .omitted_count
+            .unwrap_or(minimum_omitted)
+            .max(minimum_omitted),
+        failure_reason: raw
+            .failure_reason
+            .map(|reason| normalize_health_summary_id(&reason)),
+        text,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawContextHealthSummaryForNormalize {
+    schema: String,
+    version: u32,
+    mode: ContextHealthSummaryMode,
+    generated_at_ms: u64,
+    status: ContextDimensionStatus,
+    collection_status: Option<ContextDimensionStatus>,
+    health_status: Option<ContextHealthStatus>,
+    complete: bool,
+    context_truncated: Option<bool>,
+    text_truncated: bool,
+    truncated: bool,
+    total_unknown: bool,
+    covered_dimensions: Vec<ContextDimension>,
+    evidence_ids: Vec<String>,
+    metadata_omitted_count: usize,
+    evidence_omitted_count: usize,
+    summary_omitted_count: usize,
+    omitted_count: Option<usize>,
+    failure_reason: Option<String>,
+    text: String,
+}
+
+impl Default for RawContextHealthSummaryForNormalize {
+    fn default() -> Self {
+        let defaults = ContextHealthSummary::default();
+        Self {
+            schema: defaults.schema,
+            version: defaults.version,
+            mode: defaults.mode,
+            generated_at_ms: defaults.generated_at_ms,
+            status: defaults.status,
+            collection_status: None,
+            health_status: None,
+            complete: defaults.complete,
+            context_truncated: None,
+            text_truncated: defaults.text_truncated,
+            truncated: defaults.truncated,
+            total_unknown: defaults.total_unknown,
+            covered_dimensions: defaults.covered_dimensions,
+            evidence_ids: defaults.evidence_ids,
+            metadata_omitted_count: defaults.metadata_omitted_count,
+            evidence_omitted_count: defaults.evidence_omitted_count,
+            summary_omitted_count: defaults.summary_omitted_count,
+            omitted_count: None,
+            failure_reason: defaults.failure_reason,
+            text: defaults.text,
+        }
+    }
+}
+
+const MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_CHARS: usize = 768;
+const MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_BYTES: usize = 2 * 1024;
+const MAX_DESERIALIZED_HEALTH_SUMMARY_IDS: usize = 16;
+const MAX_DESERIALIZED_HEALTH_SUMMARY_DIMS: usize = 16;
+const MAX_DESERIALIZED_HEALTH_SUMMARY_ID_CHARS: usize = 128;
+
+fn normalize_health_summary_text(value: &str) -> (String, bool) {
+    let prefix = bounded_char_byte_prefix(
+        value,
+        MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_CHARS.saturating_mul(2),
+        MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_BYTES.saturating_mul(2),
+    );
+    let single_paragraph = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+    let without_query_or_path = single_paragraph
+        .split_whitespace()
+        .map(sanitize_deserialized_health_summary_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let redacted = redact_sensitive_text(
+        &without_query_or_path,
+        MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_CHARS.saturating_sub("...[truncated]".len()),
+    );
+    let (bounded, byte_truncated) = truncate_utf8_bytes_for_health_summary(
+        &redacted,
+        MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_BYTES,
+    );
+    let input_truncated = prefix.len() < value.len()
+        || single_paragraph.chars().count() > MAX_DESERIALIZED_HEALTH_SUMMARY_TEXT_CHARS;
+    (bounded, input_truncated || byte_truncated)
+}
+
+fn normalize_health_summary_dimensions(
+    mut values: Vec<ContextDimension>,
+) -> (Vec<ContextDimension>, usize) {
+    let original_len = values.len();
+    values.sort();
+    values.dedup();
+    if values.len() > MAX_DESERIALIZED_HEALTH_SUMMARY_DIMS {
+        values.truncate(MAX_DESERIALIZED_HEALTH_SUMMARY_DIMS);
+    }
+    let omitted = original_len.saturating_sub(values.len());
+    (values, omitted)
+}
+
+fn normalize_health_summary_ids(values: Vec<String>) -> (Vec<String>, usize) {
+    let original_len = values.len();
+    let mut ids = values
+        .into_iter()
+        .take(MAX_DESERIALIZED_HEALTH_SUMMARY_IDS)
+        .map(|value| normalize_health_summary_id(&value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    let omitted = original_len.saturating_sub(ids.len());
+    (ids, omitted)
+}
+
+fn normalize_health_summary_id(value: &str) -> String {
+    let prefix = bounded_char_byte_prefix(
+        value,
+        MAX_DESERIALIZED_HEALTH_SUMMARY_ID_CHARS.saturating_mul(2),
+        MAX_DESERIALIZED_HEALTH_SUMMARY_ID_CHARS.saturating_mul(4),
+    );
+    let single_token = prefix.split_whitespace().collect::<Vec<_>>().join("_");
+    let single_token = sanitize_deserialized_health_summary_token(&single_token);
+    redact_sensitive_text(
+        &single_token,
+        MAX_DESERIALIZED_HEALTH_SUMMARY_ID_CHARS.saturating_sub("...[truncated]".len()),
+    )
+}
+
+fn sanitize_deserialized_health_summary_token(token: &str) -> String {
+    let token = strip_deserialized_health_summary_query(token);
+    if is_deserialized_health_summary_path_token(&token) {
+        "[REDACTED_PATH]".to_string()
+    } else {
+        token
+    }
+}
+
+fn strip_deserialized_health_summary_query(token: &str) -> String {
+    let Some(index) = token.find('?') else {
+        return token.to_string();
+    };
+    let head = &token[..index];
+    if head.contains("://") || token[index + 1..].contains('=') {
+        format!("{head}?[REDACTED]")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_deserialized_health_summary_path_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if trimmed.contains("://") {
+        return false;
+    }
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+    {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn legacy_health_status_from_collection(
+    collection_status: ContextDimensionStatus,
+    complete: bool,
+    truncated: bool,
+    total_unknown: bool,
+) -> ContextHealthStatus {
+    match collection_status {
+        ContextDimensionStatus::Complete if complete && !truncated && !total_unknown => {
+            ContextHealthStatus::Healthy
+        }
+        ContextDimensionStatus::Failed => ContextHealthStatus::Failed,
+        ContextDimensionStatus::Partial | ContextDimensionStatus::Complete => {
+            ContextHealthStatus::Unknown
+        }
+        ContextDimensionStatus::Unavailable | ContextDimensionStatus::NotRequested => {
+            ContextHealthStatus::Unknown
+        }
+    }
+}
+
+fn normalize_deserialized_health_status(
+    raw: Option<ContextHealthStatus>,
+    collection_status: ContextDimensionStatus,
+    complete: bool,
+    truncated: bool,
+    total_unknown: bool,
+) -> ContextHealthStatus {
+    match collection_status {
+        ContextDimensionStatus::NotRequested | ContextDimensionStatus::Unavailable => {
+            ContextHealthStatus::Unknown
+        }
+        ContextDimensionStatus::Failed => ContextHealthStatus::Failed,
+        ContextDimensionStatus::Partial => ContextHealthStatus::Unknown,
+        ContextDimensionStatus::Complete if complete && !truncated && !total_unknown => match raw {
+            Some(ContextHealthStatus::Healthy) | None => ContextHealthStatus::Healthy,
+            _ => ContextHealthStatus::Unknown,
+        },
+        ContextDimensionStatus::Complete => ContextHealthStatus::Unknown,
+    }
+}
+
+fn bounded_char_byte_prefix(value: &str, max_chars: usize, max_bytes: usize) -> &str {
+    let mut end = 0usize;
+    for (count, (index, ch)) in value.char_indices().enumerate() {
+        if count >= max_chars {
+            break;
+        }
+        let next = index.saturating_add(ch.len_utf8());
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
+}
+
+fn truncate_utf8_bytes_for_health_summary(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
+    }
+    let marker = "...[truncated]";
+    let keep_bytes = max_bytes.saturating_sub(marker.len());
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let next = index.saturating_add(ch.len_utf8());
+        if next > keep_bytes {
+            break;
+        }
+        end = next;
+    }
+    (format!("{}{}", &value[..end], marker), true)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LlmOsContext {
@@ -2612,6 +3018,8 @@ pub struct OsContext {
     pub alerts: Vec<Alert>,
     pub alert_context: Option<AlertContext>,
     pub summary: String,
+    #[serde(default)]
+    pub health_summary: ContextHealthSummary,
     pub cropped_dimensions: Vec<String>,
     pub llm_context: LlmOsContext,
 }
@@ -2643,6 +3051,8 @@ impl<'de> Deserialize<'de> for OsContext {
             #[serde(default)]
             summary: String,
             #[serde(default)]
+            health_summary: Option<ContextHealthSummary>,
+            #[serde(default)]
             cropped_dimensions: Vec<String>,
             #[serde(default)]
             llm_context: Option<LlmOsContext>,
@@ -2660,6 +3070,9 @@ impl<'de> Deserialize<'de> for OsContext {
                 raw.services.as_ref(),
             )
         });
+        let health_summary = raw
+            .health_summary
+            .unwrap_or_else(|| legacy_context_health_summary(&raw.summary, &llm_context));
         Ok(Self {
             meta: raw.meta,
             dimensions: raw.dimensions,
@@ -2671,9 +3084,62 @@ impl<'de> Deserialize<'de> for OsContext {
             alerts: raw.alerts,
             alert_context: raw.alert_context,
             summary: raw.summary,
+            health_summary,
             cropped_dimensions: raw.cropped_dimensions,
             llm_context,
         })
+    }
+}
+
+fn legacy_context_health_summary(summary: &str, context: &LlmOsContext) -> ContextHealthSummary {
+    let (text, text_truncated) = normalize_health_summary_text(summary);
+    let (covered_dimensions, covered_omitted) = normalize_health_summary_dimensions(
+        context
+            .dimensions
+            .iter()
+            .filter(|dimension| dimension.requested)
+            .map(|dimension| dimension.dimension)
+            .collect::<Vec<_>>(),
+    );
+    let metadata_omitted_count = context.metadata_omitted_count.saturating_add(
+        context
+            .dimensions
+            .iter()
+            .filter(|dimension| dimension.requested)
+            .map(|dimension| dimension.omitted_count)
+            .sum::<usize>(),
+    );
+    let evidence_omitted_count = context.evidence_omitted_count;
+    let summary_omitted_count = covered_omitted.saturating_add(usize::from(text_truncated));
+    let omitted_count = metadata_omitted_count
+        .max(evidence_omitted_count)
+        .saturating_add(summary_omitted_count);
+    let context_truncated = context.truncated;
+    let truncated = context_truncated || text_truncated || summary_omitted_count > 0;
+    let total_unknown = context.total_unknown || text_truncated || summary_omitted_count > 0;
+    ContextHealthSummary {
+        generated_at_ms: context.collected_at_ms,
+        status: context.status,
+        collection_status: context.status,
+        health_status: legacy_health_status_from_collection(
+            context.status,
+            context.complete,
+            truncated,
+            total_unknown,
+        ),
+        complete: context.complete && !truncated && !total_unknown,
+        context_truncated,
+        text_truncated,
+        truncated,
+        total_unknown,
+        covered_dimensions,
+        metadata_omitted_count,
+        evidence_omitted_count,
+        summary_omitted_count,
+        omitted_count,
+        failure_reason: (!context.complete).then(|| "legacy_context_incomplete".to_string()),
+        text,
+        ..ContextHealthSummary::default()
     }
 }
 

@@ -1534,10 +1534,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_context_summary",
-            description: "Collect or reuse bounded OS metrics, processes, logs, network, and services and return a versioned, data-only structured LLM context. Each dimension distinguishes not requested, unavailable, failed, partial, and complete; anomaly counts are computed before deterministic output limits.",
+            description: "Collect bounded OS metrics, processes, logs, network, and services once, or summarize an existing llm_context. The llm_context input is mutually exclusive with intent/include_*/process_allowed_names/log_limit; direct llm_context mode returns only a bounded summary envelope and never echoes the provided context.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "llm_context": {
+                        "type": "object",
+                        "description": "Existing os-sense.llm-context object. Mutually exclusive with all collection selector fields. When provided, the tool only summarizes this structured context and does not collect, persist, or echo OS data."
+                    },
                     "intent": { "type": "string", "maxLength": 256, "description": "Legacy compatibility selector; it never supplies commands, paths, or probe targets." },
                     "include_metrics": { "type": "boolean" },
                     "include_processes": { "type": "boolean" },
@@ -1861,7 +1865,8 @@ fn execute_tool_with_enforcer(
                 input,
                 PermissionMode::ReadOnly,
             )?;
-            from_value::<OsContextRequest>(input).and_then(run_os_context_summary)
+            reject_oversized_os_context_summary_input(input)?;
+            from_value::<OsContextSummaryInput>(input).and_then(run_os_context_summary)
         }
         "GitStatus" => from_value::<GitStatusInput>(input).and_then(run_git_status),
         "GitDiff" => from_value::<GitDiffInput>(input).and_then(run_git_diff),
@@ -2483,13 +2488,184 @@ fn run_os_service_status(input: OsServiceQuery) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_os_context_summary(input: OsContextRequest) -> Result<String, String> {
+fn run_os_context_summary(input: OsContextSummaryInput) -> Result<String, String> {
+    input.validate_exclusive()?;
+    if let Some(llm_context) = input.llm_context {
+        return os_context_summary_output(llm_context, OsContextSummaryOutputMode::Provided);
+    }
+    let request = input.into_context_request();
     with_os_sense_runtime(|runtime| {
         let context = runtime
-            .collect_context_on_demand(&input)
+            .collect_context_on_demand(&request)
             .map_err(|error| error.to_string())?;
-        to_pretty_json(context.llm_context)
+        os_context_summary_output(context.llm_context, OsContextSummaryOutputMode::Collected)
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsContextSummaryOutputMode {
+    Provided,
+    Collected,
+}
+
+impl OsContextSummaryOutputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provided => "provided_context",
+            Self::Collected => "collected_context",
+        }
+    }
+}
+
+fn os_context_summary_output(
+    mut llm_context: os_sense::LlmOsContext,
+    mode: OsContextSummaryOutputMode,
+) -> Result<String, String> {
+    if mode == OsContextSummaryOutputMode::Provided {
+        let health_summary = os_sense::summarize_llm_context(&llm_context);
+        let summary = health_summary.text.clone();
+        return limited_context_summary_json(context_summary_envelope(
+            mode,
+            None,
+            &health_summary,
+            &summary,
+            false,
+        ));
+    }
+
+    let mut output_truncated = false;
+    loop {
+        let health_summary = os_sense::summarize_llm_context(&llm_context);
+        let summary = health_summary.text.clone();
+        let envelope = context_summary_envelope(
+            mode,
+            Some(&llm_context),
+            &health_summary,
+            &summary,
+            output_truncated,
+        );
+        let json = to_pretty_json(&envelope)?;
+        if json.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES {
+            return Ok(json);
+        }
+        if !shrink_llm_context_for_summary_output(&mut llm_context) {
+            let health_summary = unverifiable_context_health_summary(&health_summary);
+            let summary = health_summary.text.clone();
+            return limited_context_summary_json(context_summary_envelope(
+                mode,
+                None,
+                &health_summary,
+                &summary,
+                true,
+            ));
+        }
+        output_truncated = true;
+    }
+}
+
+fn unverifiable_context_health_summary(
+    source: &os_sense::ContextHealthSummary,
+) -> os_sense::ContextHealthSummary {
+    let summary_omitted_count = source
+        .summary_omitted_count
+        .saturating_add(source.evidence_ids.len())
+        .saturating_add(source.covered_dimensions.len())
+        .saturating_add(1);
+    os_sense::ContextHealthSummary {
+        health_status: os_sense::ContextHealthStatus::Unknown,
+        complete: false,
+        context_truncated: true,
+        text_truncated: false,
+        truncated: true,
+        total_unknown: true,
+        covered_dimensions: Vec::new(),
+        evidence_ids: Vec::new(),
+        summary_omitted_count,
+        omitted_count: source
+            .metadata_omitted_count
+            .max(source.evidence_omitted_count)
+            .saturating_add(summary_omitted_count),
+        failure_reason: Some("llm_context_output_omitted".to_string()),
+        text: "System health could not be verified because the summarized context was omitted to keep the tool output within size limits.".to_string(),
+        ..source.clone()
+    }
+}
+
+fn context_summary_envelope(
+    mode: OsContextSummaryOutputMode,
+    llm_context: Option<&os_sense::LlmOsContext>,
+    health_summary: &os_sense::ContextHealthSummary,
+    summary: &str,
+    llm_context_output_truncated: bool,
+) -> Value {
+    let mut envelope = json!({
+        "schema": "os-sense.context-summary-output",
+        "version": 1,
+        "mode": mode.as_str(),
+        "llm_context_included": llm_context.is_some(),
+        "llm_context_output_truncated": llm_context_output_truncated,
+        "health_summary": health_summary,
+        "summary": summary
+    });
+    if let Some(llm_context) = llm_context {
+        envelope["llm_context"] = json!(llm_context);
+    }
+    envelope
+}
+
+fn limited_context_summary_json(value: Value) -> Result<String, String> {
+    let json = to_pretty_json(&value)?;
+    if json.len() > os_sense::MAX_LLM_CONTEXT_JSON_BYTES {
+        return Err(format!(
+            "os_context_summary output exceeds {} bytes",
+            os_sense::MAX_LLM_CONTEXT_JSON_BYTES
+        ));
+    }
+    Ok(json)
+}
+
+fn shrink_llm_context_for_summary_output(context: &mut os_sense::LlmOsContext) -> bool {
+    if context.evidence.pop().is_some() {
+        context.evidence_returned_count = context.evidence.len();
+        context.evidence_omitted_count = context
+            .evidence_total
+            .saturating_sub(context.evidence_returned_count);
+        mark_llm_context_output_truncated(context);
+        return true;
+    }
+    if context.payload != os_sense::ContextPayload::default() {
+        context.payload = os_sense::ContextPayload::default();
+        mark_llm_context_output_truncated(context);
+        return true;
+    }
+    if !context.dimensions.is_empty() {
+        context.metadata_omitted_count = context
+            .metadata_omitted_count
+            .saturating_add(context.dimensions.len());
+        context.dimensions.clear();
+        mark_llm_context_output_truncated(context);
+        return true;
+    }
+    false
+}
+
+fn mark_llm_context_output_truncated(context: &mut os_sense::LlmOsContext) {
+    context.truncated = true;
+    context.total_unknown = true;
+    context.complete = false;
+}
+
+fn reject_oversized_os_context_summary_input(input: &Value) -> Result<(), String> {
+    let len = serde_json::to_vec(input)
+        .map_err(|error| format!("invalid os_context_summary input: {error}"))?
+        .len();
+    if len > os_sense::MAX_LLM_CONTEXT_JSON_BYTES {
+        return Err(format!(
+            "os_context_summary input exceeds {} bytes",
+            os_sense::MAX_LLM_CONTEXT_JSON_BYTES
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3720,6 +3896,65 @@ struct OsMetricsSnapshotInput {
 #[serde(deny_unknown_fields)]
 struct OsMetricsHistoryInput {
     window: TimeSeriesWindow,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OsContextSummaryInput {
+    #[serde(default)]
+    llm_context: Option<os_sense::LlmOsContext>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    include_metrics: Option<bool>,
+    #[serde(default)]
+    include_processes: Option<bool>,
+    #[serde(default)]
+    include_logs: Option<bool>,
+    #[serde(default)]
+    include_network: Option<bool>,
+    #[serde(default)]
+    include_services: Option<bool>,
+    #[serde(default)]
+    process_allowed_names: Vec<String>,
+    #[serde(default)]
+    log_limit: Option<usize>,
+}
+
+impl OsContextSummaryInput {
+    fn validate_exclusive(&self) -> Result<(), String> {
+        if self.llm_context.is_some() && self.has_collection_options() {
+            return Err(
+                "os_context_summary llm_context is mutually exclusive with collection selector fields"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn has_collection_options(&self) -> bool {
+        self.intent.is_some()
+            || self.include_metrics.is_some()
+            || self.include_processes.is_some()
+            || self.include_logs.is_some()
+            || self.include_network.is_some()
+            || self.include_services.is_some()
+            || self.log_limit.is_some()
+            || !self.process_allowed_names.is_empty()
+    }
+
+    fn into_context_request(self) -> OsContextRequest {
+        OsContextRequest {
+            intent: self.intent,
+            include_metrics: self.include_metrics,
+            include_processes: self.include_processes,
+            include_logs: self.include_logs,
+            include_network: self.include_network,
+            include_services: self.include_services,
+            process_allowed_names: self.process_allowed_names,
+            log_limit: self.log_limit,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -11625,15 +11860,327 @@ printf 'pwsh:%s' "$1"
             panic!("os_context_summary should be allowed in read-only mode: {error}")
         });
         let value: Value = serde_json::from_str(&output).expect("structured context JSON");
-        assert_eq!(value["schema"], "os-sense.llm-context");
+        assert_eq!(value["schema"], "os-sense.context-summary-output");
         assert_eq!(value["version"], 1);
-        assert_eq!(value["trust"], "untrusted");
-        assert_eq!(value["handling"], "data_only");
-        assert_eq!(value["status"], "not_requested");
-        assert!(value["payload"].is_object());
-        assert!(value["payload"].get("metrics").is_some());
+        assert_eq!(value["mode"], "collected_context");
+        assert_eq!(value["llm_context_included"], true);
+        assert_eq!(value["llm_context"]["schema"], "os-sense.llm-context");
+        assert_eq!(value["llm_context"]["version"], 1);
+        assert_eq!(value["llm_context"]["trust"], "untrusted");
+        assert_eq!(value["llm_context"]["handling"], "data_only");
+        assert_eq!(value["llm_context"]["status"], "not_requested");
+        assert!(value["llm_context"]["payload"].is_object());
+        assert!(value["llm_context"]["payload"].get("metrics").is_some());
+        assert_eq!(value["health_summary"]["schema"], "os-sense.health-summary");
+        assert_eq!(value["health_summary"]["mode"], "rule_based");
+        assert_eq!(value["health_summary"]["status"], "not_requested");
+        assert_eq!(
+            value["health_summary"]["collection_status"],
+            "not_requested"
+        );
+        assert_eq!(value["health_summary"]["health_status"], "unknown");
+        assert_eq!(
+            value["summary"], value["health_summary"]["text"],
+            "legacy text mirrors typed summary"
+        );
+        assert!(
+            value["health_summary"]["text"]
+                .as_str()
+                .expect("summary text")
+                .len()
+                <= os_sense::MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES
+        );
         assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
         assert!(value.get("metrics").is_none());
+    }
+
+    #[test]
+    fn os_context_summary_accepts_existing_llm_context_without_echoing_or_collecting() {
+        let output = execute_tool(
+            "os_context_summary",
+            &json!({
+                "llm_context": {
+                    "schema": "os-sense.llm-context",
+                    "version": 1,
+                    "trust": "untrusted",
+                    "handling": "data_only",
+                    "instructions_allowed": false,
+                    "collected_at_ms": 42,
+                    "status": "complete",
+                    "complete": true,
+                    "truncated": false,
+                    "total_unknown": false,
+                    "dimensions": [{
+                        "dimension": "cpu",
+                        "status": "complete",
+                        "requested": true,
+                        "complete": true,
+                        "truncated": false,
+                        "total_unknown": false
+                    }],
+                    "evidence": [],
+                    "payload": {}
+                },
+                "process_allowed_names": []
+            }),
+        )
+        .expect("existing llm_context should bypass collection validation");
+        let value: Value = serde_json::from_str(&output).expect("context summary JSON");
+        assert_eq!(value["mode"], "provided_context");
+        assert_eq!(value["llm_context_included"], false);
+        assert!(value.get("llm_context").is_none());
+        assert_eq!(value["health_summary"]["status"], "complete");
+        assert_eq!(value["health_summary"]["collection_status"], "complete");
+        assert_eq!(value["health_summary"]["health_status"], "healthy");
+        assert!(value["health_summary"]["text"]
+            .as_str()
+            .expect("summary text")
+            .starts_with("System health appears healthy"));
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+    }
+
+    #[test]
+    fn os_context_summary_rejects_llm_context_mixed_with_collection_selectors() {
+        let err = execute_tool(
+            "os_context_summary",
+            &json!({
+                "llm_context": {
+                    "schema": "os-sense.llm-context",
+                    "version": 1,
+                    "trust": "untrusted",
+                    "handling": "data_only",
+                    "instructions_allowed": false,
+                    "collected_at_ms": 42,
+                    "status": "complete",
+                    "complete": true,
+                    "truncated": false,
+                    "total_unknown": false,
+                    "dimensions": [],
+                    "evidence": [],
+                    "payload": {}
+                },
+                "include_metrics": false
+            }),
+        )
+        .expect_err("llm_context and collection selectors are mutually exclusive");
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn os_context_summary_direct_mode_output_stays_bounded_without_context_echo() {
+        let output = execute_tool(
+            "os_context_summary",
+            &json!({
+                "llm_context": {
+                    "schema": "os-sense.llm-context",
+                    "version": 1,
+                    "trust": "untrusted",
+                    "handling": "data_only",
+                    "instructions_allowed": false,
+                    "collected_at_ms": 77,
+                    "status": "complete",
+                    "complete": true,
+                    "truncated": false,
+                    "total_unknown": false,
+                    "dimensions": [{
+                        "dimension": "logs",
+                        "status": "complete",
+                        "requested": true,
+                        "complete": true,
+                        "truncated": false,
+                        "total_unknown": false
+                    }],
+                    "evidence": [{
+                        "id": "huge-evidence",
+                        "dimension": "logs",
+                        "kind": "log_pattern",
+                        "severity": "warning",
+                        "message": format!("{}DIRECT_ECHO_MARKER", "x".repeat(40_000))
+                    }],
+                    "payload": {}
+                }
+            }),
+        )
+        .expect("direct summary output should be bounded");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["mode"], "provided_context");
+        assert!(value.get("llm_context").is_none());
+        assert!(!output.contains("DIRECT_ECHO_MARKER"));
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+    }
+
+    #[test]
+    fn os_context_summary_collected_mode_output_is_bounded_valid_json() {
+        let mut context = os_sense::LlmOsContext {
+            schema: "os-sense.llm-context".to_string(),
+            version: 1,
+            trust: "untrusted".to_string(),
+            handling: "data_only".to_string(),
+            instructions_allowed: false,
+            collected_at_ms: 88,
+            status: os_sense::ContextDimensionStatus::Complete,
+            complete: true,
+            truncated: false,
+            total_unknown: false,
+            dimensions: vec![os_sense::ContextDimensionMetadata {
+                dimension: os_sense::ContextDimension::Logs,
+                status: os_sense::ContextDimensionStatus::Complete,
+                requested: true,
+                sources: Vec::new(),
+                collected_at_ms: None,
+                complete: true,
+                truncated: false,
+                total_unknown: false,
+                total: 0,
+                returned_count: 0,
+                omitted_count: 0,
+                errors: Vec::new(),
+                capabilities: Vec::new(),
+            }],
+            ..os_sense::LlmOsContext::default()
+        };
+        context.evidence = (0..80)
+            .map(|index| os_sense::ContextEvidence {
+                id: format!("large-evidence-{index}"),
+                dimension: os_sense::ContextDimension::Logs,
+                kind: os_sense::ContextEvidenceKind::LogPattern,
+                severity: "warning".to_string(),
+                subject: None,
+                message: format!("large message {index} {}", "x".repeat(1_000)),
+                count: 1,
+            })
+            .collect();
+        context.evidence_total = context.evidence.len();
+        context.evidence_returned_count = context.evidence.len();
+        let output =
+            super::os_context_summary_output(context, super::OsContextSummaryOutputMode::Collected)
+                .expect("bounded collected summary output");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["mode"], "collected_context");
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+    }
+
+    #[test]
+    fn os_context_summary_collected_mode_resummarizes_after_evidence_cropping() {
+        let mut context = os_sense::LlmOsContext {
+            schema: "os-sense.llm-context".to_string(),
+            version: 1,
+            trust: "untrusted".to_string(),
+            handling: "data_only".to_string(),
+            instructions_allowed: false,
+            collected_at_ms: 89,
+            status: os_sense::ContextDimensionStatus::Complete,
+            complete: true,
+            truncated: false,
+            total_unknown: false,
+            dimensions: vec![os_sense::ContextDimensionMetadata {
+                dimension: os_sense::ContextDimension::Logs,
+                status: os_sense::ContextDimensionStatus::Complete,
+                requested: true,
+                sources: Vec::new(),
+                collected_at_ms: None,
+                complete: true,
+                truncated: false,
+                total_unknown: false,
+                total: 0,
+                returned_count: 0,
+                omitted_count: 0,
+                errors: Vec::new(),
+                capabilities: Vec::new(),
+            }],
+            ..os_sense::LlmOsContext::default()
+        };
+        context.payload.logs = Some(os_sense::ContextLogPayload {
+            entries: os_sense::ContextPage {
+                total: 1,
+                returned_count: 1,
+                omitted_count: 0,
+                total_unknown: false,
+                truncated: false,
+                items: vec![os_sense::ContextLogEntryPayload {
+                    source: "test".to_string(),
+                    timestamp: None,
+                    severity: Some("info".to_string()),
+                    unit: None,
+                    message: "payload-size-forces-output-cropping".repeat(3_000),
+                }],
+            },
+            patterns: os_sense::ContextPage::default(),
+            filter_complete: true,
+        });
+        context.evidence = (0..4)
+            .map(|index| os_sense::ContextEvidence {
+                id: format!("info-evidence-{index}"),
+                dimension: os_sense::ContextDimension::Logs,
+                kind: os_sense::ContextEvidenceKind::LogPattern,
+                severity: "info".to_string(),
+                subject: None,
+                message: format!("info message {index}"),
+                count: 1,
+            })
+            .chain(std::iter::once(os_sense::ContextEvidence {
+                id: "tail-actionable".to_string(),
+                dimension: os_sense::ContextDimension::Logs,
+                kind: os_sense::ContextEvidenceKind::LogPattern,
+                severity: "warning".to_string(),
+                subject: None,
+                message: "tail warning".to_string(),
+                count: 1,
+            }))
+            .collect();
+        context.evidence_total = context.evidence.len();
+        context.evidence_returned_count = context.evidence.len();
+
+        let output =
+            super::os_context_summary_output(context, super::OsContextSummaryOutputMode::Collected)
+                .expect("bounded collected summary output");
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["mode"], "collected_context");
+        let returned_ids = value["llm_context"]["evidence"]
+            .as_array()
+            .expect("returned context evidence")
+            .iter()
+            .map(|item| {
+                item["id"]
+                    .as_str()
+                    .expect("returned evidence id")
+                    .to_string()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!returned_ids.contains("tail-actionable"));
+        for id in value["health_summary"]["evidence_ids"]
+            .as_array()
+            .expect("summary evidence ids")
+        {
+            assert!(
+                returned_ids.contains(id.as_str().expect("summary evidence id")),
+                "summary evidence id must exist in returned context: {id}"
+            );
+        }
+        assert_eq!(value["llm_context"]["truncated"], true);
+        let returned_context: os_sense::LlmOsContext =
+            serde_json::from_value(value["llm_context"].clone()).expect("returned llm_context");
+        let expected_summary = os_sense::summarize_llm_context(&returned_context);
+        assert_eq!(
+            value["health_summary"]["health_status"],
+            json!(expected_summary.health_status)
+        );
+        assert_eq!(value["health_summary"]["health_status"], "unknown");
+    }
+
+    #[test]
+    fn os_context_summary_rejects_unknown_and_oversized_inputs() {
+        let unknown = execute_tool("os_context_summary", &json!({"unexpected": true}))
+            .expect_err("unknown fields should be denied");
+        assert!(unknown.contains("unknown field"));
+
+        let oversized = execute_tool(
+            "os_context_summary",
+            &json!({"intent": "x".repeat(os_sense::MAX_LLM_CONTEXT_JSON_BYTES + 1)}),
+        )
+        .expect_err("oversized input should be denied before parsing");
+        assert!(oversized.contains("exceeds"));
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {

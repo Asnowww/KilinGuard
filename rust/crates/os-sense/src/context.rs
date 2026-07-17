@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,9 +11,9 @@ use crate::logs::{query_logs, LogQuery};
 use crate::model::{
     Alert, AlertContext, CollectionStatus, ContextCapability, ContextCapabilityMetadata,
     ContextDimension, ContextDimensionMetadata, ContextDimensionStatus, ContextEvidence,
-    ContextEvidenceKind, ContextTimeWindow, LlmOsContext, LogQueryResult, MetricSnapshot,
-    NetworkSnapshot, OsContext, ProcessList, ResourceDimension, ServiceHealthStatus,
-    ServiceSnapshot,
+    ContextEvidenceKind, ContextHealthStatus, ContextHealthSummary, ContextHealthSummaryMode,
+    ContextTimeWindow, LlmOsContext, LogQueryResult, MetricSnapshot, NetworkSnapshot, OsContext,
+    ProcessList, ResourceDimension, ServiceHealthStatus, ServiceSnapshot,
 };
 use crate::network::{collect_network, NetworkQuery};
 use crate::procfs::{basic_meta, MetricsThresholds, ProcessQuery, ProcfsCollector};
@@ -22,9 +22,16 @@ use crate::services::{query_services, ServiceQuery};
 
 pub const CONTEXT_SCHEMA: &str = "os-sense.llm-context";
 pub const CONTEXT_SCHEMA_VERSION: u32 = 1;
+pub const CONTEXT_HEALTH_SUMMARY_SCHEMA: &str = "os-sense.health-summary";
+pub const CONTEXT_HEALTH_SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_LLM_CONTEXT_JSON_BYTES: usize = 64 * 1024;
+pub const MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS: usize = 768;
+pub const MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES: usize = 2 * 1024;
+const MAX_CONTEXT_HEALTH_SUMMARY_INPUT_ITEMS: usize = 128;
+const MAX_CONTEXT_HEALTH_SUMMARY_INPUT_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_EVIDENCE: usize = 64;
 const MAX_DIMENSION_EVIDENCE: usize = 24;
+const MAX_CONTEXT_HEALTH_SUMMARY_EVIDENCE: usize = 6;
 const MAX_CONTEXT_WARNINGS: usize = 32;
 const MAX_CONTEXT_ERRORS_PER_DIMENSION: usize = 8;
 const MAX_CONTEXT_SOURCES_PER_DIMENSION: usize = 16;
@@ -1117,6 +1124,7 @@ pub fn aggregate_context(mut inputs: ContextInputs) -> OsContext {
         alerts,
         alert_context: None,
         summary: String::new(),
+        health_summary: ContextHealthSummary::default(),
         cropped_dimensions: Vec::new(),
         llm_context,
     }
@@ -1133,16 +1141,697 @@ fn populate_legacy_context_consumers(context: &mut OsContext) {
         })
         .map(str::to_string)
         .collect();
-    context.summary = build_health_summary(
+    let health_summary = summarize_context(context);
+    context.summary = health_summary.text.clone();
+    context.health_summary = health_summary;
+    if context.summary.is_empty() {
+        context.summary = legacy_health_summary_for_snapshots(context);
+    }
+    context.alert_context =
+        build_alert_context(&context.alerts, context.llm_context.collected_at_ms);
+}
+
+#[must_use]
+pub fn summarize_context(context: &OsContext) -> ContextHealthSummary {
+    summarize_llm_context(&context.llm_context)
+}
+
+#[must_use]
+pub fn summarize_llm_context(context: &LlmOsContext) -> ContextHealthSummary {
+    let budgeted = budget_summary_inputs(context);
+    let mut covered_dimensions = budgeted
+        .dimensions
+        .iter()
+        .copied()
+        .filter(|dimension| dimension.requested)
+        .map(|dimension| dimension.dimension)
+        .collect::<Vec<_>>();
+    covered_dimensions.sort();
+    covered_dimensions.dedup();
+    let selected_evidence = selected_summary_evidence(&budgeted.evidence);
+    let evidence_ids = selected_evidence
+        .items
+        .iter()
+        .map(|evidence| evidence.id.clone())
+        .collect::<Vec<_>>();
+    let metadata_omitted_count = context
+        .metadata_omitted_count
+        .saturating_add(budgeted.dimension_metadata_omitted_count);
+    let evidence_omitted_count = context.evidence_omitted_count;
+    let mut summary_omitted_count = budgeted
+        .summary_omitted_count
+        .saturating_add(selected_evidence.omitted_count);
+    let severity_profile = SummarySeverityProfile::from_evidence(&budgeted.evidence);
+    let mut total_unknown = context.total_unknown || budgeted.total_unknown;
+    let mut truncated = context.truncated || budgeted.truncated;
+    let health_status = derive_context_health_status(
+        context.status,
+        context.complete,
+        context.truncated,
+        total_unknown,
+        &severity_profile,
+    );
+    let mut failure_reason = context_failure_reason(
+        context,
+        &covered_dimensions,
+        budgeted.truncated,
+        summary_omitted_count,
+    );
+    let mut sentences = vec![overall_summary_sentence(
+        context,
+        &covered_dimensions,
+        health_status,
+        &severity_profile,
+    )];
+    if let Some(metrics) = context.payload.metrics.as_ref() {
+        if let Some(resource) = resource_summary_sentence(metrics) {
+            sentences.push(resource);
+        }
+    }
+    sentences.push(evidence_summary_sentence(&selected_evidence.items));
+    let omitted_count_before_text = combined_omitted_count(
+        metadata_omitted_count,
+        evidence_omitted_count,
+        summary_omitted_count,
+    );
+    if let Some(incomplete) = incomplete_summary_sentence(
+        context,
+        &budgeted.dimensions,
+        omitted_count_before_text,
+        summary_omitted_count,
+    ) {
+        sentences.push(incomplete);
+    }
+    let (text, text_truncated) = bounded_summary_text(&sentences.join(" "));
+    if text_truncated {
+        summary_omitted_count = summary_omitted_count.saturating_add(1);
+        truncated = true;
+        total_unknown = true;
+        if failure_reason.is_none() {
+            failure_reason = Some("summary_text_truncated".to_string());
+        }
+    }
+    if summary_omitted_count > 0 {
+        truncated = true;
+        total_unknown = true;
+    }
+    let omitted_count = combined_omitted_count(
+        metadata_omitted_count,
+        evidence_omitted_count,
+        summary_omitted_count,
+    );
+    ContextHealthSummary {
+        schema: CONTEXT_HEALTH_SUMMARY_SCHEMA.to_string(),
+        version: CONTEXT_HEALTH_SUMMARY_SCHEMA_VERSION,
+        mode: ContextHealthSummaryMode::RuleBased,
+        generated_at_ms: context.collected_at_ms,
+        status: context.status,
+        collection_status: context.status,
+        health_status,
+        complete: context.complete && !context.truncated && !context.total_unknown && !truncated,
+        context_truncated: context.truncated,
+        text_truncated,
+        truncated,
+        total_unknown,
+        covered_dimensions,
+        evidence_ids,
+        metadata_omitted_count,
+        evidence_omitted_count,
+        summary_omitted_count,
+        omitted_count,
+        failure_reason,
+        text,
+    }
+}
+
+struct BudgetedSummaryInputs<'a> {
+    dimensions: Vec<&'a ContextDimensionMetadata>,
+    evidence: Vec<&'a ContextEvidence>,
+    dimension_metadata_omitted_count: usize,
+    summary_omitted_count: usize,
+    truncated: bool,
+    total_unknown: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SummaryInputBudget {
+    remaining_items: usize,
+    remaining_bytes: usize,
+    omitted_count: usize,
+    truncated: bool,
+    total_unknown: bool,
+}
+
+impl SummaryInputBudget {
+    fn new() -> Self {
+        Self {
+            remaining_items: MAX_CONTEXT_HEALTH_SUMMARY_INPUT_ITEMS,
+            remaining_bytes: MAX_CONTEXT_HEALTH_SUMMARY_INPUT_BYTES,
+            omitted_count: 0,
+            truncated: false,
+            total_unknown: false,
+        }
+    }
+
+    fn try_take(&mut self, bytes: usize) -> bool {
+        if self.remaining_items == 0 || bytes > self.remaining_bytes {
+            self.remaining_items = 0;
+            self.remaining_bytes = 0;
+            self.truncated = true;
+            self.total_unknown = true;
+            return false;
+        }
+        self.remaining_items -= 1;
+        self.remaining_bytes -= bytes;
+        true
+    }
+
+    fn omit_remaining(&mut self, count: usize) {
+        if count > 0 {
+            self.omitted_count = self.omitted_count.saturating_add(count);
+            self.truncated = true;
+            self.total_unknown = true;
+        }
+    }
+}
+
+fn budget_summary_inputs(context: &LlmOsContext) -> BudgetedSummaryInputs<'_> {
+    let mut budget = SummaryInputBudget::new();
+    let mut dimensions = Vec::new();
+    let mut evidence = Vec::new();
+    let mut dimension_metadata_omitted_count = 0usize;
+
+    for (index, dimension) in context.dimensions.iter().enumerate() {
+        if !budget.try_take(summary_dimension_budget_bytes(dimension)) {
+            budget.omit_remaining(context.dimensions.len().saturating_sub(index));
+            break;
+        }
+        if dimension.requested {
+            dimension_metadata_omitted_count =
+                dimension_metadata_omitted_count.saturating_add(dimension.omitted_count);
+        }
+        dimensions.push(dimension);
+    }
+
+    for (index, item) in context.evidence.iter().enumerate() {
+        if !budget.try_take(summary_evidence_budget_bytes(item)) {
+            budget.omit_remaining(context.evidence.len().saturating_sub(index));
+            break;
+        }
+        evidence.push(item);
+    }
+
+    BudgetedSummaryInputs {
+        dimensions,
+        evidence,
+        dimension_metadata_omitted_count,
+        summary_omitted_count: budget.omitted_count,
+        truncated: budget.truncated,
+        total_unknown: budget.total_unknown,
+    }
+}
+
+fn summary_dimension_budget_bytes(dimension: &ContextDimensionMetadata) -> usize {
+    32usize
+        .saturating_add(dimension.sources.len().saturating_mul(8))
+        .saturating_add(dimension.errors.len().saturating_mul(8))
+        .saturating_add(dimension.capabilities.len().saturating_mul(8))
+}
+
+fn summary_evidence_budget_bytes(evidence: &ContextEvidence) -> usize {
+    32usize
+        .saturating_add(evidence.id.len())
+        .saturating_add(evidence.severity.len())
+        .saturating_add(evidence.subject.as_deref().map_or(0, str::len))
+        .saturating_add(evidence.message.len())
+}
+
+struct SelectedSummaryEvidence<'a> {
+    items: Vec<&'a ContextEvidence>,
+    omitted_count: usize,
+}
+
+fn selected_summary_evidence<'a>(evidence: &[&'a ContextEvidence]) -> SelectedSummaryEvidence<'a> {
+    let original_input_count = evidence.len();
+    let mut evidence = evidence
+        .iter()
+        .copied()
+        .filter(|evidence| summary_evidence_id_is_safe(&evidence.id))
+        .collect::<Vec<_>>();
+    let unsafe_id_count = original_input_count.saturating_sub(evidence.len());
+    evidence.sort_by(|left, right| {
+        evidence_severity_rank(&left.severity)
+            .cmp(&evidence_severity_rank(&right.severity))
+            .then_with(|| left.dimension.cmp(&right.dimension))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut seen_ids = BTreeSet::new();
+    evidence.retain(|item| seen_ids.insert(summary_safe_identifier(&item.id)));
+    let unique_len = evidence.len();
+    if evidence.len() > MAX_CONTEXT_HEALTH_SUMMARY_EVIDENCE {
+        evidence.truncate(MAX_CONTEXT_HEALTH_SUMMARY_EVIDENCE);
+    }
+    let selection_omitted = unique_len.saturating_sub(evidence.len());
+    SelectedSummaryEvidence {
+        items: evidence,
+        omitted_count: unsafe_id_count.saturating_add(selection_omitted),
+    }
+}
+
+fn summary_evidence_id_is_safe(id: &str) -> bool {
+    summary_safe_identifier(id) == id
+}
+
+fn evidence_severity_rank(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" | "fatal" | "error" => 0,
+        "warning" | "warn" => 1,
+        "info" | "notice" => 2,
+        _ => 3,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SummarySeverityProfile {
+    has_actionable: bool,
+    has_informational: bool,
+    has_unknown: bool,
+}
+
+impl SummarySeverityProfile {
+    fn from_evidence(evidence: &[&ContextEvidence]) -> Self {
+        let mut profile = Self::default();
+        for item in evidence {
+            match evidence_severity_class(&item.severity) {
+                SummarySeverityClass::Actionable => profile.has_actionable = true,
+                SummarySeverityClass::Informational => profile.has_informational = true,
+                SummarySeverityClass::Unknown => profile.has_unknown = true,
+            }
+        }
+        profile
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummarySeverityClass {
+    Actionable,
+    Informational,
+    Unknown,
+}
+
+fn evidence_severity_class(severity: &str) -> SummarySeverityClass {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" | "fatal" | "error" | "warning" | "warn" => SummarySeverityClass::Actionable,
+        "info" | "notice" | "debug" | "trace" => SummarySeverityClass::Informational,
+        _ => SummarySeverityClass::Unknown,
+    }
+}
+
+fn derive_context_health_status(
+    collection_status: ContextDimensionStatus,
+    collection_complete: bool,
+    context_truncated: bool,
+    total_unknown: bool,
+    severity_profile: &SummarySeverityProfile,
+) -> ContextHealthStatus {
+    match collection_status {
+        ContextDimensionStatus::Failed => ContextHealthStatus::Failed,
+        ContextDimensionStatus::Partial if severity_profile.has_actionable => {
+            ContextHealthStatus::Degraded
+        }
+        ContextDimensionStatus::Partial => ContextHealthStatus::Unknown,
+        ContextDimensionStatus::Unavailable | ContextDimensionStatus::NotRequested => {
+            ContextHealthStatus::Unknown
+        }
+        ContextDimensionStatus::Complete if severity_profile.has_actionable => {
+            ContextHealthStatus::Degraded
+        }
+        ContextDimensionStatus::Complete
+            if !collection_complete
+                || context_truncated
+                || total_unknown
+                || severity_profile.has_unknown =>
+        {
+            ContextHealthStatus::Unknown
+        }
+        ContextDimensionStatus::Complete => ContextHealthStatus::Healthy,
+    }
+}
+
+fn combined_omitted_count(
+    metadata_omitted_count: usize,
+    evidence_omitted_count: usize,
+    summary_omitted_count: usize,
+) -> usize {
+    // Metadata and typed evidence can describe the same underlying alert; the
+    // public lower bound avoids double counting by combining independent
+    // categories as max(metadata, evidence) + summary-only omissions.
+    metadata_omitted_count
+        .max(evidence_omitted_count)
+        .saturating_add(summary_omitted_count)
+}
+
+fn overall_summary_sentence(
+    context: &LlmOsContext,
+    covered_dimensions: &[ContextDimension],
+    health_status: ContextHealthStatus,
+    severity_profile: &SummarySeverityProfile,
+) -> String {
+    let coverage = coverage_phrase(covered_dimensions);
+    match context.status {
+        ContextDimensionStatus::NotRequested => {
+            "System health was not assessed because no OS context dimensions were requested."
+                .to_string()
+        }
+        ContextDimensionStatus::Unavailable => {
+            format!("System health could not be assessed because all requested OS context dimensions were unavailable across {coverage}.")
+        }
+        ContextDimensionStatus::Failed => {
+            format!("System health could not be assessed because all requested OS context dimensions failed or were unavailable across {coverage}.")
+        }
+        ContextDimensionStatus::Complete if health_status == ContextHealthStatus::Degraded => {
+            format!("System health is degraded across {coverage}.")
+        }
+        ContextDimensionStatus::Complete if health_status == ContextHealthStatus::Healthy => {
+            format!("System health appears healthy across {coverage}.")
+        }
+        ContextDimensionStatus::Complete => {
+            format!("System health is unknown across {coverage}; returned evidence is insufficient to confirm health.")
+        }
+        ContextDimensionStatus::Partial if severity_profile.has_actionable => {
+            format!("System health is partially known and degraded across {coverage}.")
+        }
+        ContextDimensionStatus::Partial => {
+            format!("System health is partially known across {coverage}; returned evidence does not show a leading anomaly.")
+        }
+    }
+}
+
+fn resource_summary_sentence(metrics: &crate::model::ContextMetricsPayload) -> Option<String> {
+    let cpu = metrics
+        .cpu
+        .usage_percent
+        .map(|value| format!("{:.1}% CPU", value.clamp(0.0, 100.0)));
+    let memory = metrics
+        .memory
+        .used_percent
+        .map(|value| format!("{:.1}% memory", value.clamp(0.0, 100.0)));
+    match (cpu, memory) {
+        (Some(cpu), Some(memory)) => Some(format!("Resource snapshot shows {cpu} and {memory}.")),
+        (Some(cpu), None) => Some(format!("Resource snapshot shows {cpu}.")),
+        (None, Some(memory)) => Some(format!("Resource snapshot shows {memory}.")),
+        (None, None) => None,
+    }
+}
+
+fn evidence_summary_sentence(evidence: &[&ContextEvidence]) -> String {
+    if evidence.is_empty() {
+        return "No typed evidence items were returned for anomalies or threshold breaches."
+            .to_string();
+    }
+    let findings = evidence
+        .iter()
+        .map(|evidence| {
+            let severity = summary_safe_identifier(&evidence.severity);
+            let kind = evidence_kind_label(evidence.kind);
+            let dimension = dimension_label(evidence.dimension);
+            let id = summary_safe_identifier(&evidence.id);
+            let message = summary_safe_text(&evidence.message, 96);
+            if evidence.count > 1 {
+                format!(
+                    "{severity} {kind} in {dimension} ({id}, count {}) - {message}",
+                    evidence.count
+                )
+            } else {
+                format!("{severity} {kind} in {dimension} ({id}) - {message}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Most important evidence: {findings}.")
+}
+
+fn incomplete_summary_sentence(
+    context: &LlmOsContext,
+    dimensions: &[&ContextDimensionMetadata],
+    omitted_count: usize,
+    summary_omitted_count: usize,
+) -> Option<String> {
+    let partial = dimensions
+        .iter()
+        .filter(|dimension| {
+            dimension.requested && dimension.status == ContextDimensionStatus::Partial
+        })
+        .count();
+    let failed = dimensions
+        .iter()
+        .filter(|dimension| {
+            dimension.requested && dimension.status == ContextDimensionStatus::Failed
+        })
+        .count();
+    let unavailable = dimensions
+        .iter()
+        .filter(|dimension| {
+            dimension.requested && dimension.status == ContextDimensionStatus::Unavailable
+        })
+        .count();
+    if partial == 0
+        && failed == 0
+        && unavailable == 0
+        && omitted_count == 0
+        && summary_omitted_count == 0
+        && !context.truncated
+        && !context.total_unknown
+    {
+        return None;
+    }
+    let mut details = Vec::new();
+    if partial > 0 {
+        details.push(format!("{partial} partial dimension(s)"));
+    }
+    if failed > 0 {
+        details.push(format!("{failed} failed dimension(s)"));
+    }
+    if unavailable > 0 {
+        details.push(format!("{unavailable} unavailable dimension(s)"));
+    }
+    if omitted_count > 0 {
+        details.push(format!("{omitted_count} omitted item(s)"));
+    }
+    if summary_omitted_count > 0 {
+        details.push(format!("{summary_omitted_count} summary-limited item(s)"));
+    }
+    if context.total_unknown || summary_omitted_count > 0 {
+        details.push("unknown totals".to_string());
+    }
+    if context.truncated {
+        details.push("truncated context".to_string());
+    }
+    Some(format!("Completeness note: {}.", details.join(", ")))
+}
+
+fn context_failure_reason(
+    context: &LlmOsContext,
+    covered_dimensions: &[ContextDimension],
+    summary_input_truncated: bool,
+    summary_omitted_count: usize,
+) -> Option<String> {
+    if summary_input_truncated {
+        return Some("summary_input_truncated".to_string());
+    }
+    match context.status {
+        ContextDimensionStatus::NotRequested => Some("no_dimensions_requested".to_string()),
+        ContextDimensionStatus::Unavailable => Some("requested_dimensions_unavailable".to_string()),
+        ContextDimensionStatus::Failed => Some("requested_dimensions_failed".to_string()),
+        ContextDimensionStatus::Partial if context.truncated => {
+            Some("context_partial_or_truncated".to_string())
+        }
+        ContextDimensionStatus::Partial if context.total_unknown => {
+            Some("context_partial_or_unknown".to_string())
+        }
+        ContextDimensionStatus::Partial => Some("context_partial".to_string()),
+        ContextDimensionStatus::Complete if covered_dimensions.is_empty() => {
+            Some("no_dimensions_requested".to_string())
+        }
+        ContextDimensionStatus::Complete if summary_omitted_count > 0 => {
+            Some("summary_output_limited".to_string())
+        }
+        ContextDimensionStatus::Complete => None,
+    }
+}
+
+fn coverage_phrase(dimensions: &[ContextDimension]) -> String {
+    if dimensions.is_empty() {
+        return "no requested dimensions".to_string();
+    }
+    if dimensions.len() > 4 {
+        return format!("{} requested dimensions", dimensions.len());
+    }
+    dimensions
+        .iter()
+        .map(|dimension| dimension_label(*dimension))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn dimension_label(dimension: ContextDimension) -> &'static str {
+    match dimension {
+        ContextDimension::Cpu => "cpu",
+        ContextDimension::Memory => "memory",
+        ContextDimension::Disk => "disk",
+        ContextDimension::Thermal => "thermal",
+        ContextDimension::NetworkMetrics => "network metrics",
+        ContextDimension::Network => "network",
+        ContextDimension::Processes => "processes",
+        ContextDimension::Logs => "logs",
+        ContextDimension::Services => "services",
+    }
+}
+
+fn evidence_kind_label(kind: ContextEvidenceKind) -> &'static str {
+    match kind {
+        ContextEvidenceKind::MetricAlert => "metric alert",
+        ContextEvidenceKind::ProcessAnomaly => "process anomaly",
+        ContextEvidenceKind::LogPattern => "log pattern",
+        ContextEvidenceKind::NetworkAnomaly => "network anomaly",
+        ContextEvidenceKind::ServiceProblem => "service problem",
+    }
+}
+
+fn summary_safe_identifier(value: &str) -> String {
+    summary_safe_text(value, 128)
+}
+
+fn summary_safe_text(value: &str, max_chars: usize) -> String {
+    let prefix = summary_char_byte_prefix(
+        value,
+        max_chars.saturating_mul(2),
+        max_chars.saturating_mul(8),
+    );
+    let scrubbed = prefix
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let without_query = scrubbed
+        .split_whitespace()
+        .map(sanitize_summary_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    redact_sensitive_text(
+        &without_query,
+        max_chars.saturating_sub("...[truncated]".len()),
+    )
+}
+
+fn sanitize_summary_token(token: &str) -> String {
+    let token = strip_query_like_suffix(token);
+    if is_path_like_summary_token(&token) {
+        "[REDACTED_PATH]".to_string()
+    } else {
+        token
+    }
+}
+
+fn strip_query_like_suffix(token: &str) -> String {
+    let Some(index) = token.find('?') else {
+        return token.to_string();
+    };
+    let head = &token[..index];
+    if head.contains("://") || token[index + 1..].contains('=') {
+        format!("{head}?[REDACTED]")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_path_like_summary_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if trimmed.contains("://") {
+        return false;
+    }
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+    {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn bounded_summary_text(value: &str) -> (String, bool) {
+    let prefix = summary_char_byte_prefix(
+        value,
+        MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS.saturating_mul(2),
+        MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES.saturating_mul(2),
+    );
+    let input_truncated = prefix.len() < value.len();
+    let single_paragraph = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redaction_truncated =
+        single_paragraph.chars().count() > MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS;
+    let redacted = redact_sensitive_text(
+        &single_paragraph,
+        MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS.saturating_sub("...[truncated]".len()),
+    );
+    let (bounded, byte_truncated) =
+        truncate_utf8_bytes(&redacted, MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES);
+    (
+        bounded,
+        input_truncated || redaction_truncated || byte_truncated,
+    )
+}
+
+fn summary_char_byte_prefix(value: &str, max_chars: usize, max_bytes: usize) -> &str {
+    let mut end = 0usize;
+    for (count, (index, ch)) in value.char_indices().enumerate() {
+        if count >= max_chars {
+            break;
+        }
+        let next = index.saturating_add(ch.len_utf8());
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
+    }
+    let marker = "...[truncated]";
+    let keep_bytes = max_bytes.saturating_sub(marker.len());
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let next = index.saturating_add(ch.len_utf8());
+        if next > keep_bytes {
+            break;
+        }
+        end = next;
+    }
+    (format!("{}{}", &value[..end], marker), true)
+}
+
+fn legacy_health_summary_for_snapshots(context: &OsContext) -> String {
+    build_health_summary(
         context.metrics.as_ref(),
         context.processes.as_ref(),
         context.logs.as_ref(),
         context.network.as_ref(),
         context.services.as_ref(),
         context.alerts.len(),
-    );
-    context.alert_context =
-        build_alert_context(&context.alerts, context.llm_context.collected_at_ms);
+    )
 }
 
 fn collected_value<T>(

@@ -1030,6 +1030,627 @@ fn shared_input_budget_preserves_service_problem_evidence_lower_bound() {
     assert!(page.omitted_count >= 4_968);
 }
 
+fn assert_summary_is_bounded(summary: &ContextHealthSummary) {
+    assert!(summary.text.chars().count() <= MAX_CONTEXT_HEALTH_SUMMARY_TEXT_CHARS);
+    assert!(summary.text.len() <= MAX_CONTEXT_HEALTH_SUMMARY_TEXT_BYTES);
+    assert!(summary.text.is_char_boundary(summary.text.len()));
+    assert!(!summary.text.contains('\n'));
+    assert!(!summary.text.contains('\r'));
+    assert_eq!(summary.collection_status, summary.status);
+    assert_eq!(
+        summary.omitted_count,
+        summary
+            .metadata_omitted_count
+            .max(summary.evidence_omitted_count)
+            .saturating_add(summary.summary_omitted_count)
+    );
+    if summary.context_truncated || summary.text_truncated || summary.summary_omitted_count > 0 {
+        assert!(summary.truncated);
+    }
+}
+
+#[test]
+fn health_summary_reports_healthy_complete_context() {
+    let context = aggregate_context(complete_inputs());
+    let summary = summarize_llm_context(&context.llm_context);
+    assert_eq!(summary.schema, CONTEXT_HEALTH_SUMMARY_SCHEMA);
+    assert_eq!(summary.version, CONTEXT_HEALTH_SUMMARY_SCHEMA_VERSION);
+    assert_eq!(summary.mode, ContextHealthSummaryMode::RuleBased);
+    assert_eq!(summary.status, ContextDimensionStatus::Complete);
+    assert_eq!(summary.collection_status, ContextDimensionStatus::Complete);
+    assert_eq!(summary.health_status, ContextHealthStatus::Healthy);
+    assert!(summary.complete);
+    assert!(!summary.truncated);
+    assert!(!summary.context_truncated);
+    assert!(!summary.text_truncated);
+    assert!(!summary.total_unknown);
+    assert_eq!(
+        summary.covered_dimensions.len(),
+        ContextDimension::ALL.len()
+    );
+    assert!(summary.evidence_ids.is_empty());
+    assert!(summary.failure_reason.is_none());
+    assert!(summary.text.starts_with("System health appears healthy"));
+    assert!(summary.text.contains("Resource snapshot"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_reports_partial_without_claiming_health() {
+    let context = aggregate_context(ContextInputs {
+        collected_at_ms: 10,
+        metrics: ContextInput::Collected(metrics_fixture()),
+        logs: ContextInput::Failed {
+            source: "journalctl".to_string(),
+            error: "permission denied".to_string(),
+        },
+        ..ContextInputs::default()
+    });
+    let summary = summarize_llm_context(&context.llm_context);
+    assert_eq!(summary.status, ContextDimensionStatus::Partial);
+    assert_eq!(summary.health_status, ContextHealthStatus::Unknown);
+    assert!(!summary.complete);
+    assert_eq!(
+        summary.failure_reason.as_deref(),
+        Some("context_partial_or_unknown")
+    );
+    assert!(summary.text.contains("partially known"));
+    assert!(!summary.text.contains("appears healthy"));
+    assert!(summary.text.contains("failed dimension"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_distinguishes_failed_unavailable_and_not_requested() {
+    let missing = aggregate_context(ContextInputs::new(10));
+    let missing_summary = summarize_llm_context(&missing.llm_context);
+    assert_eq!(missing_summary.status, ContextDimensionStatus::NotRequested);
+    assert_eq!(missing_summary.health_status, ContextHealthStatus::Unknown);
+    assert_eq!(
+        missing_summary.failure_reason.as_deref(),
+        Some("no_dimensions_requested")
+    );
+    assert!(missing_summary.text.contains("not assessed"));
+
+    let failed = aggregate_context(ContextInputs {
+        collected_at_ms: 10,
+        processes: ContextInput::Failed {
+            source: "procfs".to_string(),
+            error: "scan failed".to_string(),
+        },
+        ..ContextInputs::default()
+    });
+    let failed_summary = summarize_llm_context(&failed.llm_context);
+    assert_eq!(failed_summary.status, ContextDimensionStatus::Failed);
+    assert_eq!(failed_summary.health_status, ContextHealthStatus::Failed);
+    assert_eq!(
+        failed_summary.failure_reason.as_deref(),
+        Some("requested_dimensions_failed")
+    );
+    assert!(failed_summary.text.contains("failed or were unavailable"));
+
+    let unavailable = aggregate_context(ContextInputs {
+        collected_at_ms: 10,
+        logs: ContextInput::Unavailable {
+            source: "journalctl".to_string(),
+            reason: Some("not installed".to_string()),
+        },
+        ..ContextInputs::default()
+    });
+    let unavailable_summary = summarize_llm_context(&unavailable.llm_context);
+    assert_eq!(
+        unavailable_summary.status,
+        ContextDimensionStatus::Unavailable
+    );
+    assert_eq!(
+        unavailable_summary.health_status,
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        unavailable_summary.failure_reason.as_deref(),
+        Some("requested_dimensions_unavailable")
+    );
+    assert!(unavailable_summary.text.contains("unavailable"));
+}
+
+#[test]
+fn health_summary_uses_actionable_severity_for_degraded_status() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![
+        ContextEvidence {
+            id: "cpu-info".to_string(),
+            dimension: ContextDimension::Cpu,
+            kind: ContextEvidenceKind::MetricAlert,
+            severity: "info".to_string(),
+            subject: None,
+            message: "cpu sample is within baseline".to_string(),
+            count: 1,
+        },
+        ContextEvidence {
+            id: "logs-notice".to_string(),
+            dimension: ContextDimension::Logs,
+            kind: ContextEvidenceKind::LogPattern,
+            severity: "notice".to_string(),
+            subject: None,
+            message: "routine notice".to_string(),
+            count: 1,
+        },
+    ];
+    let info_summary = summarize_llm_context(&context);
+    assert_eq!(info_summary.status, ContextDimensionStatus::Complete);
+    assert_eq!(info_summary.health_status, ContextHealthStatus::Healthy);
+    assert!(info_summary
+        .text
+        .starts_with("System health appears healthy"));
+    assert!(!info_summary.text.contains("System health is degraded"));
+    assert_summary_is_bounded(&info_summary);
+
+    context.evidence.push(ContextEvidence {
+        id: "unknown-severity".to_string(),
+        dimension: ContextDimension::Services,
+        kind: ContextEvidenceKind::ServiceProblem,
+        severity: "surprise".to_string(),
+        subject: None,
+        message: "unclassified signal".to_string(),
+        count: 1,
+    });
+    let unknown_summary = summarize_llm_context(&context);
+    assert_eq!(unknown_summary.health_status, ContextHealthStatus::Unknown);
+    assert!(unknown_summary.text.starts_with("System health is unknown"));
+    assert!(!unknown_summary.text.contains("appears healthy"));
+    assert_summary_is_bounded(&unknown_summary);
+}
+
+#[test]
+fn health_summary_sorts_typed_evidence_by_severity_then_stable_keys() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![
+        ContextEvidence {
+            id: "network-warning".to_string(),
+            dimension: ContextDimension::Network,
+            kind: ContextEvidenceKind::NetworkAnomaly,
+            severity: "warning".to_string(),
+            subject: None,
+            message: "network anomaly: many_time_wait".to_string(),
+            count: 2,
+        },
+        ContextEvidence {
+            id: "service-error".to_string(),
+            dimension: ContextDimension::Services,
+            kind: ContextEvidenceKind::ServiceProblem,
+            severity: "error".to_string(),
+            subject: None,
+            message: "service problem: exit_code".to_string(),
+            count: 1,
+        },
+        ContextEvidence {
+            id: "log-error".to_string(),
+            dimension: ContextDimension::Logs,
+            kind: ContextEvidenceKind::LogPattern,
+            severity: "error".to_string(),
+            subject: None,
+            message: "log pattern: spike".to_string(),
+            count: 3,
+        },
+    ];
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+    context.evidence_omitted_count = 0;
+    let summary = summarize_llm_context(&context);
+    assert_eq!(summary.health_status, ContextHealthStatus::Degraded);
+    assert_eq!(
+        summary.evidence_ids,
+        vec![
+            "log-error".to_string(),
+            "service-error".to_string(),
+            "network-warning".to_string()
+        ]
+    );
+    let log_index = summary.text.find("log-error").expect("log id");
+    let service_index = summary.text.find("service-error").expect("service id");
+    let warning_index = summary.text.find("network-warning").expect("warning id");
+    assert!(log_index < service_index);
+    assert!(service_index < warning_index);
+}
+
+#[test]
+fn health_summary_reports_truncation_and_omitted_lower_bounds() {
+    let mut metrics = metrics_fixture();
+    metrics.alerts = (0..5_000)
+        .map(|index| Alert {
+            dimension: "cpu".to_string(),
+            subject: None,
+            severity: "warning".to_string(),
+            message: format!("cpu threshold token=secret-{index}"),
+            value: 99.0,
+            threshold: 90.0,
+        })
+        .collect();
+    let context = aggregate_context(ContextInputs {
+        collected_at_ms: 1,
+        metrics: ContextInput::Collected(metrics),
+        ..ContextInputs::default()
+    });
+    let summary = summarize_llm_context(&context.llm_context);
+    assert_eq!(summary.status, ContextDimensionStatus::Partial);
+    assert_eq!(summary.health_status, ContextHealthStatus::Degraded);
+    assert!(summary.context_truncated);
+    assert!(!summary.text_truncated);
+    assert!(summary.truncated);
+    assert!(summary.total_unknown);
+    assert!(summary.evidence_omitted_count >= 4_936);
+    assert!(summary.omitted_count >= 4_936);
+    assert_eq!(
+        summary.failure_reason.as_deref(),
+        Some("context_partial_or_truncated")
+    );
+    assert!(summary.text.contains("omitted item"));
+    assert!(summary.text.contains("truncated context"));
+    assert!(!summary.text.contains("secret-"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_budgets_evidence_before_redaction_sorting_and_text_processing() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![
+        ContextEvidence {
+            id: "huge-message".to_string(),
+            dimension: ContextDimension::Logs,
+            kind: ContextEvidenceKind::LogPattern,
+            severity: "warning".to_string(),
+            subject: None,
+            message: format!(
+                "{}TAIL_SHOULD_NOT_BE_READ token=secret-tail",
+                "x".repeat(20_000)
+            ),
+            count: 1,
+        },
+        ContextEvidence {
+            id: "later-error".to_string(),
+            dimension: ContextDimension::Services,
+            kind: ContextEvidenceKind::ServiceProblem,
+            severity: "error".to_string(),
+            subject: None,
+            message: "this later item should be omitted after budget stop".to_string(),
+            count: 1,
+        },
+    ];
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+    let summary = summarize_llm_context(&context);
+    assert_eq!(summary.collection_status, ContextDimensionStatus::Complete);
+    assert_eq!(summary.health_status, ContextHealthStatus::Unknown);
+    assert!(!summary.context_truncated);
+    assert!(summary.truncated);
+    assert!(summary.total_unknown);
+    assert!(!summary.complete);
+    assert!(summary.summary_omitted_count >= 2);
+    assert_eq!(
+        summary.failure_reason.as_deref(),
+        Some("summary_input_truncated")
+    );
+    assert!(summary.evidence_ids.is_empty());
+    assert!(!summary.text.contains("TAIL_SHOULD_NOT_BE_READ"));
+    assert!(!summary.text.contains("secret-tail"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_stops_all_summary_input_when_dimensions_exhaust_budget() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.dimensions.insert(
+        0,
+        ContextDimensionMetadata {
+            dimension: ContextDimension::Cpu,
+            status: ContextDimensionStatus::Complete,
+            requested: true,
+            sources: vec![String::new(); 3_000],
+            collected_at_ms: None,
+            complete: true,
+            truncated: false,
+            total_unknown: false,
+            total: 0,
+            returned_count: 0,
+            omitted_count: 0,
+            errors: Vec::new(),
+            capabilities: Vec::new(),
+        },
+    );
+    context.evidence = vec![ContextEvidence {
+        id: "must-not-process".to_string(),
+        dimension: ContextDimension::Services,
+        kind: ContextEvidenceKind::ServiceProblem,
+        severity: "error".to_string(),
+        subject: None,
+        message: "this evidence is after an exhausted dimensions budget".to_string(),
+        count: 1,
+    }];
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+    let summary = summarize_llm_context(&context);
+    assert_eq!(summary.health_status, ContextHealthStatus::Unknown);
+    assert!(summary.truncated);
+    assert!(summary.total_unknown);
+    assert_eq!(
+        summary.failure_reason.as_deref(),
+        Some("summary_input_truncated")
+    );
+    assert!(summary.evidence_ids.is_empty());
+    assert!(!summary.text.contains("must-not-process"));
+    assert!(!summary.text.contains("after an exhausted"));
+    assert!(summary.summary_omitted_count >= context.dimensions.len() + context.evidence.len());
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_marks_text_truncation_separately_from_context_truncation() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = (0..6)
+        .map(|index| ContextEvidence {
+            id: format!("long-warning-{index}"),
+            dimension: ContextDimension::Logs,
+            kind: ContextEvidenceKind::LogPattern,
+            severity: "warning".to_string(),
+            subject: None,
+            message: format!(
+                "repeatable warning detail {index} {}",
+                "safe-detail".repeat(24)
+            ),
+            count: 1,
+        })
+        .collect();
+    context.evidence_total = context.evidence.len();
+    context.evidence_returned_count = context.evidence.len();
+    let summary = summarize_llm_context(&context);
+    assert_eq!(summary.status, ContextDimensionStatus::Complete);
+    assert_eq!(summary.health_status, ContextHealthStatus::Degraded);
+    assert!(!summary.context_truncated);
+    assert!(summary.text_truncated);
+    assert!(summary.truncated);
+    assert!(!summary.complete);
+    assert!(summary.summary_omitted_count >= 1);
+    assert_eq!(summary.metadata_omitted_count, 0);
+    assert_eq!(summary.evidence_omitted_count, 0);
+    assert!(summary.text.ends_with("...[truncated]"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_redacts_untrusted_text_and_url_queries() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![ContextEvidence {
+        id: "service-redaction".to_string(),
+        dimension: ContextDimension::Services,
+        kind: ContextEvidenceKind::ServiceProblem,
+        severity: "error".to_string(),
+        subject: Some("Authorization:Bearer topsecret".to_string()),
+        message: "Authorization: Bearer topsecret /etc/shadow C:\\Users\\patri\\secret.txt password=quoted https://host/path?api_key=secret"
+            .to_string(),
+        count: 1,
+    }];
+    let summary = summarize_llm_context(&context);
+    let json = serde_json::to_string(&summary).expect("summary JSON");
+    assert!(!json.contains("topsecret"));
+    assert!(!json.contains("quoted"));
+    assert!(!json.contains("api_key=secret"));
+    assert!(!json.contains("/etc/shadow"));
+    assert!(!json.contains("C:\\Users\\patri"));
+    assert!(!json.contains("token=secret"));
+    assert!(json.contains("[REDACTED]"));
+    assert!(json.contains("[REDACTED_PATH]"));
+    assert_eq!(summary.evidence_ids, ["service-redaction"]);
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn health_summary_bounds_long_utf8_without_invalid_text() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![ContextEvidence {
+        id: "log-long".to_string(),
+        dimension: ContextDimension::Logs,
+        kind: ContextEvidenceKind::LogPattern,
+        severity: "error".to_string(),
+        subject: None,
+        message: "故障".repeat(500),
+        count: 1,
+    }];
+    let summary = summarize_llm_context(&context);
+    assert_summary_is_bounded(&summary);
+    assert!(summary.text.is_char_boundary(summary.text.len()));
+}
+
+#[test]
+fn health_summary_is_deterministic_and_side_effect_free() {
+    let mut context = aggregate_context(complete_inputs()).llm_context;
+    context.evidence = vec![
+        ContextEvidence {
+            id: "z-warning".to_string(),
+            dimension: ContextDimension::Processes,
+            kind: ContextEvidenceKind::ProcessAnomaly,
+            severity: "warning".to_string(),
+            subject: None,
+            message: "process anomaly: cpu".to_string(),
+            count: 1,
+        },
+        ContextEvidence {
+            id: "a-error".to_string(),
+            dimension: ContextDimension::Logs,
+            kind: ContextEvidenceKind::LogPattern,
+            severity: "error".to_string(),
+            subject: None,
+            message: "log pattern: failure".to_string(),
+            count: 1,
+        },
+    ];
+    let before = context.clone();
+    let first = summarize_llm_context(&context);
+    let second = summarize_llm_context(&context);
+    assert_eq!(first, second);
+    assert_eq!(context, before);
+    context.evidence.reverse();
+    assert_eq!(first, summarize_llm_context(&context));
+}
+
+#[test]
+fn health_summary_legacy_json_and_collect_context_string_are_compatible() {
+    let legacy = json!({
+        "meta": meta_json("context", 200),
+        "dimensions": ["metrics"],
+        "metrics": metrics_fixture(),
+        "processes": null,
+        "logs": null,
+        "network": null,
+        "services": null,
+        "alerts": [],
+        "alert_context": null,
+        "summary": "legacy summary Authorization: Bearer topsecret",
+        "cropped_dimensions": ["processes", "logs", "network", "services"]
+    });
+    let parsed: OsContext = serde_json::from_value(legacy).expect("legacy context");
+    assert_eq!(parsed.health_summary.schema, CONTEXT_HEALTH_SUMMARY_SCHEMA);
+    assert_eq!(
+        parsed.health_summary.status,
+        ContextDimensionStatus::Complete
+    );
+    assert_eq!(
+        parsed.health_summary.collection_status,
+        ContextDimensionStatus::Complete
+    );
+    assert_eq!(
+        parsed.health_summary.health_status,
+        ContextHealthStatus::Healthy
+    );
+    assert!(parsed.health_summary.text.contains("legacy summary"));
+    assert!(!parsed.health_summary.text.contains("topsecret"));
+
+    let mut context = aggregate_context(complete_inputs());
+    populate_legacy_context_consumers(&mut context);
+    assert_eq!(context.summary, context.health_summary.text);
+    assert_eq!(summarize_context(&context), context.health_summary);
+    assert!(context.summary.starts_with("System health"));
+}
+
+#[test]
+fn explicit_health_summary_json_is_normalized_on_deserialize() {
+    let mut evidence_ids = (0..40)
+        .map(|index| format!("evidence-{index}"))
+        .collect::<Vec<_>>();
+    evidence_ids.push("Authorization:Bearer topsecret".to_string());
+    evidence_ids.push("evidence-1".to_string());
+    let raw = json!({
+        "schema": "os-sense.health-summary",
+        "version": 1,
+        "mode": "rule_based",
+        "generated_at_ms": 10,
+        "status": "partial",
+        "health_status": "healthy",
+        "complete": true,
+        "truncated": true,
+        "total_unknown": false,
+        "covered_dimensions": [
+            "cpu", "cpu", "memory", "disk", "thermal", "network_metrics",
+            "network", "processes", "logs", "services", "services"
+        ],
+        "evidence_ids": evidence_ids,
+        "metadata_omitted_count": 2,
+        "evidence_omitted_count": 5,
+        "summary_omitted_count": 0,
+        "omitted_count": 0,
+        "failure_reason": "Authorization:Bearer topsecret",
+        "text": format!(
+            "line one\nAuthorization: Bearer topsecret https://host/path?api_key=secret /etc/shadow {}",
+            "健康".repeat(1_000)
+        )
+    });
+    let summary: ContextHealthSummary =
+        serde_json::from_value(raw).expect("normalized health summary");
+    assert_eq!(summary.status, ContextDimensionStatus::Partial);
+    assert_eq!(summary.collection_status, ContextDimensionStatus::Partial);
+    assert_eq!(summary.health_status, ContextHealthStatus::Unknown);
+    assert!(summary.truncated);
+    assert!(summary.text_truncated);
+    assert!(!summary.complete);
+    assert!(summary.total_unknown);
+    assert!(summary.covered_dimensions.len() <= 16);
+    assert!(summary.evidence_ids.len() <= 16);
+    let unique_ids = summary
+        .evidence_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique_ids.len(), summary.evidence_ids.len());
+    assert!(!summary.text.contains('\n'));
+    assert!(!summary.text.contains("topsecret"));
+    assert!(!summary.text.contains("api_key=secret"));
+    assert!(!summary.text.contains("/etc/shadow"));
+    assert!(!summary
+        .failure_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("topsecret"));
+    assert!(summary.text.contains("[REDACTED_PATH]"));
+    assert_summary_is_bounded(&summary);
+}
+
+#[test]
+fn explicit_health_summary_status_combinations_are_conservative() {
+    let parse_status = |status: &str,
+                        health_status: &str,
+                        complete: bool,
+                        truncated: bool,
+                        total_unknown: bool,
+                        evidence_ids: Vec<&str>| {
+        let raw = json!({
+            "schema": "os-sense.health-summary",
+            "version": 1,
+            "mode": "rule_based",
+            "status": status,
+            "health_status": health_status,
+            "complete": complete,
+            "truncated": truncated,
+            "total_unknown": total_unknown,
+            "evidence_ids": evidence_ids,
+            "text": "status combination"
+        });
+        serde_json::from_value::<ContextHealthSummary>(raw)
+            .expect("normalized health summary")
+            .health_status
+    };
+
+    assert_eq!(
+        parse_status("not_requested", "degraded", false, false, false, vec!["e1"]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("unavailable", "failed", false, false, false, vec!["e1"]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("failed", "healthy", true, false, false, vec![]),
+        ContextHealthStatus::Failed
+    );
+    assert_eq!(
+        parse_status("partial", "healthy", true, false, false, vec!["e1"]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("partial", "degraded", false, true, true, vec!["e1"]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("complete", "healthy", true, true, false, vec![]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("complete", "partial", true, false, false, vec![]),
+        ContextHealthStatus::Unknown
+    );
+    assert_eq!(
+        parse_status("complete", "degraded", true, false, false, vec!["e1"]),
+        ContextHealthStatus::Unknown
+    );
+}
+
 #[test]
 fn network_metrics_is_independent_from_unrequested_network_inventory() {
     let context = aggregate_context(ContextInputs {
@@ -1054,6 +1675,7 @@ fn network_metrics_is_independent_from_unrequested_network_inventory() {
 fn pure_aggregation_does_not_apply_summary_or_intent_consumers() {
     let context = aggregate_context(complete_inputs());
     assert!(context.summary.is_empty());
+    assert!(context.health_summary.text.is_empty());
     assert!(context.alert_context.is_none());
     assert!(context.cropped_dimensions.is_empty());
     assert!(context.llm_context.payload.metrics.is_some());
