@@ -1534,11 +1534,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "os_context_summary",
-            description: "Aggregate OS metrics, processes, logs, network, and services into a structured LLM context with health summary and intent-based dimension cropping; an explicit firewall intent includes bounded structured firewall status.",
+            description: "Collect or reuse bounded OS metrics, processes, logs, network, and services and return a versioned, data-only structured LLM context. Each dimension distinguishes not requested, unavailable, failed, partial, and complete; anomaly counts are computed before deterministic output limits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "intent": { "type": "string", "maxLength": 256 },
+                    "intent": { "type": "string", "maxLength": 256, "description": "Legacy compatibility selector; it never supplies commands, paths, or probe targets." },
                     "include_metrics": { "type": "boolean" },
                     "include_processes": { "type": "boolean" },
                     "include_logs": { "type": "boolean" },
@@ -2488,7 +2488,7 @@ fn run_os_context_summary(input: OsContextRequest) -> Result<String, String> {
         let context = runtime
             .collect_context_on_demand(&input)
             .map_err(|error| error.to_string())?;
-        to_pretty_json(context)
+        to_pretty_json(context.llm_context)
     })
 }
 
@@ -11621,10 +11621,19 @@ printf 'pwsh:%s' "$1"
                 "include_services": false
             }),
         );
-        assert!(
-            result.is_ok(),
-            "os_context_summary should be allowed in read-only mode: {result:?}"
-        );
+        let output = result.unwrap_or_else(|error| {
+            panic!("os_context_summary should be allowed in read-only mode: {error}")
+        });
+        let value: Value = serde_json::from_str(&output).expect("structured context JSON");
+        assert_eq!(value["schema"], "os-sense.llm-context");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["trust"], "untrusted");
+        assert_eq!(value["handling"], "data_only");
+        assert_eq!(value["status"], "not_requested");
+        assert!(value["payload"].is_object());
+        assert!(value["payload"].get("metrics").is_some());
+        assert!(output.len() <= os_sense::MAX_LLM_CONTEXT_JSON_BYTES);
+        assert!(value.get("metrics").is_none());
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {

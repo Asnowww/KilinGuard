@@ -756,7 +756,7 @@ mod tests {
         fs::remove_file(&baseline_path).expect("remove baseline after initialization");
         std::env::remove_var(OS_PROCESS_BASELINE_FILE_ENV);
 
-        let context_error = runtime
+        let context = runtime
             .collect_context_on_demand(&ContextRequest {
                 include_metrics: Some(false),
                 include_processes: Some(true),
@@ -766,8 +766,18 @@ mod tests {
                 process_allowed_names: vec!["worker".to_string()],
                 ..ContextRequest::default()
             })
-            .expect_err("context cannot override configured baseline");
-        assert!(matches!(context_error, OsSenseError::Configuration(_)));
+            .expect("collector errors are isolated by context dimension");
+        let process_status = context
+            .llm_context
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.dimension == crate::model::ContextDimension::Processes)
+            .expect("process context status");
+        assert_eq!(
+            process_status.status,
+            crate::model::ContextDimensionStatus::Failed
+        );
+        assert!(context.processes.is_none());
         let list = runtime
             .collect_processes(&ProcessQuery::default())
             .expect("process collection");

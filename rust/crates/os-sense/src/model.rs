@@ -2140,7 +2140,467 @@ fn service_unit_has_problem(unit: &ServiceUnit) -> bool {
             && (!unit.problem_complete || unit.problem_evidence.is_some()))
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDimension {
+    Cpu,
+    Memory,
+    Disk,
+    Thermal,
+    NetworkMetrics,
+    Network,
+    Processes,
+    Logs,
+    Services,
+}
+
+impl ContextDimension {
+    pub const ALL: [Self; 9] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Thermal,
+        Self::NetworkMetrics,
+        Self::Network,
+        Self::Processes,
+        Self::Logs,
+        Self::Services,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDimensionStatus {
+    Complete,
+    Partial,
+    Failed,
+    Unavailable,
+    #[default]
+    NotRequested,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCapability {
+    LoadAverage,
+    ThermalSensors,
+    NetworkMetrics,
+    DnsResolver,
+    DnsChecks,
+    NetworkTcpProbes,
+    Firewall,
+    ServiceFailureAnalysis,
+    ServiceProblemAnalysis,
+    ServiceDependencies,
+    ServicePorts,
+    ServiceTcpProbes,
+    ServiceHttpProbes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextCapabilityMetadata {
+    pub capability: ContextCapability,
+    pub status: ContextDimensionStatus,
+    pub requested: bool,
+    pub complete: bool,
+    pub truncated: bool,
+    pub total_unknown: bool,
+    pub total: usize,
+    pub returned_count: usize,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextTimeWindow {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextDimensionMetadata {
+    pub dimension: ContextDimension,
+    pub status: ContextDimensionStatus,
+    pub requested: bool,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub collected_at_ms: Option<u64>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub total_unknown: bool,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub returned_count: usize,
+    #[serde(default)]
+    pub omitted_count: usize,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<ContextCapabilityMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextEvidenceKind {
+    MetricAlert,
+    ProcessAnomaly,
+    LogPattern,
+    NetworkAnomaly,
+    ServiceProblem,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextEvidence {
+    pub id: String,
+    pub dimension: ContextDimension,
+    pub kind: ContextEvidenceKind,
+    pub severity: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub message: String,
+    #[serde(default = "default_context_evidence_count")]
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextPage<T> {
+    pub total: usize,
+    pub returned_count: usize,
+    pub omitted_count: usize,
+    pub total_unknown: bool,
+    pub truncated: bool,
+    pub items: Vec<T>,
+}
+
+impl<T> Default for ContextPage<T> {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            returned_count: 0,
+            omitted_count: 0,
+            total_unknown: false,
+            truncated: false,
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextPayload {
+    pub metrics: Option<ContextMetricsPayload>,
+    pub processes: Option<ContextProcessPayload>,
+    pub logs: Option<ContextLogPayload>,
+    pub network: Option<ContextNetworkPayload>,
+    pub services: Option<ContextServicePayload>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextMetricsPayload {
+    pub cpu: ContextCpuPayload,
+    pub memory: ContextMemoryPayload,
+    pub load: Option<ContextLoadPayload>,
+    pub disks: ContextPage<ContextDiskPayload>,
+    pub disk_devices: ContextPage<ContextDiskDevicePayload>,
+    pub network_interfaces: ContextPage<ContextNetworkInterfacePayload>,
+    pub thermal_sensors: ContextPage<ContextThermalPayload>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextCpuPayload {
+    pub usage_percent: Option<f64>,
+    pub cpu_count: usize,
+    pub sample_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextMemoryPayload {
+    pub total_kb: u64,
+    pub available_kb: u64,
+    pub used_kb: u64,
+    pub used_percent: Option<f64>,
+    pub swap_total_kb: u64,
+    pub swap_used_kb: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextLoadPayload {
+    pub one: f64,
+    pub five: f64,
+    pub fifteen: f64,
+    pub runnable_tasks: Option<u64>,
+    pub total_tasks: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextDiskPayload {
+    pub mount_point: String,
+    pub filesystem: String,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub used_percent: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextDiskDevicePayload {
+    pub name: String,
+    pub read_bytes_per_sec: Option<f64>,
+    pub write_bytes_per_sec: Option<f64>,
+    pub read_iops: Option<f64>,
+    pub write_iops: Option<f64>,
+    pub io_in_progress: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextNetworkInterfacePayload {
+    pub name: String,
+    pub receive_bytes_per_sec: Option<f64>,
+    pub transmit_bytes_per_sec: Option<f64>,
+    pub receive_errors_total: u64,
+    pub transmit_errors_total: u64,
+    pub receive_dropped_total: u64,
+    pub transmit_dropped_total: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextThermalPayload {
+    pub source: String,
+    pub label: Option<String>,
+    pub value: i64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextProcessPayload {
+    pub processes: ContextPage<ContextProcessItem>,
+    pub anomaly_total: usize,
+    pub unauthorized_total: usize,
+    pub filter_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextProcessItem {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub name: String,
+    pub state: String,
+    pub user: Option<String>,
+    pub cpu_usage_percent: Option<f64>,
+    pub memory_rss_kb: Option<u64>,
+    pub memory_percent: Option<f64>,
+    pub authorized: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextLogPayload {
+    pub entries: ContextPage<ContextLogEntryPayload>,
+    pub patterns: ContextPage<ContextLogPatternPayload>,
+    pub filter_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextLogEntryPayload {
+    pub source: String,
+    pub timestamp: Option<String>,
+    pub severity: Option<String>,
+    pub unit: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextLogPatternPayload {
+    pub kind: String,
+    pub count: usize,
+    pub score: Option<u8>,
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextNetworkPayload {
+    pub connections: ContextPage<ContextConnectionPayload>,
+    pub dns_resolver_status: ContextDimensionStatus,
+    pub dns_checks: ContextPage<ContextProbePayload>,
+    pub tcp_probes: ContextPage<ContextProbePayload>,
+    pub firewall: ContextPage<ContextFirewallPayload>,
+    pub anomaly_total: usize,
+    pub filter_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextConnectionPayload {
+    pub protocol: String,
+    pub local_address: String,
+    pub local_port: u16,
+    pub remote_address: String,
+    pub remote_port: u16,
+    pub state: String,
+    pub uid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextProbePayload {
+    pub status: String,
+    pub stage: String,
+    pub ok: bool,
+    pub latency_ms: Option<u128>,
+    pub status_code: Option<u16>,
+    pub error_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextFirewallPayload {
+    pub backend: String,
+    pub available: bool,
+    pub active: bool,
+    pub status: CollectionStatus,
+    pub rule_count: usize,
+    pub omitted_rule_count: usize,
+    pub truncated: bool,
+    pub error_kind: Option<FirewallErrorKind>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextServicePayload {
+    pub units: ContextPage<ContextServiceUnitPayload>,
+    pub failed_units: ContextPage<String>,
+    pub problem_units: ContextPage<String>,
+    pub ports: ContextPage<ContextServicePortPayload>,
+    pub dependency_impacts: ContextPage<ContextDependencyImpactPayload>,
+    pub tcp_probes: ContextPage<ContextProbePayload>,
+    pub http_probes: ContextPage<ContextProbePayload>,
+    pub failed_filter_complete: bool,
+    pub problem_filter_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextServiceUnitPayload {
+    pub name: String,
+    pub load_state: Option<String>,
+    pub active_state: Option<String>,
+    pub sub_state: Option<String>,
+    pub unit_file_state: Option<String>,
+    pub health_status: ServiceHealthStatus,
+    pub problems: Vec<ServiceProblemKind>,
+    pub ports: Vec<u16>,
+    pub requires: Vec<String>,
+    pub wants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextServicePortPayload {
+    pub binding_id: String,
+    pub protocol: ServicePortProtocol,
+    pub local_address: String,
+    pub port: u16,
+    pub ownership_status: ServicePortOwnershipStatus,
+    pub owner_services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextDependencyImpactPayload {
+    pub service: String,
+    pub depth: usize,
+    pub severity: Option<DependencyImpactSeverity>,
+    pub has_direct_relation: bool,
+    pub path: Vec<String>,
+}
+
+const fn default_context_evidence_count() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LlmOsContext {
+    pub schema: String,
+    pub version: u32,
+    pub trust: String,
+    pub handling: String,
+    pub instructions_allowed: bool,
+    pub collected_at_ms: u64,
+    pub time_window: ContextTimeWindow,
+    pub status: ContextDimensionStatus,
+    pub complete: bool,
+    pub truncated: bool,
+    pub total_unknown: bool,
+    #[serde(default)]
+    pub metadata_omitted_count: usize,
+    pub evidence_total: usize,
+    pub evidence_returned_count: usize,
+    pub evidence_omitted_count: usize,
+    pub dimensions: Vec<ContextDimensionMetadata>,
+    pub evidence: Vec<ContextEvidence>,
+    pub payload: ContextPayload,
+}
+
+impl Default for LlmOsContext {
+    fn default() -> Self {
+        Self {
+            schema: "os-sense.llm-context".to_string(),
+            version: 1,
+            trust: "untrusted".to_string(),
+            handling: "data_only".to_string(),
+            instructions_allowed: false,
+            collected_at_ms: 0,
+            time_window: ContextTimeWindow::default(),
+            status: ContextDimensionStatus::NotRequested,
+            complete: false,
+            truncated: false,
+            total_unknown: false,
+            metadata_omitted_count: 0,
+            evidence_total: 0,
+            evidence_returned_count: 0,
+            evidence_omitted_count: 0,
+            dimensions: ContextDimension::ALL
+                .into_iter()
+                .map(|dimension| ContextDimensionMetadata {
+                    dimension,
+                    status: ContextDimensionStatus::NotRequested,
+                    requested: false,
+                    sources: Vec::new(),
+                    collected_at_ms: None,
+                    complete: false,
+                    truncated: false,
+                    total_unknown: false,
+                    total: 0,
+                    returned_count: 0,
+                    omitted_count: 0,
+                    errors: Vec::new(),
+                    capabilities: Vec::new(),
+                })
+                .collect(),
+            evidence: Vec::new(),
+            payload: ContextPayload::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OsContext {
     pub meta: OsSampleMeta,
     pub dimensions: Vec<String>,
@@ -2153,4 +2613,298 @@ pub struct OsContext {
     pub alert_context: Option<AlertContext>,
     pub summary: String,
     pub cropped_dimensions: Vec<String>,
+    pub llm_context: LlmOsContext,
+}
+
+impl<'de> Deserialize<'de> for OsContext {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawOsContext {
+            meta: OsSampleMeta,
+            #[serde(default)]
+            dimensions: Vec<String>,
+            #[serde(default)]
+            metrics: Option<MetricSnapshot>,
+            #[serde(default)]
+            processes: Option<ProcessList>,
+            #[serde(default)]
+            logs: Option<LogQueryResult>,
+            #[serde(default)]
+            network: Option<NetworkSnapshot>,
+            #[serde(default)]
+            services: Option<ServiceSnapshot>,
+            #[serde(default)]
+            alerts: Vec<Alert>,
+            #[serde(default)]
+            alert_context: Option<AlertContext>,
+            #[serde(default)]
+            summary: String,
+            #[serde(default)]
+            cropped_dimensions: Vec<String>,
+            #[serde(default)]
+            llm_context: Option<LlmOsContext>,
+        }
+
+        let raw = RawOsContext::deserialize(deserializer)?;
+        let llm_context = raw.llm_context.unwrap_or_else(|| {
+            legacy_llm_context(
+                &raw.meta,
+                &raw.dimensions,
+                raw.metrics.as_ref(),
+                raw.processes.as_ref(),
+                raw.logs.as_ref(),
+                raw.network.as_ref(),
+                raw.services.as_ref(),
+            )
+        });
+        Ok(Self {
+            meta: raw.meta,
+            dimensions: raw.dimensions,
+            metrics: raw.metrics,
+            processes: raw.processes,
+            logs: raw.logs,
+            network: raw.network,
+            services: raw.services,
+            alerts: raw.alerts,
+            alert_context: raw.alert_context,
+            summary: raw.summary,
+            cropped_dimensions: raw.cropped_dimensions,
+            llm_context,
+        })
+    }
+}
+
+fn legacy_llm_context(
+    meta: &OsSampleMeta,
+    dimensions: &[String],
+    metrics: Option<&MetricSnapshot>,
+    processes: Option<&ProcessList>,
+    logs: Option<&LogQueryResult>,
+    network: Option<&NetworkSnapshot>,
+    services: Option<&ServiceSnapshot>,
+) -> LlmOsContext {
+    let listed = |name: &str| dimensions.iter().any(|dimension| dimension == name);
+    let metric_status = |dimension| {
+        metrics.and_then(|snapshot| {
+            snapshot
+                .dimension_results
+                .iter()
+                .find(|result| result.dimension == dimension)
+                .map(|result| result.status)
+                .or(Some(snapshot.status))
+        })
+    };
+    let mut statuses = vec![
+        legacy_dimension_metadata(
+            ContextDimension::Cpu,
+            listed("metrics") || metrics.is_some(),
+            metrics.map(|snapshot| snapshot.meta.source.as_str()),
+            metrics.map(|snapshot| snapshot.meta.collected_at_ms),
+            metric_status(ResourceDimension::Cpu),
+            false,
+            1,
+            usize::from(metrics.is_some()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Memory,
+            listed("metrics") || metrics.is_some(),
+            metrics.map(|snapshot| snapshot.meta.source.as_str()),
+            metrics.map(|snapshot| snapshot.meta.collected_at_ms),
+            metric_status(ResourceDimension::Memory),
+            false,
+            1,
+            usize::from(metrics.is_some()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Disk,
+            listed("metrics") || metrics.is_some(),
+            metrics.map(|snapshot| snapshot.meta.source.as_str()),
+            metrics.map(|snapshot| snapshot.meta.collected_at_ms),
+            metric_status(ResourceDimension::Disk),
+            false,
+            metrics.map_or(0, |snapshot| snapshot.disks.len()),
+            metrics.map_or(0, |snapshot| snapshot.disks.len()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Thermal,
+            listed("metrics") || metrics.is_some(),
+            metrics.map(|snapshot| snapshot.meta.source.as_str()),
+            metrics.map(|snapshot| snapshot.meta.collected_at_ms),
+            metric_status(ResourceDimension::Thermal),
+            false,
+            metrics.map_or(0, |snapshot| {
+                snapshot
+                    .thermal
+                    .temperatures
+                    .len()
+                    .saturating_add(snapshot.thermal.fans.len())
+            }),
+            metrics.map_or(0, |snapshot| {
+                snapshot
+                    .thermal
+                    .temperatures
+                    .len()
+                    .saturating_add(snapshot.thermal.fans.len())
+            }),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::NetworkMetrics,
+            listed("metrics") || metrics.is_some(),
+            metrics.map(|snapshot| snapshot.meta.source.as_str()),
+            metrics.map(|snapshot| snapshot.meta.collected_at_ms),
+            metric_status(ResourceDimension::Network),
+            false,
+            metrics.map_or(0, |snapshot| snapshot.network.interfaces.len()),
+            metrics.map_or(0, |snapshot| snapshot.network.interfaces.len()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Network,
+            listed("network") || network.is_some(),
+            network.map(|snapshot| snapshot.meta.source.as_str()),
+            network.map(|snapshot| snapshot.meta.collected_at_ms),
+            network.map(|snapshot| snapshot.collection_status),
+            network.is_some_and(|snapshot| snapshot.truncated || !snapshot.filter_complete),
+            network.map_or(0, |snapshot| snapshot.total),
+            network.map_or(0, |snapshot| snapshot.connections.len()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Processes,
+            listed("processes") || processes.is_some(),
+            processes.map(|snapshot| snapshot.meta.source.as_str()),
+            processes.map(|snapshot| snapshot.meta.collected_at_ms),
+            processes.map(|snapshot| snapshot.collection_status),
+            processes.is_some_and(|snapshot| snapshot.truncated || !snapshot.filter_complete),
+            processes.map_or(0, |snapshot| snapshot.total),
+            processes.map_or(0, |snapshot| snapshot.processes.len()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Logs,
+            listed("logs") || logs.is_some(),
+            logs.map(|snapshot| snapshot.meta.source.as_str()),
+            logs.map(|snapshot| snapshot.meta.collected_at_ms),
+            logs.map(|snapshot| snapshot.collection_status),
+            logs.is_some_and(|snapshot| snapshot.truncated || !snapshot.filter_complete),
+            logs.map_or(0, |snapshot| snapshot.entries.len()),
+            logs.map_or(0, |snapshot| snapshot.entries.len()),
+        ),
+        legacy_dimension_metadata(
+            ContextDimension::Services,
+            listed("services") || services.is_some(),
+            services.map(|snapshot| snapshot.meta.source.as_str()),
+            services.map(|snapshot| snapshot.meta.collected_at_ms),
+            services.map(|snapshot| snapshot.collection_status),
+            services.is_some_and(|snapshot| snapshot.truncated || !snapshot.filter_complete),
+            services.map_or(0, |snapshot| snapshot.total),
+            services.map_or(0, |snapshot| snapshot.returned_count),
+        ),
+    ];
+    statuses.sort_by_key(|status| status.dimension);
+    let status = aggregate_context_status(&statuses);
+    let start_ms = metrics
+        .map(|snapshot| snapshot.started_at_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or(meta.collected_at_ms);
+    LlmOsContext {
+        schema: "os-sense.llm-context".to_string(),
+        version: 1,
+        trust: "untrusted".to_string(),
+        handling: "data_only".to_string(),
+        instructions_allowed: false,
+        collected_at_ms: meta.collected_at_ms,
+        time_window: ContextTimeWindow {
+            start_ms,
+            end_ms: meta.collected_at_ms,
+        },
+        status,
+        complete: status == ContextDimensionStatus::Complete,
+        truncated: statuses.iter().any(|dimension| dimension.truncated),
+        total_unknown: statuses.iter().any(|dimension| dimension.total_unknown),
+        metadata_omitted_count: 0,
+        evidence_total: 0,
+        evidence_returned_count: 0,
+        evidence_omitted_count: 0,
+        dimensions: statuses,
+        evidence: Vec::new(),
+        payload: ContextPayload::default(),
+    }
+}
+
+fn legacy_dimension_metadata(
+    dimension: ContextDimension,
+    requested: bool,
+    source: Option<&str>,
+    collected_at_ms: Option<u64>,
+    status: Option<CollectionStatus>,
+    truncated: bool,
+    total: usize,
+    returned_count: usize,
+) -> ContextDimensionMetadata {
+    let mut status = if !requested {
+        ContextDimensionStatus::NotRequested
+    } else {
+        status.map_or(
+            ContextDimensionStatus::Failed,
+            context_status_from_collection,
+        )
+    };
+    if requested && status == ContextDimensionStatus::Complete && truncated {
+        status = ContextDimensionStatus::Partial;
+    }
+    ContextDimensionMetadata {
+        dimension,
+        status,
+        requested,
+        sources: source.into_iter().map(str::to_string).collect(),
+        collected_at_ms,
+        complete: status == ContextDimensionStatus::Complete && !truncated,
+        truncated,
+        total_unknown: requested && status != ContextDimensionStatus::Complete,
+        total,
+        returned_count,
+        omitted_count: total.saturating_sub(returned_count),
+        errors: Vec::new(),
+        capabilities: Vec::new(),
+    }
+}
+
+fn context_status_from_collection(status: CollectionStatus) -> ContextDimensionStatus {
+    match status {
+        CollectionStatus::Complete => ContextDimensionStatus::Complete,
+        CollectionStatus::Partial => ContextDimensionStatus::Partial,
+        CollectionStatus::Failed => ContextDimensionStatus::Failed,
+    }
+}
+
+fn aggregate_context_status(statuses: &[ContextDimensionMetadata]) -> ContextDimensionStatus {
+    let requested = statuses
+        .iter()
+        .filter(|dimension| dimension.requested)
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return ContextDimensionStatus::NotRequested;
+    }
+    if requested
+        .iter()
+        .all(|dimension| dimension.status == ContextDimensionStatus::Complete && dimension.complete)
+    {
+        return ContextDimensionStatus::Complete;
+    }
+    if requested
+        .iter()
+        .all(|dimension| dimension.status == ContextDimensionStatus::Unavailable)
+    {
+        return ContextDimensionStatus::Unavailable;
+    }
+    if requested.iter().all(|dimension| {
+        matches!(
+            dimension.status,
+            ContextDimensionStatus::Failed | ContextDimensionStatus::Unavailable
+        )
+    }) {
+        return ContextDimensionStatus::Failed;
+    }
+    ContextDimensionStatus::Partial
 }

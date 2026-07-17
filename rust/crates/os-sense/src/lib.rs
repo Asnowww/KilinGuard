@@ -6,6 +6,7 @@
 
 mod command;
 pub mod context;
+mod context_payload;
 pub mod error;
 pub mod http_probe;
 pub mod logs;
@@ -19,7 +20,10 @@ mod service_ports;
 pub mod services;
 pub mod storage;
 
-pub use context::{build_alert_context, collect_context, ContextRequest};
+pub use context::{
+    aggregate_context, build_alert_context, collect_context, ContextInput, ContextInputs,
+    ContextRequest, CONTEXT_SCHEMA, CONTEXT_SCHEMA_VERSION, MAX_LLM_CONTEXT_JSON_BYTES,
+};
 pub use error::{OsSenseError, Result};
 pub use http_probe::HttpProbeRequest;
 pub use logs::{
@@ -28,23 +32,32 @@ pub use logs::{
 };
 pub use model::{
     ActiveAlert, ActiveAlertDimension, ActiveAlertSnapshot, Alert, AlertContext,
-    AlertEvaluationFreshness, CollectionMode, CollectionStatus, CorruptSampleDetail,
-    CpuCoreSnapshot, CpuSnapshot, DependencyImpactReason, DependencyImpactSeverity,
-    DependencyRelationKind, DimensionCollectionResult, DiskDeviceSnapshot, DiskSnapshot,
-    DnsResolutionSource, DnsResolutionStatus, DnsResolverStatus, FanReading, FirewallErrorKind,
-    FirewallStatus, HealthProbeResult, HttpProbeErrorKind, HttpProbeResult, HttpProbeStage,
-    HttpProbeStatus, HwmonSensorReading, LoadAverage, LogEntry, LogLlmSummaryOutput, LogPattern,
-    LogPatternEvidence, LogQueryResult, LogSourceStatus, LogSummary, LogSummaryBoundary,
-    LogSummaryEvidence, LogSummaryMode, LogSummaryRequest, LogSummaryTimeRange, MemorySnapshot,
-    MetricSnapshot, NetworkAnomalyEvidence, NetworkBaseline, NetworkBaselineEntry,
-    NetworkConnection, NetworkInterfaceSnapshot, NetworkMetricsSnapshot, NetworkSnapshot,
-    NetworkSourceStatus, OsContext, OsSampleMeta, PlatformInfo, ProcessAnomalyEvidence,
-    ProcessBaseline, ProcessBaselineEntry, ProcessInfo, ProcessList, RateStatus, ResourceDimension,
-    SensorAvailability, ServiceDependencyAnalysis, ServiceDependencyImpact,
-    ServiceDependencyPathEdge, ServiceHealthStatus, ServicePortBinding, ServicePortCollection,
-    ServicePortOwnershipStatus, ServicePortProtocol, ServiceProblem, ServiceProblemEvidence,
-    ServiceProblemKind, ServiceSnapshot, ServiceSource, ServiceSourceStatus, ServiceUnit,
-    TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus, TemperatureReading, ThermalSnapshot,
+    AlertEvaluationFreshness, CollectionMode, CollectionStatus, ContextCapability,
+    ContextCapabilityMetadata, ContextConnectionPayload, ContextCpuPayload,
+    ContextDependencyImpactPayload, ContextDimension, ContextDimensionMetadata,
+    ContextDimensionStatus, ContextDiskDevicePayload, ContextDiskPayload, ContextEvidence,
+    ContextEvidenceKind, ContextFirewallPayload, ContextLoadPayload, ContextLogEntryPayload,
+    ContextLogPatternPayload, ContextLogPayload, ContextMemoryPayload, ContextMetricsPayload,
+    ContextNetworkInterfacePayload, ContextNetworkPayload, ContextPage, ContextPayload,
+    ContextProbePayload, ContextProcessItem, ContextProcessPayload, ContextServicePayload,
+    ContextServicePortPayload, ContextServiceUnitPayload, ContextThermalPayload, ContextTimeWindow,
+    CorruptSampleDetail, CpuCoreSnapshot, CpuSnapshot, DependencyImpactReason,
+    DependencyImpactSeverity, DependencyRelationKind, DimensionCollectionResult,
+    DiskDeviceSnapshot, DiskSnapshot, DnsResolutionSource, DnsResolutionStatus, DnsResolverStatus,
+    FanReading, FirewallErrorKind, FirewallStatus, HealthProbeResult, HttpProbeErrorKind,
+    HttpProbeResult, HttpProbeStage, HttpProbeStatus, HwmonSensorReading, LlmOsContext,
+    LoadAverage, LogEntry, LogLlmSummaryOutput, LogPattern, LogPatternEvidence, LogQueryResult,
+    LogSourceStatus, LogSummary, LogSummaryBoundary, LogSummaryEvidence, LogSummaryMode,
+    LogSummaryRequest, LogSummaryTimeRange, MemorySnapshot, MetricSnapshot, NetworkAnomalyEvidence,
+    NetworkBaseline, NetworkBaselineEntry, NetworkConnection, NetworkInterfaceSnapshot,
+    NetworkMetricsSnapshot, NetworkSnapshot, NetworkSourceStatus, OsContext, OsSampleMeta,
+    PlatformInfo, ProcessAnomalyEvidence, ProcessBaseline, ProcessBaselineEntry, ProcessInfo,
+    ProcessList, RateStatus, ResourceDimension, SensorAvailability, ServiceDependencyAnalysis,
+    ServiceDependencyImpact, ServiceDependencyPathEdge, ServiceHealthStatus, ServicePortBinding,
+    ServicePortCollection, ServicePortOwnershipStatus, ServicePortProtocol, ServiceProblem,
+    ServiceProblemEvidence, ServiceProblemKind, ServiceSnapshot, ServiceSource,
+    ServiceSourceStatus, ServiceUnit, TcpProbeErrorKind, TcpProbeStage, TcpProbeStatus,
+    TemperatureReading, ThermalSnapshot,
 };
 pub use network::{
     collect_network, NetworkQuery, TcpProbeRequest, MAX_NETWORK_BASELINE_ENTRIES,
