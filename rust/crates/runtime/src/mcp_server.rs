@@ -1,7 +1,7 @@
 //! Minimal Model Context Protocol (MCP) server.
 //!
-//! Implements a newline-safe, LSP-framed JSON-RPC server over stdio that
-//! answers `initialize`, `tools/list`, and `tools/call` requests. The framing
+//! Implements a newline-delimited JSON-RPC server over stdio that answers
+//! `initialize`, `tools/list`, and `tools/call` requests. The framing
 //! matches the client transport implemented in [`crate::mcp_stdio`] so this
 //! server can be driven by either an external MCP client (e.g. Claude
 //! Desktop) or `claw`'s own [`McpServerManager`](crate::McpServerManager).
@@ -17,7 +17,7 @@ use std::io;
 
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{
-    stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdin, Stdout,
+    stdin, stdout, AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout,
 };
 
 use crate::mcp_stdio::{
@@ -31,6 +31,7 @@ use crate::mcp_stdio::{
 /// Matches the version used by the built-in client in
 /// [`crate::mcp_stdio`], so the two stay in lockstep.
 pub const MCP_SERVER_PROTOCOL_VERSION: &str = "2025-03-26";
+const MCP_MAX_JSONRPC_LINE_BYTES: usize = 1024 * 1024;
 
 /// Synchronous handler invoked for every `tools/call` request.
 ///
@@ -242,47 +243,79 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
     }
 }
 
-/// Reads a single LSP-framed JSON-RPC payload from `reader`.
+/// Reads a single newline-delimited JSON-RPC payload from `reader`.
 ///
-/// Returns `Ok(None)` on clean EOF before any header bytes have been read,
+/// Returns `Ok(None)` on clean EOF before any bytes have been read,
 /// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
-async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
-    let mut content_length: Option<usize> = None;
-    let mut first_header = true;
+async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    read_limited_jsonrpc_line(reader).await
+}
+
+async fn read_limited_jsonrpc_line<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut payload = Vec::new();
     loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            if first_header {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if payload.is_empty() {
                 return Ok(None);
             }
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "MCP stdio stream closed while reading headers",
+                "MCP stdio stream closed before JSON-RPC newline",
             ));
         }
-        first_header = false;
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let header = line.trim_end_matches(['\r', '\n']);
-        if let Some((name, value)) = header.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                content_length = Some(parsed);
-            }
-        }
-    }
 
-    let content_length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
-    let mut payload = vec![0_u8; content_length];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(payload))
+        if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
+            if payload.len().saturating_add(newline_index) > MCP_MAX_JSONRPC_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "MCP stdio JSON-RPC line exceeded {} byte limit",
+                        MCP_MAX_JSONRPC_LINE_BYTES
+                    ),
+                ));
+            }
+            payload.extend_from_slice(&available[..newline_index]);
+            reader.consume(newline_index + 1);
+            if payload.last() == Some(&b'\r') {
+                payload.pop();
+            }
+            if payload.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP stdio JSON-RPC line must not be empty",
+                ));
+            }
+            if payload.contains(&b'\r') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP stdio JSON-RPC line must not contain carriage returns",
+                ));
+            }
+            std::str::from_utf8(&payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            return Ok(Some(payload));
+        }
+
+        if payload.len().saturating_add(available.len()) > MCP_MAX_JSONRPC_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP stdio JSON-RPC line exceeded {} byte limit",
+                    MCP_MAX_JSONRPC_LINE_BYTES
+                ),
+            ));
+        }
+        let available_len = available.len();
+        payload.extend_from_slice(available);
+        reader.consume(available_len);
+    }
 }
 
 async fn write_response(
@@ -291,15 +324,31 @@ async fn write_response(
 ) -> io::Result<()> {
     let body = serde_json::to_vec(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdout.write_all(header.as_bytes()).await?;
+    if body.len() > MCP_MAX_JSONRPC_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "MCP stdio JSON-RPC line exceeded {} byte limit: {}",
+                MCP_MAX_JSONRPC_LINE_BYTES,
+                body.len()
+            ),
+        ));
+    }
+    if body.contains(&b'\n') || body.contains(&b'\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP stdio JSON-RPC messages must be single-line JSON",
+        ));
+    }
     stdout.write_all(&body).await?;
+    stdout.write_all(b"\n").await?;
     stdout.flush().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::runtime::Builder;
 
     #[test]
     fn dispatch_initialize_returns_server_info() {
@@ -332,8 +381,10 @@ mod tests {
     fn dispatch_tools_list_returns_registered_tools() {
         let tool = McpTool {
             name: "echo".to_string(),
+            title: None,
             description: Some("Echo".to_string()),
             input_schema: Some(json!({"type": "object"})),
+            output_schema: None,
             annotations: None,
             meta: None,
         };
@@ -436,5 +487,84 @@ mod tests {
         let response = server.dispatch(request);
         let error = response.error.expect("error payload");
         assert_eq!(error.code, -32601);
+    }
+
+    #[test]
+    fn read_frame_accepts_single_line_json() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"{\"jsonrpc\":\"2.0\"}\n"[..]);
+            let payload = read_frame(&mut reader)
+                .await
+                .expect("read should succeed")
+                .expect("payload");
+            assert_eq!(payload, br#"{"jsonrpc":"2.0"}"#);
+        });
+    }
+
+    #[test]
+    fn read_frame_accepts_crlf_delimited_json() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"{\"jsonrpc\":\"2.0\"}\r\n"[..]);
+            let payload = read_frame(&mut reader)
+                .await
+                .expect("read should succeed")
+                .expect("payload");
+            assert_eq!(payload, br#"{"jsonrpc":"2.0"}"#);
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_embedded_carriage_return() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"{\"jsonrpc\":\"2.0\r\"}\n"[..]);
+            let error = read_frame(&mut reader)
+                .await
+                .expect_err("embedded carriage return should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_overlong_line() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut bytes = vec![b'{'; MCP_MAX_JSONRPC_LINE_BYTES + 1];
+            bytes.push(b'\n');
+            let mut reader = BufReader::new(bytes.as_slice());
+            let error = read_frame(&mut reader)
+                .await
+                .expect_err("overlong line should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_empty_line() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"\n"[..]);
+            let error = read_frame(&mut reader)
+                .await
+                .expect_err("empty line should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
     }
 }

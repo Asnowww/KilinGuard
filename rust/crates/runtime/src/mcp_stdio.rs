@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
 use std::io::{Read as StdRead, Write as StdWrite};
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
@@ -25,7 +25,7 @@ use crate::mcp_lifecycle_hardened::{
 use crate::sse::IncrementalSseParser;
 
 #[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
@@ -33,6 +33,15 @@ const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
+
+const MCP_MAX_JSONRPC_FRAME_BYTES: usize = 1024 * 1024;
+const MCP_MAX_PAGINATION_PAGES: usize = 64;
+const MCP_MAX_PAGINATION_ITEMS: usize = 1024;
+const MCP_MAX_CURSOR_BYTES: usize = 4096;
+const MCP_MAX_CATALOG_ITEM_JSON_BYTES: usize = 64 * 1024;
+const MCP_MAX_RESULT_JSON_BYTES: usize = 1024 * 1024;
+const MCP_MAX_RESOURCE_CONTENTS: usize = 64;
+const MCP_MAX_PROMPT_MESSAGES: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -141,9 +150,13 @@ pub struct McpListToolsParams {
 pub struct McpTool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<JsonValue>,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<JsonValue>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
@@ -202,9 +215,13 @@ pub struct McpResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<JsonValue>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
@@ -221,6 +238,40 @@ pub struct McpListResourcesResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct McpListResourceTemplatesParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpResourceTemplate {
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<JsonValue>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpListResourceTemplatesResult {
+    #[serde(default)]
+    pub resource_templates: Vec<McpResourceTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct McpListPromptsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
@@ -231,6 +282,8 @@ pub struct McpListPromptsParams {
 pub struct McpPromptArgument {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
     pub required: bool,
@@ -240,9 +293,13 @@ pub struct McpPromptArgument {
 pub struct McpPrompt {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
     pub arguments: Vec<McpPromptArgument>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -271,10 +328,9 @@ pub struct McpPromptMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpGetPromptResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub messages: Vec<McpPromptMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,12 +357,140 @@ pub struct McpReadResourceResult {
     pub contents: Vec<McpResourceContents>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedMcpTool {
     pub server_name: String,
     pub qualified_name: String,
     pub raw_name: String,
     pub tool: McpTool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedMcpResource {
+    pub server_name: String,
+    pub uri: String,
+    pub resource: McpResource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedMcpResourceTemplate {
+    pub server_name: String,
+    pub uri_template: String,
+    pub resource_template: McpResourceTemplate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedMcpPrompt {
+    pub server_name: String,
+    pub name: String,
+    pub prompt: McpPrompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCapabilityKind {
+    Tools,
+    Resources,
+    ResourceTemplates,
+    Prompts,
+}
+
+impl McpCapabilityKind {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Tools => "tools/list",
+            Self::Resources => "resources/list",
+            Self::ResourceTemplates => "resources/templates/list",
+            Self::Prompts => "prompts/list",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Resources | Self::ResourceTemplates => "resources",
+            Self::Prompts => "prompts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerCapabilities {
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+    pub raw: JsonValue,
+}
+
+impl Default for McpServerCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: false,
+            resources: false,
+            prompts: false,
+            raw: JsonValue::Null,
+        }
+    }
+}
+
+impl McpServerCapabilities {
+    fn from_raw(raw: JsonValue) -> Self {
+        Self {
+            tools: capability_declared(&raw, "tools"),
+            resources: capability_declared(&raw, "resources"),
+            prompts: capability_declared(&raw, "prompts"),
+            raw,
+        }
+    }
+
+    fn supports(&self, capability: McpCapabilityKind) -> bool {
+        match capability {
+            McpCapabilityKind::Tools => self.tools,
+            McpCapabilityKind::Resources | McpCapabilityKind::ResourceTemplates => self.resources,
+            McpCapabilityKind::Prompts => self.prompts,
+        }
+    }
+}
+
+fn capability_declared(raw: &JsonValue, key: &str) -> bool {
+    raw.as_object()
+        .and_then(|object| object.get(key))
+        .is_some_and(JsonValue::is_object)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerCatalog {
+    pub server_name: String,
+    pub server_info: Option<McpInitializeServerInfo>,
+    pub capabilities: Option<McpServerCapabilities>,
+    pub tools: Vec<ManagedMcpTool>,
+    pub resources: Vec<ManagedMcpResource>,
+    pub resource_templates: Vec<ManagedMcpResourceTemplate>,
+    pub prompts: Vec<ManagedMcpPrompt>,
+    pub tools_complete: bool,
+    pub resources_complete: bool,
+    pub resource_templates_complete: bool,
+    pub prompts_complete: bool,
+}
+
+impl McpServerCatalog {
+    fn new(server_name: impl Into<String>) -> Self {
+        Self {
+            server_name: server_name.into(),
+            server_info: None,
+            capabilities: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            tools_complete: false,
+            resources_complete: false,
+            resource_templates_complete: false,
+            prompts_complete: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,10 +511,35 @@ pub struct McpDiscoveryFailure {
     pub context: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCapabilityDegradation {
+    pub server_name: String,
+    pub phase: McpLifecyclePhase,
+    pub required: bool,
+    pub capability: McpCapabilityKind,
+    pub method: &'static str,
+    pub reason: String,
+    pub context: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpToolDiscoveryReport {
     pub tools: Vec<ManagedMcpTool>,
     pub failed_servers: Vec<McpDiscoveryFailure>,
+    pub unsupported_servers: Vec<UnsupportedMcpServer>,
+    pub heartbeat: Vec<McpServerHeartbeat>,
+    pub degraded_startup: Option<McpDegradedReport>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpCapabilityDiscoveryReport {
+    pub catalogs: Vec<McpServerCatalog>,
+    pub tools: Vec<ManagedMcpTool>,
+    pub resources: Vec<ManagedMcpResource>,
+    pub resource_templates: Vec<ManagedMcpResourceTemplate>,
+    pub prompts: Vec<ManagedMcpPrompt>,
+    pub failed_servers: Vec<McpDiscoveryFailure>,
+    pub degraded_capabilities: Vec<McpCapabilityDegradation>,
     pub unsupported_servers: Vec<UnsupportedMcpServer>,
     pub heartbeat: Vec<McpServerHeartbeat>,
     pub degraded_startup: Option<McpDegradedReport>,
@@ -420,8 +629,26 @@ pub enum McpServerManagerError {
     UnknownTool {
         qualified_name: String,
     },
+    UnknownResource {
+        server_name: String,
+        uri: String,
+    },
+    UnknownPrompt {
+        server_name: String,
+        name: String,
+    },
     UnknownServer {
         server_name: String,
+    },
+    UnsupportedCapability {
+        server_name: String,
+        capability: McpCapabilityKind,
+    },
+    LimitExceeded {
+        server_name: String,
+        method: &'static str,
+        limit: usize,
+        details: String,
     },
 }
 
@@ -465,7 +692,30 @@ impl std::fmt::Display for McpServerManagerError {
             Self::UnknownTool { qualified_name } => {
                 write!(f, "unknown MCP tool `{qualified_name}`")
             }
+            Self::UnknownResource { server_name, uri } => {
+                write!(f, "unknown MCP resource `{uri}` on server `{server_name}`")
+            }
+            Self::UnknownPrompt { server_name, name } => {
+                write!(f, "unknown MCP prompt `{name}` on server `{server_name}`")
+            }
             Self::UnknownServer { server_name } => write!(f, "unknown MCP server `{server_name}`"),
+            Self::UnsupportedCapability {
+                server_name,
+                capability,
+            } => write!(
+                f,
+                "MCP server `{server_name}` did not declare `{}` capability",
+                capability.as_str()
+            ),
+            Self::LimitExceeded {
+                server_name,
+                method,
+                limit,
+                details,
+            } => write!(
+                f,
+                "MCP server `{server_name}` exceeded {method} limit {limit}: {details}"
+            ),
         }
     }
 }
@@ -479,7 +729,11 @@ impl std::error::Error for McpServerManagerError {
             | Self::InvalidResponse { .. }
             | Self::Timeout { .. }
             | Self::UnknownTool { .. }
-            | Self::UnknownServer { .. } => None,
+            | Self::UnknownResource { .. }
+            | Self::UnknownPrompt { .. }
+            | Self::UnknownServer { .. }
+            | Self::UnsupportedCapability { .. }
+            | Self::LimitExceeded { .. } => None,
         }
     }
 }
@@ -497,9 +751,16 @@ impl McpServerManagerError {
             Self::Transport { method, .. }
             | Self::JsonRpc { method, .. }
             | Self::InvalidResponse { method, .. }
-            | Self::Timeout { method, .. } => lifecycle_phase_for_method(method),
-            Self::UnknownTool { .. } => McpLifecyclePhase::ToolDiscovery,
+            | Self::Timeout { method, .. }
+            | Self::LimitExceeded { method, .. } => lifecycle_phase_for_method(method),
+            Self::UnknownTool { .. } | Self::UnknownPrompt { .. } => {
+                McpLifecyclePhase::ToolDiscovery
+            }
+            Self::UnknownResource { .. } => McpLifecyclePhase::ResourceDiscovery,
             Self::UnknownServer { .. } => McpLifecyclePhase::ServerRegistration,
+            Self::UnsupportedCapability { capability, .. } => {
+                lifecycle_phase_for_method(capability.method())
+            }
         }
     }
 
@@ -567,9 +828,35 @@ impl McpServerManagerError {
             Self::UnknownTool { qualified_name } => {
                 BTreeMap::from([("qualified_tool".to_string(), qualified_name.clone())])
             }
+            Self::UnknownResource { server_name, uri } => BTreeMap::from([
+                ("server".to_string(), server_name.clone()),
+                ("uri".to_string(), uri.clone()),
+            ]),
+            Self::UnknownPrompt { server_name, name } => BTreeMap::from([
+                ("server".to_string(), server_name.clone()),
+                ("prompt".to_string(), name.clone()),
+            ]),
             Self::UnknownServer { server_name } => {
                 BTreeMap::from([("server".to_string(), server_name.clone())])
             }
+            Self::UnsupportedCapability {
+                server_name,
+                capability,
+            } => BTreeMap::from([
+                ("server".to_string(), server_name.clone()),
+                ("capability".to_string(), capability.as_str().to_string()),
+            ]),
+            Self::LimitExceeded {
+                server_name,
+                method,
+                limit,
+                details,
+            } => BTreeMap::from([
+                ("server".to_string(), server_name.clone()),
+                ("method".to_string(), (*method).to_string()),
+                ("limit".to_string(), limit.to_string()),
+                ("details".to_string(), details.clone()),
+            ]),
         }
     }
 }
@@ -580,7 +867,7 @@ fn lifecycle_phase_for_method(method: &str) -> McpLifecyclePhase {
         "tools/list" => McpLifecyclePhase::ToolDiscovery,
         "prompts/list" => McpLifecyclePhase::ToolDiscovery,
         "prompts/get" => McpLifecyclePhase::Invocation,
-        "resources/list" => McpLifecyclePhase::ResourceDiscovery,
+        "resources/list" | "resources/templates/list" => McpLifecyclePhase::ResourceDiscovery,
         "resources/read" | "tools/call" => McpLifecyclePhase::Invocation,
         _ => McpLifecyclePhase::ErrorSurfacing,
     }
@@ -603,6 +890,46 @@ fn unsupported_server_failed_server(server: &UnsupportedMcpServer) -> McpFailedS
     }
 }
 
+fn degraded_startup_report(
+    working_servers: &[String],
+    failed_servers: &[McpDiscoveryFailure],
+    unsupported_servers: &[UnsupportedMcpServer],
+    available_tools: Vec<String>,
+) -> Option<McpDegradedReport> {
+    let degraded_failed_servers = failed_servers
+        .iter()
+        .map(|failure| McpFailedServer {
+            server_name: failure.server_name.clone(),
+            phase: failure.phase,
+            error: McpErrorSurface::new(
+                failure.phase,
+                Some(failure.server_name.clone()),
+                failure.error.clone(),
+                {
+                    let mut context = failure.context.clone();
+                    context.insert("required".to_string(), failure.required.to_string());
+                    context
+                },
+                failure.recoverable,
+            ),
+        })
+        .chain(
+            unsupported_servers
+                .iter()
+                .map(unsupported_server_failed_server),
+        )
+        .collect::<Vec<_>>();
+
+    (!working_servers.is_empty() && !degraded_failed_servers.is_empty()).then(|| {
+        McpDegradedReport::new(
+            working_servers.to_vec(),
+            degraded_failed_servers,
+            available_tools,
+            Vec::new(),
+        )
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolRoute {
     server_name: String,
@@ -615,15 +942,22 @@ struct ManagedMcpServer {
     process: Option<McpStdioProcess>,
     initialized: bool,
     required: bool,
+    catalog: McpServerCatalog,
+}
+
+struct McpCatalogDiscoveryOutcome {
+    catalog: McpServerCatalog,
+    degraded_capabilities: Vec<McpCapabilityDegradation>,
 }
 
 impl ManagedMcpServer {
-    fn new(bootstrap: McpClientBootstrap, required: bool) -> Self {
+    fn new(server_name: impl Into<String>, bootstrap: McpClientBootstrap, required: bool) -> Self {
         Self {
             bootstrap,
             process: None,
             initialized: false,
             required,
+            catalog: McpServerCatalog::new(server_name),
         }
     }
 }
@@ -685,7 +1019,7 @@ impl McpServerManager {
                 );
                 managed_servers.insert(
                     server_name.clone(),
-                    ManagedMcpServer::new(bootstrap, server_config.required),
+                    ManagedMcpServer::new(server_name.clone(), bootstrap, server_config.required),
                 );
             } else {
                 let reason = match &server_config.config {
@@ -733,6 +1067,98 @@ impl McpServerManager {
     #[must_use]
     pub fn heartbeat_report(&self) -> Vec<McpServerHeartbeat> {
         self.heartbeat.values().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn server_catalogs(&self) -> Vec<McpServerCatalog> {
+        self.servers
+            .values()
+            .map(|server| server.catalog.clone())
+            .collect()
+    }
+
+    pub async fn discover_catalogs(
+        &mut self,
+    ) -> Result<Vec<McpServerCatalog>, McpServerManagerError> {
+        let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
+        let mut catalogs = Vec::new();
+
+        for server_name in server_names {
+            match self.discover_catalog_for_server(&server_name).await {
+                Ok(catalog) => {
+                    self.replace_routes_for_catalog(&catalog);
+                    catalogs.push(catalog);
+                }
+                Err(error) => {
+                    self.clear_routes_for_server(&server_name);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(catalogs)
+    }
+
+    pub async fn discover_catalogs_best_effort(&mut self) -> McpCapabilityDiscoveryReport {
+        let server_names = self.server_names();
+        let mut catalogs = Vec::new();
+        let mut tools = Vec::new();
+        let mut resources = Vec::new();
+        let mut resource_templates = Vec::new();
+        let mut prompts = Vec::new();
+        let mut working_servers = Vec::new();
+        let mut failed_servers = Vec::new();
+        let mut degraded_capabilities = Vec::new();
+
+        for server_name in server_names {
+            match self
+                .discover_catalog_for_server_best_effort(&server_name)
+                .await
+            {
+                Ok(outcome) => {
+                    let catalog = outcome.catalog;
+                    working_servers.push(server_name.clone());
+                    self.replace_routes_for_catalog(&catalog);
+                    tools.extend(catalog.tools.clone());
+                    resources.extend(catalog.resources.clone());
+                    resource_templates.extend(catalog.resource_templates.clone());
+                    prompts.extend(catalog.prompts.clone());
+                    degraded_capabilities.extend(outcome.degraded_capabilities);
+                    catalogs.push(catalog);
+                }
+                Err(error) => {
+                    self.clear_routes_for_server(&server_name);
+                    let required = self
+                        .servers
+                        .get(&server_name)
+                        .is_some_and(|server| server.required);
+                    failed_servers.push(error.discovery_failure(&server_name, required));
+                }
+            }
+        }
+
+        let degraded_startup = degraded_startup_report(
+            &working_servers,
+            &failed_servers,
+            &self.unsupported_servers,
+            tools
+                .iter()
+                .map(|tool| tool.qualified_name.clone())
+                .collect(),
+        );
+
+        McpCapabilityDiscoveryReport {
+            catalogs,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+            failed_servers,
+            degraded_capabilities,
+            unsupported_servers: self.unsupported_servers.clone(),
+            heartbeat: self.heartbeat_report(),
+            degraded_startup,
+        }
     }
 
     pub async fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
@@ -791,41 +1217,15 @@ impl McpServerManager {
             }
         }
 
-        let degraded_failed_servers = failed_servers
-            .iter()
-            .map(|failure| McpFailedServer {
-                server_name: failure.server_name.clone(),
-                phase: failure.phase,
-                error: McpErrorSurface::new(
-                    failure.phase,
-                    Some(failure.server_name.clone()),
-                    failure.error.clone(),
-                    {
-                        let mut context = failure.context.clone();
-                        context.insert("required".to_string(), failure.required.to_string());
-                        context
-                    },
-                    failure.recoverable,
-                ),
-            })
-            .chain(
-                self.unsupported_servers
-                    .iter()
-                    .map(unsupported_server_failed_server),
-            )
-            .collect::<Vec<_>>();
-        let degraded_startup = (!working_servers.is_empty() && !degraded_failed_servers.is_empty())
-            .then(|| {
-                McpDegradedReport::new(
-                    working_servers,
-                    degraded_failed_servers,
-                    discovered_tools
-                        .iter()
-                        .map(|tool| tool.qualified_name.clone())
-                        .collect(),
-                    Vec::new(),
-                )
-            });
+        let degraded_startup = degraded_startup_report(
+            &working_servers,
+            &failed_servers,
+            &self.unsupported_servers,
+            discovered_tools
+                .iter()
+                .map(|tool| tool.qualified_name.clone())
+                .collect(),
+        );
 
         McpToolDiscoveryReport {
             tools: discovered_tools,
@@ -876,6 +1276,7 @@ impl McpServerManager {
         }
 
         self.ensure_server_ready(&route.server_name).await?;
+        self.ensure_capability(&route.server_name, McpCapabilityKind::Tools)?;
         self.ping_if_configured(&route.server_name).await?;
         let request_id = self.take_request_id();
         let response =
@@ -908,6 +1309,14 @@ impl McpServerManager {
             if Self::should_reset_server(error) {
                 self.reset_server(&route.server_name).await?;
             }
+        } else if let Ok(response) = &response {
+            Self::validate_json_size(
+                &route.server_name,
+                "tools/call",
+                response,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "tools/call response JSON",
+            )?;
         }
 
         response
@@ -946,6 +1355,29 @@ impl McpServerManager {
         loop {
             match self.read_resource_once(server_name, uri).await {
                 Ok(resource) => return Ok(resource),
+                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
+                    self.reset_server(server_name).await?;
+                    attempts += 1;
+                }
+                Err(error) => {
+                    if Self::should_reset_server(&error) {
+                        self.reset_server(server_name).await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    pub async fn list_resource_templates(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpListResourceTemplatesResult, McpServerManagerError> {
+        let mut attempts = 0;
+
+        loop {
+            match self.list_resource_templates_once(server_name).await {
+                Ok(templates) => return Ok(templates),
                 Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
                     self.reset_server(server_name).await?;
                     attempts += 1;
@@ -1027,6 +1459,28 @@ impl McpServerManager {
     fn clear_routes_for_server(&mut self, server_name: &str) {
         self.tool_index
             .retain(|_, route| route.server_name != server_name);
+    }
+
+    fn replace_routes_for_catalog(&mut self, catalog: &McpServerCatalog) {
+        self.clear_routes_for_server(&catalog.server_name);
+        for tool in &catalog.tools {
+            self.tool_index.insert(
+                tool.qualified_name.clone(),
+                ToolRoute {
+                    server_name: tool.server_name.clone(),
+                    raw_name: tool.raw_name.clone(),
+                },
+            );
+        }
+    }
+
+    fn server_catalog(&self, server_name: &str) -> Result<McpServerCatalog, McpServerManagerError> {
+        self.servers
+            .get(server_name)
+            .map(|server| server.catalog.clone())
+            .ok_or_else(|| McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            })
     }
 
     fn server_mut(
@@ -1119,6 +1573,557 @@ impl McpServerManager {
         })
     }
 
+    fn ensure_capability(
+        &self,
+        server_name: &str,
+        capability: McpCapabilityKind,
+    ) -> Result<(), McpServerManagerError> {
+        let server =
+            self.servers
+                .get(server_name)
+                .ok_or_else(|| McpServerManagerError::UnknownServer {
+                    server_name: server_name.to_string(),
+                })?;
+        let capabilities = server.catalog.capabilities.as_ref().ok_or_else(|| {
+            McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: capability.method(),
+                details: "server capabilities unavailable before initialize".to_string(),
+            }
+        })?;
+        if capabilities.supports(capability) {
+            Ok(())
+        } else {
+            Err(McpServerManagerError::UnsupportedCapability {
+                server_name: server_name.to_string(),
+                capability,
+            })
+        }
+    }
+
+    fn update_tool_catalog(
+        &mut self,
+        server_name: &str,
+        tools: Vec<ManagedMcpTool>,
+    ) -> Result<(), McpServerManagerError> {
+        let server = self.server_mut(server_name)?;
+        server.catalog.tools = tools;
+        server.catalog.tools_complete = true;
+        Ok(())
+    }
+
+    fn update_initialize_catalog(
+        &mut self,
+        server_name: &str,
+        result: McpInitializeResult,
+    ) -> Result<(), McpServerManagerError> {
+        let server_info = result.server_info;
+        let capabilities = McpServerCapabilities::from_raw(result.capabilities);
+        let server = self.server_mut(server_name)?;
+        server.catalog.server_info = Some(server_info);
+        server.catalog.capabilities = Some(capabilities);
+        server.initialized = true;
+        Ok(())
+    }
+
+    fn legacy_sse_catalog_degradations(
+        &self,
+        catalog: &McpServerCatalog,
+    ) -> Vec<McpCapabilityDegradation> {
+        let Some(server) = self.servers.get(&catalog.server_name) else {
+            return Vec::new();
+        };
+        if !matches!(server.bootstrap.transport, McpClientTransport::Sse(_)) {
+            return Vec::new();
+        }
+
+        let required = server.required;
+        let Some(capabilities) = catalog.capabilities.as_ref() else {
+            return Vec::new();
+        };
+        let mut degradations = Vec::new();
+        if capabilities.resources {
+            degradations.push(Self::legacy_sse_capability_degradation(
+                &catalog.server_name,
+                required,
+                McpCapabilityKind::Resources,
+                "resources/list",
+            ));
+            degradations.push(Self::legacy_sse_capability_degradation(
+                &catalog.server_name,
+                required,
+                McpCapabilityKind::ResourceTemplates,
+                "resources/templates/list",
+            ));
+        }
+        if capabilities.prompts {
+            degradations.push(Self::legacy_sse_capability_degradation(
+                &catalog.server_name,
+                required,
+                McpCapabilityKind::Prompts,
+                "prompts/list",
+            ));
+        }
+        degradations
+    }
+
+    fn legacy_sse_capability_degradation(
+        server_name: &str,
+        required: bool,
+        capability: McpCapabilityKind,
+        method: &'static str,
+    ) -> McpCapabilityDegradation {
+        McpCapabilityDegradation {
+            server_name: server_name.to_string(),
+            phase: lifecycle_phase_for_method(method),
+            required,
+            capability,
+            method,
+            reason: format!(
+                "legacy SSE MCP transport does not support {method} in this runtime client"
+            ),
+            context: BTreeMap::from([
+                ("transport".to_string(), "sse".to_string()),
+                ("method".to_string(), method.to_string()),
+                ("capability".to_string(), capability.as_str().to_string()),
+                ("unsupported".to_string(), "true".to_string()),
+            ]),
+        }
+    }
+
+    fn required_for_server(&self, server_name: &str) -> bool {
+        self.servers
+            .get(server_name)
+            .is_some_and(|server| server.required)
+    }
+
+    fn capability_degradation_for_error(
+        &self,
+        server_name: &str,
+        capability: McpCapabilityKind,
+        method: &'static str,
+        error: &McpServerManagerError,
+    ) -> McpCapabilityDegradation {
+        let mut context = error.error_context();
+        context.insert("capability".to_string(), capability.as_str().to_string());
+        context.insert("method".to_string(), method.to_string());
+        McpCapabilityDegradation {
+            server_name: server_name.to_string(),
+            phase: lifecycle_phase_for_method(method),
+            required: self.required_for_server(server_name),
+            capability,
+            method,
+            reason: error.to_string(),
+            context,
+        }
+    }
+
+    fn clear_resource_catalog(
+        &mut self,
+        server_name: &str,
+        complete: bool,
+    ) -> Result<(), McpServerManagerError> {
+        let server = self.server_mut(server_name)?;
+        server.catalog.resources.clear();
+        server.catalog.resources_complete = complete;
+        Ok(())
+    }
+
+    fn clear_resource_template_catalog(
+        &mut self,
+        server_name: &str,
+        complete: bool,
+    ) -> Result<(), McpServerManagerError> {
+        let server = self.server_mut(server_name)?;
+        server.catalog.resource_templates.clear();
+        server.catalog.resource_templates_complete = complete;
+        Ok(())
+    }
+
+    fn clear_prompt_catalog(
+        &mut self,
+        server_name: &str,
+        complete: bool,
+    ) -> Result<(), McpServerManagerError> {
+        let server = self.server_mut(server_name)?;
+        server.catalog.prompts.clear();
+        server.catalog.prompts_complete = complete;
+        Ok(())
+    }
+
+    fn update_resource_catalog(
+        &mut self,
+        server_name: &str,
+        resources: Vec<McpResource>,
+    ) -> Result<(), McpServerManagerError> {
+        let managed = resources
+            .into_iter()
+            .map(|resource| ManagedMcpResource {
+                server_name: server_name.to_string(),
+                uri: resource.uri.clone(),
+                resource,
+            })
+            .collect();
+        let server = self.server_mut(server_name)?;
+        server.catalog.resources = managed;
+        server.catalog.resources_complete = true;
+        Ok(())
+    }
+
+    fn update_resource_template_catalog(
+        &mut self,
+        server_name: &str,
+        resource_templates: Vec<McpResourceTemplate>,
+    ) -> Result<(), McpServerManagerError> {
+        let managed = resource_templates
+            .into_iter()
+            .map(|resource_template| ManagedMcpResourceTemplate {
+                server_name: server_name.to_string(),
+                uri_template: resource_template.uri_template.clone(),
+                resource_template,
+            })
+            .collect();
+        let server = self.server_mut(server_name)?;
+        server.catalog.resource_templates = managed;
+        server.catalog.resource_templates_complete = true;
+        Ok(())
+    }
+
+    fn update_prompt_catalog(
+        &mut self,
+        server_name: &str,
+        prompts: Vec<McpPrompt>,
+    ) -> Result<(), McpServerManagerError> {
+        let managed = prompts
+            .into_iter()
+            .map(|prompt| ManagedMcpPrompt {
+                server_name: server_name.to_string(),
+                name: prompt.name.clone(),
+                prompt,
+            })
+            .collect();
+        let server = self.server_mut(server_name)?;
+        server.catalog.prompts = managed;
+        server.catalog.prompts_complete = true;
+        Ok(())
+    }
+
+    async fn ensure_prompt_catalog(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        let complete = self
+            .servers
+            .get(server_name)
+            .ok_or_else(|| McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            })?
+            .catalog
+            .prompts_complete;
+        if !complete {
+            let _ = self.list_prompts(server_name).await?;
+        }
+        Ok(())
+    }
+
+    fn ensure_prompt_known(
+        &self,
+        server_name: &str,
+        name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        let server =
+            self.servers
+                .get(server_name)
+                .ok_or_else(|| McpServerManagerError::UnknownServer {
+                    server_name: server_name.to_string(),
+                })?;
+        if server
+            .catalog
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == name)
+        {
+            Ok(())
+        } else {
+            Err(McpServerManagerError::UnknownPrompt {
+                server_name: server_name.to_string(),
+                name: name.to_string(),
+            })
+        }
+    }
+
+    fn validate_json_size<T: Serialize>(
+        server_name: &str,
+        method: &'static str,
+        value: &T,
+        limit: usize,
+        details: impl Into<String>,
+    ) -> Result<(), McpServerManagerError> {
+        let bytes = Self::json_size(server_name, method, value)?;
+        if bytes.len() > limit {
+            Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit,
+                details: format!("{} ({} bytes)", details.into(), bytes.len()),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn json_size<T: Serialize>(
+        server_name: &str,
+        method: &'static str,
+        value: &T,
+    ) -> Result<Vec<u8>, McpServerManagerError> {
+        serde_json::to_vec(value).map_err(|error| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!("failed to measure JSON payload: {error}"),
+        })
+    }
+
+    fn validate_aggregate_json_size(
+        server_name: &str,
+        method: &'static str,
+        total_bytes: usize,
+    ) -> Result<(), McpServerManagerError> {
+        if total_bytes > MCP_MAX_RESULT_JSON_BYTES {
+            Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_RESULT_JSON_BYTES,
+                details: format!("paginated aggregate reached {total_bytes} bytes"),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn duplicate_catalog_item(
+        server_name: &str,
+        method: &'static str,
+        field: &str,
+        value: &str,
+    ) -> McpServerManagerError {
+        McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!("duplicate {field} `{value}` in catalog"),
+        }
+    }
+
+    fn validate_next_cursor(
+        server_name: &str,
+        method: &'static str,
+        next_cursor: String,
+        seen_cursors: &mut BTreeSet<String>,
+    ) -> Result<String, McpServerManagerError> {
+        if next_cursor.is_empty() {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_CURSOR_BYTES,
+                details: "server returned an empty pagination cursor".to_string(),
+            });
+        }
+        if next_cursor.len() > MCP_MAX_CURSOR_BYTES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_CURSOR_BYTES,
+                details: format!("pagination cursor was {} bytes", next_cursor.len()),
+            });
+        }
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_PAGINATION_PAGES,
+                details: "server repeated a pagination cursor".to_string(),
+            });
+        }
+        Ok(next_cursor)
+    }
+
+    fn validate_page_limit(
+        server_name: &str,
+        method: &'static str,
+        page_count: usize,
+    ) -> Result<(), McpServerManagerError> {
+        if page_count >= MCP_MAX_PAGINATION_PAGES {
+            Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_PAGINATION_PAGES,
+                details: "pagination page limit reached".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_total_items(
+        server_name: &str,
+        method: &'static str,
+        total: usize,
+    ) -> Result<(), McpServerManagerError> {
+        if total > MCP_MAX_PAGINATION_ITEMS {
+            Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_MAX_PAGINATION_ITEMS,
+                details: format!("server returned {total} catalog items"),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_method_not_found(error: &McpServerManagerError, method: &'static str) -> bool {
+        matches!(
+            error,
+            McpServerManagerError::JsonRpc {
+                method: error_method,
+                error,
+                ..
+            } if *error_method == method && error.code == -32601
+        )
+    }
+
+    async fn discover_catalog_for_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpServerCatalog, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let _ = self
+                .discover_sse_tools_for_server_once(server_name, transport)
+                .await?;
+            return self.server_catalog(server_name);
+        }
+
+        self.ensure_server_ready(server_name).await?;
+        let capabilities = self
+            .server_catalog(server_name)?
+            .capabilities
+            .clone()
+            .unwrap_or_default();
+
+        if capabilities.tools {
+            let _ = self.discover_tools_for_server_once(server_name).await?;
+        } else {
+            self.clear_routes_for_server(server_name);
+        }
+
+        if capabilities.resources {
+            let _ = self.list_resources(server_name).await?;
+            match self.list_resource_templates(server_name).await {
+                Ok(_) => {}
+                Err(error) if Self::is_method_not_found(&error, "resources/templates/list") => {
+                    let server = self.server_mut(server_name)?;
+                    server.catalog.resource_templates.clear();
+                    server.catalog.resource_templates_complete = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if capabilities.prompts {
+            let _ = self.list_prompts(server_name).await?;
+        }
+
+        self.server_catalog(server_name)
+    }
+
+    async fn discover_catalog_for_server_best_effort(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpCatalogDiscoveryOutcome, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let _ = self
+                .discover_sse_tools_for_server_once(server_name, transport)
+                .await?;
+            let catalog = self.server_catalog(server_name)?;
+            let degraded_capabilities = self.legacy_sse_catalog_degradations(&catalog);
+            return Ok(McpCatalogDiscoveryOutcome {
+                catalog,
+                degraded_capabilities,
+            });
+        }
+
+        self.ensure_server_ready(server_name).await?;
+        let capabilities = self
+            .server_catalog(server_name)?
+            .capabilities
+            .clone()
+            .unwrap_or_default();
+
+        if capabilities.tools {
+            let _ = self.discover_tools_for_server_once(server_name).await?;
+        } else {
+            self.clear_routes_for_server(server_name);
+            self.update_tool_catalog(server_name, Vec::new())?;
+        }
+
+        let mut degraded_capabilities = Vec::new();
+
+        if capabilities.resources {
+            match self.list_resources(server_name).await {
+                Ok(_) => match self.list_resource_templates(server_name).await {
+                    Ok(_) => {}
+                    Err(error) if Self::is_method_not_found(&error, "resources/templates/list") => {
+                        self.clear_resource_template_catalog(server_name, true)?;
+                    }
+                    Err(error) => {
+                        self.clear_resource_template_catalog(server_name, false)?;
+                        degraded_capabilities.push(self.capability_degradation_for_error(
+                            server_name,
+                            McpCapabilityKind::ResourceTemplates,
+                            "resources/templates/list",
+                            &error,
+                        ));
+                    }
+                },
+                Err(error) => {
+                    self.clear_resource_catalog(server_name, false)?;
+                    self.clear_resource_template_catalog(server_name, false)?;
+                    degraded_capabilities.push(self.capability_degradation_for_error(
+                        server_name,
+                        McpCapabilityKind::Resources,
+                        "resources/list",
+                        &error,
+                    ));
+                }
+            }
+        } else {
+            self.clear_resource_catalog(server_name, true)?;
+            self.clear_resource_template_catalog(server_name, true)?;
+        }
+
+        if capabilities.prompts {
+            match self.list_prompts(server_name).await {
+                Ok(_) => {}
+                Err(error) => {
+                    self.clear_prompt_catalog(server_name, false)?;
+                    degraded_capabilities.push(self.capability_degradation_for_error(
+                        server_name,
+                        McpCapabilityKind::Prompts,
+                        "prompts/list",
+                        &error,
+                    ));
+                }
+            }
+        } else {
+            self.clear_prompt_catalog(server_name, true)?;
+        }
+
+        Ok(McpCatalogDiscoveryOutcome {
+            catalog: self.server_catalog(server_name)?,
+            degraded_capabilities,
+        })
+    }
+
     async fn discover_tools_for_server(
         &mut self,
         server_name: &str,
@@ -1149,27 +2154,24 @@ impl McpServerManager {
         server_name: &str,
     ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
         if let Some(transport) = self.sse_transport(server_name)? {
-            let request_id = self.take_request_id_block(3);
-            let server_name_owned = server_name.to_string();
-            let tools = tokio::task::spawn_blocking(move || {
-                discover_sse_tools(&server_name_owned, &transport, request_id)
-            })
-            .await
-            .map_err(|error| McpServerManagerError::InvalidResponse {
-                server_name: server_name.to_string(),
-                method: "sse",
-                details: format!("SSE worker task failed: {error}"),
-            })?;
-            self.record_heartbeat_result(server_name, &tools);
-            return tools;
+            return self
+                .discover_sse_tools_for_server_once(server_name, transport)
+                .await;
         }
 
         self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::Tools)?;
         self.ping_if_configured(server_name).await?;
 
         let mut discovered_tools = Vec::new();
         let mut cursor = None;
+        let mut page_count = 0;
+        let mut total_json_bytes = 0_usize;
+        let mut seen_cursors = BTreeSet::new();
+        let mut seen_names = BTreeSet::new();
         loop {
+            Self::validate_page_limit(server_name, "tools/list", page_count)?;
+            page_count += 1;
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
@@ -1210,6 +2212,35 @@ impl McpServerManager {
                     details: "missing result payload".to_string(),
                 })?;
 
+            let page_json = Self::json_size(server_name, "tools/list", &result)?;
+            Self::validate_json_size(
+                server_name,
+                "tools/list",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "tools/list page JSON",
+            )?;
+            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+            Self::validate_aggregate_json_size(server_name, "tools/list", total_json_bytes)?;
+
+            for tool in &result.tools {
+                Self::validate_json_size(
+                    server_name,
+                    "tools/list",
+                    tool,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "tool catalog item JSON",
+                )?;
+                if !seen_names.insert(tool.name.clone()) {
+                    return Err(Self::duplicate_catalog_item(
+                        server_name,
+                        "tools/list",
+                        "tool name",
+                        &tool.name,
+                    ));
+                }
+            }
+
             for tool in result.tools {
                 let qualified_name = mcp_tool_name(server_name, &tool.name);
                 discovered_tools.push(ManagedMcpTool {
@@ -1219,14 +2250,53 @@ impl McpServerManager {
                     tool,
                 });
             }
+            Self::validate_total_items(server_name, "tools/list", discovered_tools.len())?;
 
             match result.next_cursor {
-                Some(next_cursor) => cursor = Some(next_cursor),
+                Some(next_cursor) => {
+                    cursor = Some(Self::validate_next_cursor(
+                        server_name,
+                        "tools/list",
+                        next_cursor,
+                        &mut seen_cursors,
+                    )?);
+                }
                 None => break,
             }
         }
 
+        Self::validate_json_size(
+            server_name,
+            "tools/list",
+            &discovered_tools,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "tools/list aggregate JSON",
+        )?;
+        self.update_tool_catalog(server_name, discovered_tools.clone())?;
         Ok(discovered_tools)
+    }
+
+    async fn discover_sse_tools_for_server_once(
+        &mut self,
+        server_name: &str,
+        transport: McpRemoteTransport,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        let request_id = self.take_request_id_block((MCP_MAX_PAGINATION_PAGES + 2) as u64);
+        let server_name_owned = server_name.to_string();
+        let discovery = tokio::task::spawn_blocking(move || {
+            discover_sse_tools(&server_name_owned, &transport, request_id)
+        })
+        .await
+        .map_err(|error| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse",
+            details: format!("SSE worker task failed: {error}"),
+        })?;
+        self.record_heartbeat_result(server_name, &discovery);
+        let discovery = discovery?;
+        self.update_initialize_catalog(server_name, discovery.initialize_result)?;
+        self.update_tool_catalog(server_name, discovery.tools.clone())?;
+        Ok(discovery.tools)
     }
 
     async fn list_resources_once(
@@ -1234,10 +2304,17 @@ impl McpServerManager {
         server_name: &str,
     ) -> Result<McpListResourcesResult, McpServerManagerError> {
         self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
 
         let mut resources = Vec::new();
         let mut cursor = None;
+        let mut page_count = 0;
+        let mut total_json_bytes = 0_usize;
+        let mut seen_cursors = BTreeSet::new();
+        let mut seen_uris = BTreeSet::new();
         loop {
+            Self::validate_page_limit(server_name, "resources/list", page_count)?;
+            page_count += 1;
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
@@ -1278,18 +2355,188 @@ impl McpServerManager {
                     details: "missing result payload".to_string(),
                 })?;
 
+            let page_json = Self::json_size(server_name, "resources/list", &result)?;
+            Self::validate_json_size(
+                server_name,
+                "resources/list",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "resources/list page JSON",
+            )?;
+            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+            Self::validate_aggregate_json_size(server_name, "resources/list", total_json_bytes)?;
+
+            for resource in &result.resources {
+                Self::validate_json_size(
+                    server_name,
+                    "resources/list",
+                    resource,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "resource catalog item JSON",
+                )?;
+                if !seen_uris.insert(resource.uri.clone()) {
+                    return Err(Self::duplicate_catalog_item(
+                        server_name,
+                        "resources/list",
+                        "resource uri",
+                        &resource.uri,
+                    ));
+                }
+            }
+
             resources.extend(result.resources);
+            Self::validate_total_items(server_name, "resources/list", resources.len())?;
 
             match result.next_cursor {
-                Some(next_cursor) => cursor = Some(next_cursor),
+                Some(next_cursor) => {
+                    cursor = Some(Self::validate_next_cursor(
+                        server_name,
+                        "resources/list",
+                        next_cursor,
+                        &mut seen_cursors,
+                    )?);
+                }
                 None => break,
             }
         }
 
-        Ok(McpListResourcesResult {
+        let result = McpListResourcesResult {
             resources,
             next_cursor: None,
-        })
+        };
+        Self::validate_json_size(
+            server_name,
+            "resources/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "resources/list aggregate JSON",
+        )?;
+        self.update_resource_catalog(server_name, result.resources.clone())?;
+        Ok(result)
+    }
+
+    async fn list_resource_templates_once(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpListResourceTemplatesResult, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::ResourceTemplates)?;
+
+        let mut resource_templates = Vec::new();
+        let mut cursor = None;
+        let mut page_count = 0;
+        let mut total_json_bytes = 0_usize;
+        let mut seen_cursors = BTreeSet::new();
+        let mut seen_templates = BTreeSet::new();
+        loop {
+            Self::validate_page_limit(server_name, "resources/templates/list", page_count)?;
+            page_count += 1;
+            let request_id = self.take_request_id();
+            let response = {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/templates/list",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                Self::run_process_request(
+                    server_name,
+                    "resources/templates/list",
+                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    process.list_resource_templates(
+                        request_id,
+                        Some(McpListResourceTemplatesParams {
+                            cursor: cursor.clone(),
+                        }),
+                    ),
+                )
+                .await?
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "resources/templates/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/templates/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            let page_json = Self::json_size(server_name, "resources/templates/list", &result)?;
+            Self::validate_json_size(
+                server_name,
+                "resources/templates/list",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "resources/templates/list page JSON",
+            )?;
+            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+            Self::validate_aggregate_json_size(
+                server_name,
+                "resources/templates/list",
+                total_json_bytes,
+            )?;
+
+            for template in &result.resource_templates {
+                Self::validate_json_size(
+                    server_name,
+                    "resources/templates/list",
+                    template,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "resource template catalog item JSON",
+                )?;
+                if !seen_templates.insert(template.uri_template.clone()) {
+                    return Err(Self::duplicate_catalog_item(
+                        server_name,
+                        "resources/templates/list",
+                        "resource template uriTemplate",
+                        &template.uri_template,
+                    ));
+                }
+            }
+
+            resource_templates.extend(result.resource_templates);
+            Self::validate_total_items(
+                server_name,
+                "resources/templates/list",
+                resource_templates.len(),
+            )?;
+
+            match result.next_cursor {
+                Some(next_cursor) => {
+                    cursor = Some(Self::validate_next_cursor(
+                        server_name,
+                        "resources/templates/list",
+                        next_cursor,
+                        &mut seen_cursors,
+                    )?);
+                }
+                None => break,
+            }
+        }
+
+        let result = McpListResourceTemplatesResult {
+            resource_templates,
+            next_cursor: None,
+        };
+        Self::validate_json_size(
+            server_name,
+            "resources/templates/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "resources/templates/list aggregate JSON",
+        )?;
+        self.update_resource_template_catalog(server_name, result.resource_templates.clone())?;
+        Ok(result)
     }
 
     async fn read_resource_once(
@@ -1298,6 +2545,7 @@ impl McpServerManager {
         uri: &str,
     ) -> Result<McpReadResourceResult, McpServerManagerError> {
         self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
 
         let request_id = self.take_request_id();
         let response =
@@ -1332,13 +2580,41 @@ impl McpServerManager {
             });
         }
 
-        response
+        let result = response
             .result
             .ok_or_else(|| McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "resources/read",
                 details: "missing result payload".to_string(),
-            })
+            })?;
+        if result.contents.len() > MCP_MAX_RESOURCE_CONTENTS {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                limit: MCP_MAX_RESOURCE_CONTENTS,
+                details: format!(
+                    "server returned {} resource contents",
+                    result.contents.len()
+                ),
+            });
+        }
+        Self::validate_json_size(
+            server_name,
+            "resources/read",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "resources/read result JSON",
+        )?;
+        for content in &result.contents {
+            Self::validate_json_size(
+                server_name,
+                "resources/read",
+                content,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "resource content JSON",
+            )?;
+        }
+        Ok(result)
     }
 
     async fn list_prompts_once(
@@ -1346,10 +2622,17 @@ impl McpServerManager {
         server_name: &str,
     ) -> Result<McpListPromptsResult, McpServerManagerError> {
         self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
 
         let mut prompts = Vec::new();
         let mut cursor = None;
+        let mut page_count = 0;
+        let mut total_json_bytes = 0_usize;
+        let mut seen_cursors = BTreeSet::new();
+        let mut seen_names = BTreeSet::new();
         loop {
+            Self::validate_page_limit(server_name, "prompts/list", page_count)?;
+            page_count += 1;
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
@@ -1390,18 +2673,64 @@ impl McpServerManager {
                     details: "missing result payload".to_string(),
                 })?;
 
+            let page_json = Self::json_size(server_name, "prompts/list", &result)?;
+            Self::validate_json_size(
+                server_name,
+                "prompts/list",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "prompts/list page JSON",
+            )?;
+            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+            Self::validate_aggregate_json_size(server_name, "prompts/list", total_json_bytes)?;
+
+            for prompt in &result.prompts {
+                Self::validate_json_size(
+                    server_name,
+                    "prompts/list",
+                    prompt,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "prompt catalog item JSON",
+                )?;
+                if !seen_names.insert(prompt.name.clone()) {
+                    return Err(Self::duplicate_catalog_item(
+                        server_name,
+                        "prompts/list",
+                        "prompt name",
+                        &prompt.name,
+                    ));
+                }
+            }
+
             prompts.extend(result.prompts);
+            Self::validate_total_items(server_name, "prompts/list", prompts.len())?;
 
             match result.next_cursor {
-                Some(next_cursor) => cursor = Some(next_cursor),
+                Some(next_cursor) => {
+                    cursor = Some(Self::validate_next_cursor(
+                        server_name,
+                        "prompts/list",
+                        next_cursor,
+                        &mut seen_cursors,
+                    )?);
+                }
                 None => break,
             }
         }
 
-        Ok(McpListPromptsResult {
+        let result = McpListPromptsResult {
             prompts,
             next_cursor: None,
-        })
+        };
+        Self::validate_json_size(
+            server_name,
+            "prompts/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "prompts/list aggregate JSON",
+        )?;
+        self.update_prompt_catalog(server_name, result.prompts.clone())?;
+        Ok(result)
     }
 
     async fn get_prompt_once(
@@ -1411,6 +2740,9 @@ impl McpServerManager {
         arguments: Option<JsonValue>,
     ) -> Result<McpGetPromptResult, McpServerManagerError> {
         self.ensure_server_ready(server_name).await?;
+        self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
+        self.ensure_prompt_catalog(server_name).await?;
+        self.ensure_prompt_known(server_name, name)?;
 
         let request_id = self.take_request_id();
         let timeout_ms = self.tool_call_timeout_ms(server_name)?;
@@ -1447,13 +2779,38 @@ impl McpServerManager {
             });
         }
 
-        response
+        let result = response
             .result
             .ok_or_else(|| McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "prompts/get",
                 details: "missing result payload".to_string(),
-            })
+            })?;
+        if result.messages.len() > MCP_MAX_PROMPT_MESSAGES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method: "prompts/get",
+                limit: MCP_MAX_PROMPT_MESSAGES,
+                details: format!("server returned {} prompt messages", result.messages.len()),
+            });
+        }
+        Self::validate_json_size(
+            server_name,
+            "prompts/get",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "prompts/get result JSON",
+        )?;
+        for message in &result.messages {
+            Self::validate_json_size(
+                server_name,
+                "prompts/get",
+                message,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "prompt message JSON",
+            )?;
+        }
+        Ok(result)
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
@@ -1693,6 +3050,9 @@ impl McpServerManager {
                 return Err(error);
             }
 
+            let server_info = result.server_info.clone();
+            let capabilities = McpServerCapabilities::from_raw(result.capabilities.clone());
+
             {
                 let server = self.server_mut(server_name)?;
                 let process = server.process.as_mut().ok_or_else(|| {
@@ -1715,7 +3075,12 @@ impl McpServerManager {
                 .await?;
             }
 
-            self.server_mut(server_name)?.initialized = true;
+            {
+                let server = self.server_mut(server_name)?;
+                server.catalog.server_info = Some(server_info);
+                server.catalog.capabilities = Some(capabilities);
+                server.initialized = true;
+            }
             return Ok(());
         }
     }
@@ -1927,7 +3292,7 @@ fn discover_sse_tools(
     server_name: &str,
     transport: &McpRemoteTransport,
     request_id: u64,
-) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+) -> Result<McpSseToolDiscovery, McpServerManagerError> {
     let timeout_ms = transport
         .tool_call_timeout_ms
         .or(transport.heartbeat_timeout_ms)
@@ -1939,12 +3304,21 @@ fn discover_sse_tools(
             source,
         }
     })?;
-    initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
+    let initialize_result =
+        initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
     session.notify(
         "notifications/initialized",
         Some(JsonValue::Object(serde_json::Map::new())),
         timeout_ms,
     )?;
+    let capabilities = McpServerCapabilities::from_raw(initialize_result.capabilities.clone());
+    if !capabilities.tools {
+        return Ok(McpSseToolDiscovery {
+            initialize_result,
+            tools: Vec::new(),
+        });
+    }
+
     let heartbeat_timeout_ms = transport.heartbeat_timeout_ms.unwrap_or(timeout_ms);
     let _ping = session.request::<_, JsonValue>(
         JsonRpcId::Number(request_id + 1),
@@ -1952,36 +3326,108 @@ fn discover_sse_tools(
         Some(JsonValue::Object(serde_json::Map::new())),
         heartbeat_timeout_ms,
     )?;
-    let list = session.request::<_, McpListToolsResult>(
-        JsonRpcId::Number(request_id + 2),
-        "tools/list",
-        Some(McpListToolsParams { cursor: None }),
-        timeout_ms,
-    )?;
-    if let Some(error) = list.error {
-        return Err(McpServerManagerError::JsonRpc {
-            server_name: server_name.to_string(),
-            method: "tools/list",
-            error,
-        });
+
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut page_count = 0;
+    let mut total_json_bytes = 0_usize;
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    loop {
+        McpServerManager::validate_page_limit(server_name, "tools/list", page_count)?;
+        let page_request_id = request_id + 2 + page_count as u64;
+        page_count += 1;
+
+        let list = session.request::<_, McpListToolsResult>(
+            JsonRpcId::Number(page_request_id),
+            "tools/list",
+            Some(McpListToolsParams {
+                cursor: cursor.clone(),
+            }),
+            timeout_ms,
+        )?;
+        if let Some(error) = list.error {
+            return Err(McpServerManagerError::JsonRpc {
+                server_name: server_name.to_string(),
+                method: "tools/list",
+                error,
+            });
+        }
+        let result = list
+            .result
+            .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "tools/list",
+                details: "missing result payload".to_string(),
+            })?;
+
+        let page_json = McpServerManager::json_size(server_name, "tools/list", &result)?;
+        McpServerManager::validate_json_size(
+            server_name,
+            "tools/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "tools/list page JSON",
+        )?;
+        total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+        McpServerManager::validate_aggregate_json_size(
+            server_name,
+            "tools/list",
+            total_json_bytes,
+        )?;
+
+        for tool in &result.tools {
+            McpServerManager::validate_json_size(
+                server_name,
+                "tools/list",
+                tool,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "tool catalog item JSON",
+            )?;
+            if !seen_names.insert(tool.name.clone()) {
+                return Err(McpServerManager::duplicate_catalog_item(
+                    server_name,
+                    "tools/list",
+                    "tool name",
+                    &tool.name,
+                ));
+            }
+        }
+
+        for tool in result.tools {
+            tools.push(ManagedMcpTool {
+                server_name: server_name.to_string(),
+                qualified_name: mcp_tool_name(server_name, &tool.name),
+                raw_name: tool.name.clone(),
+                tool,
+            });
+        }
+        McpServerManager::validate_total_items(server_name, "tools/list", tools.len())?;
+
+        match result.next_cursor {
+            Some(next_cursor) => {
+                cursor = Some(McpServerManager::validate_next_cursor(
+                    server_name,
+                    "tools/list",
+                    next_cursor,
+                    &mut seen_cursors,
+                )?);
+            }
+            None => break,
+        }
     }
-    let result = list
-        .result
-        .ok_or_else(|| McpServerManagerError::InvalidResponse {
-            server_name: server_name.to_string(),
-            method: "tools/list",
-            details: "missing result payload".to_string(),
-        })?;
-    Ok(result
-        .tools
-        .into_iter()
-        .map(|tool| ManagedMcpTool {
-            server_name: server_name.to_string(),
-            qualified_name: mcp_tool_name(server_name, &tool.name),
-            raw_name: tool.name.clone(),
-            tool,
-        })
-        .collect())
+
+    McpServerManager::validate_json_size(
+        server_name,
+        "tools/list",
+        &tools,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "tools/list aggregate JSON",
+    )?;
+    Ok(McpSseToolDiscovery {
+        initialize_result,
+        tools,
+    })
 }
 
 fn call_sse_tool(
@@ -1999,7 +3445,8 @@ fn call_sse_tool(
             source,
         }
     })?;
-    initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
+    let _initialize_result =
+        initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
     session.notify(
         "notifications/initialized",
         Some(JsonValue::Object(serde_json::Map::new())),
@@ -2030,7 +3477,7 @@ fn initialize_sse_session(
     session: &mut McpSseSession,
     request_id: u64,
     timeout_ms: u64,
-) -> Result<(), McpServerManagerError> {
+) -> Result<McpInitializeResult, McpServerManagerError> {
     let requested_protocol_version = transport
         .protocol_version
         .clone()
@@ -2074,7 +3521,7 @@ fn initialize_sse_session(
             ),
         });
     }
-    Ok(())
+    Ok(result)
 }
 
 fn parse_http_url(url: &str) -> io::Result<ParsedHttpUrl> {
@@ -2114,6 +3561,11 @@ fn format_http_headers(headers: &BTreeMap<String, String>) -> String {
         .iter()
         .map(|(key, value)| format!("{key}: {value}\r\n"))
         .collect::<String>()
+}
+
+struct McpSseToolDiscovery {
+    initialize_result: McpInitializeResult,
+    tools: Vec<ManagedMcpTool>,
 }
 
 #[derive(Debug)]
@@ -2183,48 +3635,51 @@ impl McpStdioProcess {
     }
 
     pub async fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
-        let encoded = encode_frame(payload);
-        self.write_all(&encoded).await?;
+        if payload.len() > MCP_MAX_JSONRPC_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP stdio JSON-RPC line exceeded {} byte limit: {}",
+                    MCP_MAX_JSONRPC_FRAME_BYTES,
+                    payload.len()
+                ),
+            ));
+        }
+        if payload.contains(&b'\n') || payload.contains(&b'\r') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP stdio JSON-RPC messages must be single-line JSON",
+            ));
+        }
+        self.write_all(payload).await?;
+        self.write_all(b"\n").await?;
         self.flush().await
     }
 
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                return Err(io::Error::new(
+        read_limited_jsonrpc_line(&mut self.stdout)
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "MCP stdio stream closed while reading headers",
-                ));
-            }
-            if line == "\r\n" {
-                break;
-            }
-            let header = line.trim_end_matches(['\r', '\n']);
-            if let Some((name, value)) = header.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    let parsed = value
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    content_length = Some(parsed);
-                }
-            }
-        }
-
-        let content_length = content_length.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-        })?;
-        let mut payload = vec![0_u8; content_length];
-        self.stdout.read_exact(&mut payload).await?;
-        Ok(payload)
+                    "MCP stdio stream closed while reading JSON-RPC line",
+                )
+            })
     }
 
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if body.len() > MCP_MAX_JSONRPC_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP stdio JSON-RPC request exceeded {} byte limit: {}",
+                    MCP_MAX_JSONRPC_FRAME_BYTES,
+                    body.len()
+                ),
+            ));
+        }
         self.write_frame(&body).await
     }
 
@@ -2318,6 +3773,14 @@ impl McpStdioProcess {
         params: Option<McpListResourcesParams>,
     ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
         self.request(id, "resources/list", params).await
+    }
+
+    pub async fn list_resource_templates(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourceTemplatesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourceTemplatesResult>> {
+        self.request(id, "resources/templates/list", params).await
     }
 
     pub async fn read_resource(
@@ -2437,11 +3900,68 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
-fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    let mut framed = header.into_bytes();
-    framed.extend_from_slice(payload);
-    framed
+async fn read_limited_jsonrpc_line<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut payload = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if payload.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed before JSON-RPC newline",
+            ));
+        }
+
+        if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
+            if payload.len().saturating_add(newline_index) > MCP_MAX_JSONRPC_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "MCP stdio JSON-RPC line exceeded {} byte limit",
+                        MCP_MAX_JSONRPC_FRAME_BYTES
+                    ),
+                ));
+            }
+            payload.extend_from_slice(&available[..newline_index]);
+            reader.consume(newline_index + 1);
+            if payload.last() == Some(&b'\r') {
+                payload.pop();
+            }
+            if payload.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP stdio JSON-RPC line must not be empty",
+                ));
+            }
+            if payload.contains(&b'\r') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP stdio JSON-RPC line must not contain carriage returns",
+                ));
+            }
+            std::str::from_utf8(&payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            return Ok(Some(payload));
+        }
+
+        if payload.len().saturating_add(available.len()) > MCP_MAX_JSONRPC_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP stdio JSON-RPC line exceeded {} byte limit",
+                    MCP_MAX_JSONRPC_FRAME_BYTES
+                ),
+            ));
+        }
+        let available_len = available.len();
+        payload.extend_from_slice(available);
+        reader.consume(available_len);
+    }
 }
 
 fn default_initialize_params() -> McpInitializeParams {
@@ -2485,15 +4005,17 @@ mod tests {
     use std::fs;
     use std::io::ErrorKind;
     use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use tokio::io::BufReader;
     use tokio::runtime::Builder;
 
     use crate::config::{
@@ -2504,13 +4026,14 @@ mod tests {
     use crate::mcp_client::McpClientBootstrap;
 
     use super::{
-        spawn_mcp_stdio_process, unsupported_server_failed_server, JsonRpcId, JsonRpcRequest,
-        JsonRpcResponse, McpGetPromptParams, McpHeartbeatStatus, McpInitializeClientInfo,
-        McpInitializeParams, McpInitializeResult, McpInitializeServerInfo, McpListToolsResult,
-        McpReadResourceParams, McpReadResourceResult, McpServerManager, McpServerManagerError,
-        McpStdioProcess, McpTool, McpToolCallParams,
+        read_limited_jsonrpc_line, spawn_mcp_stdio_process, unsupported_server_failed_server,
+        JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpGetPromptParams, McpHeartbeatStatus,
+        McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
+        McpListPromptsParams, McpListResourceTemplatesParams, McpListResourcesParams,
+        McpListToolsParams, McpReadResourceParams, McpReadResourceResult, McpServerManager,
+        McpServerManagerError, McpStdioProcess, McpToolCallParams, MCP_MAX_JSONRPC_FRAME_BYTES,
     };
-    use crate::McpLifecyclePhase;
+    use crate::{McpCapabilityKind, McpLifecyclePhase};
 
     fn temp_dir() -> PathBuf {
         static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -2542,24 +4065,15 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import json, os, sys",
-            "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
+            "RESPONSE_NEWLINE = b'\\r\\n' if os.environ.get('MCP_RESPONSE_CRLF') == '1' else b'\\n'",
+            "line = sys.stdin.buffer.readline()",
+            "if not line:",
             "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "request = json.loads(line.decode())",
             r"assert request['jsonrpc'] == '2.0'",
             r"assert request['method'] == 'initialize'",
             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
-            "header_name = 'content-length' if LOWERCASE_CONTENT_LENGTH else 'Content-Length'",
             r"response = json.dumps({",
             r"    'jsonrpc': '2.0',",
             r"    'id': response_id,",
@@ -2569,7 +4083,7 @@ mod tests {
             r"        'serverInfo': {'name': 'fake-mcp', 'version': '0.1.0'}",
             r"    }",
             r"}).encode()",
-            r"sys.stdout.buffer.write(f'{header_name}: {len(response)}\r\n\r\n'.encode() + response)",
+            "sys.stdout.buffer.write(response + RESPONSE_NEWLINE)",
             "sys.stdout.buffer.flush()",
             "",
         ]
@@ -2589,24 +4103,36 @@ mod tests {
             "import json, os, sys, time",
             "TOOL_CALL_DELAY_MS = int(os.environ.get('MCP_TOOL_CALL_DELAY_MS', '0'))",
             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
+            "OMIT_RESULT_METHOD = os.environ.get('MCP_OMIT_RESULT_METHOD')",
+            "PAGINATION_LOOP_METHOD = os.environ.get('MCP_PAGINATION_LOOP_METHOD')",
+            "EMPTY_CURSOR_METHOD = os.environ.get('MCP_EMPTY_CURSOR_METHOD')",
+            "DUPLICATE_LIST_METHOD = os.environ.get('MCP_DUPLICATE_LIST_METHOD')",
+            "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "CAPABILITIES = {'tools': {}, 'resources': {}, 'prompts': {}}",
+            "if os.environ.get('MCP_DISABLE_TOOLS') == '1':",
+            "    CAPABILITIES.pop('tools', None)",
+            "if os.environ.get('MCP_DISABLE_RESOURCES') == '1':",
+            "    CAPABILITIES.pop('resources', None)",
+            "if os.environ.get('MCP_DISABLE_PROMPTS') == '1':",
+            "    CAPABILITIES.pop('prompts', None)",
+            "capability_overrides = os.environ.get('MCP_CAPABILITY_OVERRIDES')",
+            "if capability_overrides:",
+            "    CAPABILITIES.update(json.loads(capability_overrides))",
+            "",
+            "def log(method):",
+            "    if LOG_PATH:",
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as handle:",
+            "            handle.write(f'{method}\\n')",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(payload + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -2614,7 +4140,11 @@ mod tests {
             "    if request is None:",
             "        break",
             "    method = request['method']",
+            "    log(method)",
             "    if 'id' not in request:",
+            "        continue",
+            "    if method == OMIT_RESULT_METHOD:",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id']})",
             "        continue",
             "    if method == 'initialize':",
             "        send_message({",
@@ -2622,31 +4152,43 @@ mod tests {
             "            'id': request['id'],",
             "            'result': {",
             "                'protocolVersion': request['params']['protocolVersion'],",
-            "                'capabilities': {'tools': {}, 'resources': {}},",
+            "                'capabilities': CAPABILITIES,",
             "                'serverInfo': {'name': 'fake-mcp', 'version': '0.2.0'}",
             "            }",
             "        })",
             "    elif method == 'tools/list':",
+            "        cursor = (request.get('params') or {}).get('cursor')",
+            "        if cursor is None:",
+            "            tools = [{",
+            "                'name': 'echo',",
+            "                'description': 'Echoes text',",
+            "                'inputSchema': {",
+            "                    'type': 'object',",
+            "                    'properties': {'text': {'type': 'string'}},",
+            "                    'required': ['text']",
+            "                }",
+            "            }]",
+            "            next_cursor = 'tools-page-2'",
+            "        else:",
+            "            tools = [{",
+            "                'name': 'inspect',",
+            "                'description': 'Inspect fixture state',",
+            "                'inputSchema': {'type': 'object'},",
+            "                'outputSchema': {'type': 'object'}",
+            "            }]",
+            "            next_cursor = None",
+            "        if PAGINATION_LOOP_METHOD == method:",
+            "            next_cursor = 'loop'",
+            "        if EMPTY_CURSOR_METHOD == method:",
+            "            next_cursor = ''",
             "        send_message({",
             "            'jsonrpc': '2.0',",
             "            'id': request['id'],",
-            "            'result': {",
-            "                'tools': [",
-            "                    {",
-            "                        'name': 'echo',",
-            "                        'description': 'Echoes text',",
-            "                        'inputSchema': {",
-            "                            'type': 'object',",
-            "                            'properties': {'text': {'type': 'string'}},",
-            "                            'required': ['text']",
-            "                        }",
-            "                    }",
-            "                ]",
-            "            }",
+            "            'result': {'tools': tools, 'nextCursor': next_cursor}",
             "        })",
             "    elif method == 'tools/call':",
             "        if INVALID_TOOL_CALL_RESPONSE:",
-            "            sys.stdout.buffer.write(b'Content-Length: 5\\r\\n\\r\\nnope!')",
+            "            sys.stdout.buffer.write(b'nope!\\n')",
             "            sys.stdout.buffer.flush()",
             "            continue",
             "        if TOOL_CALL_DELAY_MS:",
@@ -2670,28 +4212,71 @@ mod tests {
             "                }",
             "            })",
             "    elif method == 'resources/list':",
+            "        cursor = (request.get('params') or {}).get('cursor')",
+            "        if cursor is None:",
+            "            resources = [{",
+            "                'uri': 'file://guide.txt',",
+            "                'name': 'guide',",
+            "                'title': 'Guide',",
+            "                'description': 'Guide text',",
+            "                'mimeType': 'text/plain'",
+            "            }]",
+            "            next_cursor = 'resources-page-2'",
+            "        else:",
+            "            resources = [{",
+            "                'uri': 'file://guide.txt' if DUPLICATE_LIST_METHOD == method else 'file://status.json',",
+            "                'name': 'status',",
+            "                'description': 'Status JSON',",
+            "                'mimeType': 'application/json',",
+            "                'size': 17",
+            "            }]",
+            "            next_cursor = None",
+            "        if PAGINATION_LOOP_METHOD == method:",
+            "            next_cursor = 'loop'",
+            "        if EMPTY_CURSOR_METHOD == method:",
+            "            next_cursor = ''",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'resources': resources, 'nextCursor': next_cursor}",
+            "        })",
+            "    elif method == 'resources/templates/list':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
             "            'id': request['id'],",
             "            'result': {",
-            "                'resources': [",
-            "                    {",
-            "                        'uri': 'file://guide.txt',",
-            "                        'name': 'guide',",
-            "                        'description': 'Guide text',",
-            "                        'mimeType': 'text/plain'",
-            "                    }",
-            "                ]",
+            "                'resourceTemplates': [{",
+            "                    'uriTemplate': 'file://logs/{unit}.txt',",
+            "                    'name': 'unit-log',",
+            "                    'description': 'Unit log'",
+            "                }]",
             "            }",
             "        })",
             "    elif method == 'prompts/list':",
+            "        cursor = (request.get('params') or {}).get('cursor')",
+            "        if cursor is None:",
+            "            prompts = [{",
+            "                'name': 'triage',",
+            "                'title': 'Triage',",
+            "                'description': 'Build a triage prompt',",
+            "                'arguments': [{'name': 'service', 'required': True}]",
+            "            }]",
+            "            next_cursor = 'prompts-page-2'",
+            "        else:",
+            "            prompts = [{",
+            "                'name': 'repair',",
+            "                'description': 'Build a repair prompt',",
+            "                'arguments': []",
+            "            }]",
+            "            next_cursor = None",
+            "        if PAGINATION_LOOP_METHOD == method:",
+            "            next_cursor = 'loop'",
+            "        if EMPTY_CURSOR_METHOD == method:",
+            "            next_cursor = ''",
             "        send_message({",
             "            'jsonrpc': '2.0',",
             "            'id': request['id'],",
-            "            'result': {",
-            "                'prompts': [],",
-            "                'nextCursor': None",
-            "            }",
+            "            'result': {'prompts': prompts, 'nextCursor': next_cursor}",
             "        })",
             "    elif method == 'prompts/get':",
             "        args = request['params'].get('arguments') or {}",
@@ -2770,22 +4355,14 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(payload + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -2948,6 +4525,61 @@ mod tests {
         }
     }
 
+    fn read_sse_post_json(stream: &mut TcpStream) -> serde_json::Value {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let request = String::from_utf8_lossy(&buffer);
+                    if let Some((headers, body)) = request.split_once("\r\n\r\n") {
+                        let content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        if content_length.is_some_and(|length| body.as_bytes().len() >= length) {
+                            return serde_json::from_str(body.trim()).expect("json body");
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("read SSE POST: {error}"),
+            }
+        }
+        let request = String::from_utf8_lossy(&buffer);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.trim())
+            .unwrap_or("");
+        serde_json::from_str(body).expect("json body")
+    }
+
+    fn accept_sse_post(
+        listener: &TcpListener,
+        methods: &Arc<Mutex<Vec<String>>>,
+    ) -> (TcpStream, serde_json::Value) {
+        let (mut post, _) = listener.accept().expect("accept post");
+        let value = read_sse_post_json(&mut post);
+        let method = value
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .expect("method")
+            .to_string();
+        methods.lock().expect("methods lock").push(method);
+        (post, value)
+    }
+
     fn manager_server_config(
         script_path: &Path,
         label: &str,
@@ -3073,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn write_jsonrpc_request_emits_content_length_frame() {
+    fn write_jsonrpc_request_interops_with_standard_newline_server() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3107,17 +4739,14 @@ mod tests {
     }
 
     #[test]
-    fn given_lowercase_content_length_when_initialize_then_response_parses() {
+    fn given_standard_newline_server_when_initialize_then_response_parses() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_jsonrpc_script();
-            let transport = script_transport_with_env(
-                &script_path,
-                BTreeMap::from([("MCP_LOWERCASE_CONTENT_LENGTH".to_string(), "1".to_string())]),
-            );
+            let transport = script_transport(&script_path);
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
 
             let response = process
@@ -3142,6 +4771,110 @@ mod tests {
             let status = process.wait().await.expect("wait for exit");
             assert!(status.success());
 
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn overlong_jsonrpc_line_is_rejected_before_json_parse() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut bytes = vec![b'{'; MCP_MAX_JSONRPC_FRAME_BYTES + 1];
+            bytes.push(b'\n');
+            let mut reader = BufReader::new(bytes.as_slice());
+            let error = read_limited_jsonrpc_line(&mut reader)
+                .await
+                .expect_err("overlong line must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("exceeded"));
+        });
+    }
+
+    #[test]
+    fn empty_jsonrpc_line_is_rejected() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"\n"[..]);
+            let error = read_limited_jsonrpc_line(&mut reader)
+                .await
+                .expect_err("empty line must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("must not be empty"));
+        });
+    }
+
+    #[test]
+    fn crlf_jsonrpc_line_strips_delimiter_carriage_return() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"{\"jsonrpc\":\"2.0\"}\r\n"[..]);
+            let payload = read_limited_jsonrpc_line(&mut reader)
+                .await
+                .expect("CRLF line should parse")
+                .expect("payload");
+            assert_eq!(payload, br#"{"jsonrpc":"2.0"}"#);
+        });
+    }
+
+    #[test]
+    fn embedded_carriage_return_jsonrpc_line_is_rejected() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = BufReader::new(&b"{\"jsonrpc\":\"2.0\r\"}\n"[..]);
+            let error = read_limited_jsonrpc_line(&mut reader)
+                .await
+                .expect_err("embedded carriage return must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("carriage returns"));
+        });
+    }
+
+    #[test]
+    fn given_crlf_response_when_initialize_then_response_parses() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_jsonrpc_script();
+            let transport = script_transport_with_env(
+                &script_path,
+                BTreeMap::from([("MCP_RESPONSE_CRLF".to_string(), "1".to_string())]),
+            );
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(9),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("initialize should parse CRLF response");
+
+            assert_eq!(response.id, JsonRpcId::Number(9));
+            assert_eq!(response.error, None);
+            assert!(response.result.is_some());
+
+            let status = process.wait().await.expect("wait for exit");
+            assert!(status.success());
             cleanup_script(&script_path);
         });
     }
@@ -3220,29 +4953,51 @@ mod tests {
             let transport = script_transport(&script_path);
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn fake mcp server");
 
+            let initialize = process
+                .initialize(
+                    JsonRpcId::Number(1),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("initialize");
+            let initialize_result = initialize.result.expect("initialize result");
+            assert!(initialize_result.capabilities.get("tools").is_some());
+            assert!(initialize_result.capabilities.get("resources").is_some());
+            assert!(initialize_result.capabilities.get("prompts").is_some());
+            process
+                .notify("notifications/initialized", Some(json!({})))
+                .await
+                .expect("initialized notification");
+
             let tools = process
                 .list_tools(JsonRpcId::Number(2), None)
                 .await
                 .expect("list tools");
             assert_eq!(tools.error, None);
             assert_eq!(tools.id, JsonRpcId::Number(2));
-            assert_eq!(
-                tools.result,
-                Some(McpListToolsResult {
-                    tools: vec![McpTool {
-                        name: "echo".to_string(),
-                        description: Some("Echoes text".to_string()),
-                        input_schema: Some(json!({
-                            "type": "object",
-                            "properties": {"text": {"type": "string"}},
-                            "required": ["text"]
-                        })),
-                        annotations: None,
-                        meta: None,
-                    }],
-                    next_cursor: None,
-                })
-            );
+            let tools_result = tools.result.expect("tools result");
+            assert_eq!(tools_result.tools[0].name, "echo");
+            assert_eq!(tools_result.next_cursor.as_deref(), Some("tools-page-2"));
+            let tools_second = process
+                .list_tools(
+                    JsonRpcId::Number(21),
+                    Some(McpListToolsParams {
+                        cursor: tools_result.next_cursor,
+                    }),
+                )
+                .await
+                .expect("list tools second page")
+                .result
+                .expect("tools second page");
+            assert_eq!(tools_second.tools[0].name, "inspect");
+            assert_eq!(tools_second.next_cursor, None);
 
             let call = process
                 .call_tool(
@@ -3277,8 +5032,38 @@ mod tests {
             assert_eq!(resources_result.resources.len(), 1);
             assert_eq!(resources_result.resources[0].uri, "file://guide.txt");
             assert_eq!(
+                resources_result.next_cursor.as_deref(),
+                Some("resources-page-2")
+            );
+            assert_eq!(
                 resources_result.resources[0].mime_type.as_deref(),
                 Some("text/plain")
+            );
+            let resources_second = process
+                .list_resources(
+                    JsonRpcId::Number(31),
+                    Some(McpListResourcesParams {
+                        cursor: resources_result.next_cursor,
+                    }),
+                )
+                .await
+                .expect("list resources second page")
+                .result
+                .expect("resources second page");
+            assert_eq!(resources_second.resources[0].uri, "file://status.json");
+
+            let resource_templates = process
+                .list_resource_templates(
+                    JsonRpcId::Number(32),
+                    Some(McpListResourceTemplatesParams { cursor: None }),
+                )
+                .await
+                .expect("list resource templates")
+                .result
+                .expect("resource templates result");
+            assert_eq!(
+                resource_templates.resource_templates[0].uri_template,
+                "file://logs/{unit}.txt"
             );
 
             let read = process
@@ -3308,7 +5093,24 @@ mod tests {
                 .await
                 .expect("list prompts");
             assert_eq!(prompts.error, None);
-            assert_eq!(prompts.result.expect("prompts result").prompts.len(), 0);
+            let prompts_result = prompts.result.expect("prompts result");
+            assert_eq!(prompts_result.prompts[0].name, "triage");
+            assert_eq!(
+                prompts_result.next_cursor.as_deref(),
+                Some("prompts-page-2")
+            );
+            let prompts_second = process
+                .list_prompts(
+                    JsonRpcId::Number(51),
+                    Some(McpListPromptsParams {
+                        cursor: prompts_result.next_cursor,
+                    }),
+                )
+                .await
+                .expect("list prompts second page")
+                .result
+                .expect("prompts second page");
+            assert_eq!(prompts_second.prompts[0].name, "repair");
 
             let prompt = process
                 .get_prompt(
@@ -3865,22 +5667,265 @@ mod tests {
                 .list_resources("alpha")
                 .await
                 .expect("list resources");
-            assert_eq!(listed.resources.len(), 1);
+            assert_eq!(listed.resources.len(), 2);
             assert_eq!(listed.resources[0].uri, "file://guide.txt");
 
-            let read = manager
-                .read_resource("alpha", "file://guide.txt")
+            let templates = manager
+                .list_resource_templates("alpha")
                 .await
-                .expect("read resource");
+                .expect("list resource templates");
+            assert_eq!(templates.resource_templates.len(), 1);
+            assert_eq!(
+                templates.resource_templates[0].uri_template,
+                "file://logs/{unit}.txt"
+            );
+
+            let read = manager
+                .read_resource("alpha", "file://logs/api.txt")
+                .await
+                .expect("read concrete template resource");
             assert_eq!(read.contents.len(), 1);
             assert_eq!(
                 read.contents[0].text.as_deref(),
-                Some("contents for file://guide.txt")
+                Some("contents for file://logs/api.txt")
             );
 
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn manager_discovers_three_capability_catalog_and_invokes_real_results() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("catalog.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config(&script_path, "alpha", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let catalogs = manager
+                .discover_catalogs()
+                .await
+                .expect("discover catalogs");
+            assert_eq!(catalogs.len(), 1);
+            let catalog = &catalogs[0];
+            assert!(catalog
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.tools
+                    && capabilities.resources
+                    && capabilities.prompts));
+            assert_eq!(catalog.tools.len(), 2);
+            assert_eq!(catalog.resources.len(), 2);
+            assert_eq!(catalog.resource_templates.len(), 1);
+            assert_eq!(catalog.prompts.len(), 2);
+
+            let tool = manager
+                .call_tool(&mcp_tool_name("alpha", "echo"), Some(json!({"text": "ok"})))
+                .await
+                .expect("call discovered tool")
+                .result
+                .expect("tool result");
+            assert_eq!(tool.structured_content, Some(json!({"echoed": "ok"})));
+
+            let resource = manager
+                .read_resource("alpha", "file://guide.txt")
+                .await
+                .expect("read listed resource");
+            assert_eq!(
+                resource.contents[0].text.as_deref(),
+                Some("contents for file://guide.txt")
+            );
+
+            let prompt = manager
+                .get_prompt("alpha", "triage", Some(json!({"service": "api"})))
+                .await
+                .expect("get listed prompt");
+            assert_eq!(prompt.messages.len(), 1);
+            assert_eq!(prompt.messages[0].role, "user");
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_rejects_missing_and_non_object_capabilities_before_calling_methods() {
+        let invalid_values = [
+            ("missing", None),
+            ("array", Some(json!([]))),
+            ("string", Some(json!("yes"))),
+            ("number", Some(json!(1))),
+            ("bool-true", Some(json!(true))),
+            ("bool-false", Some(json!(false))),
+            ("null", Some(json!(null))),
+        ];
+        let probes = [
+            (
+                "tools",
+                McpCapabilityKind::Tools,
+                &["tools/list", "tools/call"][..],
+            ),
+            (
+                "resources",
+                McpCapabilityKind::Resources,
+                &["resources/list", "resources/read"][..],
+            ),
+            (
+                "prompts",
+                McpCapabilityKind::Prompts,
+                &["prompts/list", "prompts/get"][..],
+            ),
+        ];
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for (capability_key, expected_capability, forbidden_methods) in probes {
+                for (value_label, override_value) in &invalid_values {
+                    let script_path = write_mcp_server_script();
+                    let root = script_path.parent().expect("script parent");
+                    let log_path =
+                        root.join(format!("{capability_key}-{value_label}-fail-closed.log"));
+                    let mut env = BTreeMap::new();
+                    if let Some(override_value) = override_value {
+                        let mut overrides = serde_json::Map::new();
+                        overrides.insert(capability_key.to_string(), override_value.clone());
+                        env.insert(
+                            "MCP_CAPABILITY_OVERRIDES".to_string(),
+                            serde_json::Value::Object(overrides).to_string(),
+                        );
+                    } else {
+                        env.insert(
+                            format!("MCP_DISABLE_{}", capability_key.to_ascii_uppercase()),
+                            "1".to_string(),
+                        );
+                    }
+                    let servers = BTreeMap::from([(
+                        "alpha".to_string(),
+                        manager_server_config_with_env(&script_path, "alpha", &log_path, env),
+                    )]);
+                    let mut manager = McpServerManager::from_servers(&servers);
+
+                    let error = match expected_capability {
+                        McpCapabilityKind::Tools => manager
+                            .discover_tools()
+                            .await
+                            .map(|_| ())
+                            .expect_err("tools capability must fail closed"),
+                        McpCapabilityKind::Resources => manager
+                            .read_resource("alpha", "file://guide.txt")
+                            .await
+                            .map(|_| ())
+                            .expect_err("resources capability must fail closed"),
+                        McpCapabilityKind::Prompts => manager
+                            .get_prompt("alpha", "triage", None)
+                            .await
+                            .map(|_| ())
+                            .expect_err("prompts capability must fail closed"),
+                        McpCapabilityKind::ResourceTemplates => unreachable!(),
+                    };
+                    assert!(
+                        matches!(
+                            error,
+                            McpServerManagerError::UnsupportedCapability { capability, .. }
+                                if capability == expected_capability
+                        ),
+                        "{capability_key}={value_label} returned unexpected error: {error:?}"
+                    );
+
+                    manager.shutdown().await.expect("shutdown");
+                    let log = fs::read_to_string(&log_path).expect("read log");
+                    for method in forbidden_methods {
+                        assert!(
+                            !log.lines().any(|line| line == *method),
+                            "{capability_key}={value_label} unexpectedly called {method}; log: {log:?}"
+                        );
+                    }
+                    cleanup_script(&script_path);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn manager_rejects_paginated_list_limit_violations() {
+        let cases = [
+            (
+                "loop",
+                BTreeMap::from([(
+                    "MCP_PAGINATION_LOOP_METHOD".to_string(),
+                    "resources/list".to_string(),
+                )]),
+                "repeated",
+            ),
+            (
+                "empty",
+                BTreeMap::from([(
+                    "MCP_EMPTY_CURSOR_METHOD".to_string(),
+                    "resources/list".to_string(),
+                )]),
+                "empty",
+            ),
+            (
+                "missing-result",
+                BTreeMap::from([(
+                    "MCP_OMIT_RESULT_METHOD".to_string(),
+                    "resources/list".to_string(),
+                )]),
+                "missing result",
+            ),
+            (
+                "duplicate",
+                BTreeMap::from([(
+                    "MCP_DUPLICATE_LIST_METHOD".to_string(),
+                    "resources/list".to_string(),
+                )]),
+                "duplicate resource uri",
+            ),
+        ];
+
+        for (label, env, expected) in cases {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let script_path = write_mcp_server_script();
+                let root = script_path.parent().expect("script parent");
+                let servers = BTreeMap::from([(
+                    "alpha".to_string(),
+                    manager_server_config_with_env(
+                        &script_path,
+                        "alpha",
+                        &root.join(format!("{label}.log")),
+                        env,
+                    ),
+                )]);
+                let mut manager = McpServerManager::from_servers(&servers);
+
+                let error = manager
+                    .list_resources("alpha")
+                    .await
+                    .expect_err("invalid pagination should fail");
+                assert!(
+                    error.to_string().contains(expected),
+                    "{label} error did not contain {expected}: {error}"
+                );
+
+                manager.shutdown().await.expect("shutdown");
+                cleanup_script(&script_path);
+            });
+        }
     }
 
     fn write_initialize_disconnect_script() -> PathBuf {
@@ -3890,18 +5935,9 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import sys",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "if length:",
-            "    sys.stdin.buffer.read(length)",
+            "line = sys.stdin.buffer.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
             "raise SystemExit(0)",
             "",
         ]
@@ -4149,6 +6185,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
         let addr = listener.local_addr().expect("fixture addr");
         let handle = thread::spawn(move || {
+            let methods = Arc::new(Mutex::new(Vec::new()));
             let (mut sse, _) = listener.accept().expect("accept sse");
             let mut request = [0_u8; 1024];
             let _ = sse.read(&mut request);
@@ -4157,21 +6194,55 @@ mod tests {
             )
             .expect("write endpoint");
 
-            for (method, id, result) in [
-                (
-                    "initialize",
-                    1_u64,
-                    json!({
+            let (mut initialize, initialize_request) = accept_sse_post(&listener, &methods);
+            initialize
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("initialize ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_request["id"].clone(),
+                    "result": {
                         "protocolVersion": "2025-03-26",
-                        "capabilities": {},
+                        "capabilities": { "tools": {} },
                         "serverInfo": { "name": "fixture", "version": "1.0.0" }
-                    }),
-                ),
-                ("ping", 2_u64, json!({})),
-                (
-                    "tools/list",
-                    3_u64,
-                    json!({
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write initialize");
+
+            let (mut notification, _) = accept_sse_post(&listener, &methods);
+            notification
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("notification ack");
+
+            let (mut ping, ping_request) = accept_sse_post(&listener, &methods);
+            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("ping ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
+            );
+            sse.write_all(frame.as_bytes()).expect("write ping");
+
+            let (mut tools, tools_request) = accept_sse_post(&listener, &methods);
+            assert_eq!(
+                tools_request
+                    .get("params")
+                    .and_then(|params| params.get("cursor"))
+                    .and_then(serde_json::Value::as_str),
+                None
+            );
+            tools
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("tools ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": tools_request["id"].clone(),
+                    "result": {
                         "tools": [
                             {
                                 "name": "inspect",
@@ -4179,36 +6250,10 @@ mod tests {
                                 "inputSchema": { "type": "object" }
                             }
                         ]
-                    }),
-                ),
-            ] {
-                let (mut post, _) = listener.accept().expect("accept post");
-                post.set_read_timeout(Some(Duration::from_millis(50))).ok();
-                let mut body = [0_u8; 2048];
-                let _ = post.read(&mut body);
-                post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                    .expect("post ack");
-                sse.write_all(
-                    b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"message\":\"still running\"}}\r\n\r\n",
-                )
-                .expect("write notification");
-                let frame = format!(
-                    "event: message\ndata: {}\r\n\r\n",
-                    json!({"jsonrpc":"2.0","id":id,"result":result})
-                );
-                sse.write_all(frame.as_bytes()).expect("write response");
-                if method == "initialize" {
-                    let (mut notification, _) = listener.accept().expect("accept notification");
-                    notification
-                        .set_read_timeout(Some(Duration::from_millis(50)))
-                        .ok();
-                    let mut ignored = [0_u8; 2048];
-                    let _ = notification.read(&mut ignored);
-                    notification
-                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                        .expect("notification ack");
-                }
-            }
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write tools");
         });
 
         let servers = BTreeMap::from([(
@@ -4242,6 +6287,466 @@ mod tests {
         assert_eq!(heartbeat[0].server_name, "remote");
         assert_eq!(heartbeat[0].status, McpHeartbeatStatus::Healthy);
         assert!(heartbeat[0].last_success_at_ms.is_some());
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn legacy_sse_without_object_tools_capability_does_not_request_tools_list() {
+        for (label, capabilities) in [
+            ("missing", json!({})),
+            ("array", json!({ "tools": [] })),
+            ("string", json!({ "tools": "yes" })),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+            let addr = listener.local_addr().expect("fixture addr");
+            let methods = Arc::new(Mutex::new(Vec::new()));
+            let fixture_methods = Arc::clone(&methods);
+            let handle = thread::spawn(move || {
+                let (mut sse, _) = listener.accept().expect("accept sse");
+                let mut request = [0_u8; 1024];
+                let _ = sse.read(&mut request);
+                sse.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
+                )
+                .expect("write endpoint");
+
+                let (mut initialize, initialize_request) =
+                    accept_sse_post(&listener, &fixture_methods);
+                initialize
+                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                    .expect("initialize ack");
+                let frame = format!(
+                    "event: message\ndata: {}\r\n\r\n",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": initialize_request["id"].clone(),
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": capabilities,
+                            "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
+                        }
+                    })
+                );
+                sse.write_all(frame.as_bytes()).expect("write initialize");
+
+                let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
+                notification
+                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                    .expect("notification ack");
+            });
+
+            let servers = BTreeMap::from([(
+                "remote".to_string(),
+                ScopedMcpServerConfig {
+                    required: true,
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Sse(McpRemoteServerConfig {
+                        url: format!("http://{addr}/sse"),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                        oauth: None,
+                        tool_call_timeout_ms: Some(1_000),
+                        heartbeat_timeout_ms: Some(1_000),
+                        protocol_version: Some("2025-03-26".to_string()),
+                        capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            let report = runtime.block_on(manager.discover_catalogs_best_effort());
+
+            assert!(report.failed_servers.is_empty(), "{label}");
+            assert!(report.tools.is_empty(), "{label}");
+            let catalog = report.catalogs.first().expect("catalog");
+            assert!(catalog.tools_complete, "{label}");
+            assert!(catalog.tools.is_empty(), "{label}");
+            assert!(catalog
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| !capabilities.tools));
+            let methods = methods.lock().expect("methods lock").clone();
+            assert_eq!(
+                methods,
+                vec![
+                    "initialize".to_string(),
+                    "notifications/initialized".to_string()
+                ],
+                "{label}"
+            );
+            handle.join().expect("fixture thread");
+        }
+    }
+
+    #[test]
+    fn legacy_sse_tools_list_follows_cursor_pagination() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let mut request = [0_u8; 1024];
+            let _ = sse.read(&mut request);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
+            )
+            .expect("write endpoint");
+
+            let (mut initialize, initialize_request) = accept_sse_post(&listener, &fixture_methods);
+            initialize
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("initialize ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_request["id"].clone(),
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write initialize");
+
+            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
+            notification
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("notification ack");
+
+            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods);
+            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("ping ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
+            );
+            sse.write_all(frame.as_bytes()).expect("write ping");
+
+            for (expected_cursor, tool_name, next_cursor) in [
+                (None, "inspect", Some("page-2")),
+                (Some("page-2"), "repair", None),
+            ] {
+                let (mut post, request) = accept_sse_post(&listener, &fixture_methods);
+                assert_eq!(
+                    request
+                        .get("params")
+                        .and_then(|params| params.get("cursor"))
+                        .and_then(serde_json::Value::as_str),
+                    expected_cursor
+                );
+                post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                    .expect("tools ack");
+                let frame = format!(
+                    "event: message\ndata: {}\r\n\r\n",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"].clone(),
+                        "result": {
+                            "tools": [{
+                                "name": tool_name,
+                                "description": "fixture tool",
+                                "inputSchema": { "type": "object" }
+                            }],
+                            "nextCursor": next_cursor
+                        }
+                    })
+                );
+                sse.write_all(frame.as_bytes()).expect("write tools page");
+            }
+        });
+
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2025-03-26".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let report = runtime.block_on(manager.discover_catalogs_best_effort());
+
+        assert!(report.failed_servers.is_empty());
+        assert_eq!(report.tools.len(), 2);
+        assert_eq!(report.tools[0].raw_name, "inspect");
+        assert_eq!(report.tools[1].raw_name, "repair");
+        assert_eq!(
+            methods.lock().expect("methods lock").clone(),
+            vec![
+                "initialize".to_string(),
+                "notifications/initialized".to_string(),
+                "ping".to_string(),
+                "tools/list".to_string(),
+                "tools/list".to_string()
+            ]
+        );
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn legacy_sse_tools_list_rejects_repeated_cursor() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let mut request = [0_u8; 1024];
+            let _ = sse.read(&mut request);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
+            )
+            .expect("write endpoint");
+
+            let (mut initialize, initialize_request) = accept_sse_post(&listener, &fixture_methods);
+            initialize
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("initialize ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_request["id"].clone(),
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write initialize");
+
+            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
+            notification
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("notification ack");
+
+            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods);
+            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("ping ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
+            );
+            sse.write_all(frame.as_bytes()).expect("write ping");
+
+            for tool_name in ["inspect", "repair"] {
+                let (mut post, request) = accept_sse_post(&listener, &fixture_methods);
+                post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                    .expect("tools ack");
+                let frame = format!(
+                    "event: message\ndata: {}\r\n\r\n",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"].clone(),
+                        "result": {
+                            "tools": [{
+                                "name": tool_name,
+                                "description": "fixture tool",
+                                "inputSchema": { "type": "object" }
+                            }],
+                            "nextCursor": "repeat"
+                        }
+                    })
+                );
+                sse.write_all(frame.as_bytes()).expect("write tools page");
+            }
+        });
+
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2025-03-26".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let error = runtime
+            .block_on(manager.discover_tools())
+            .expect_err("repeated SSE cursor should fail");
+
+        assert!(error.to_string().contains("repeated"));
+        assert_eq!(
+            methods.lock().expect("methods lock").clone(),
+            vec![
+                "initialize".to_string(),
+                "notifications/initialized".to_string(),
+                "ping".to_string(),
+                "tools/list".to_string(),
+                "tools/list".to_string()
+            ]
+        );
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn discover_catalogs_best_effort_keeps_legacy_sse_tools_with_capability_degradations() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let handle = thread::spawn(move || {
+            let methods = Arc::new(Mutex::new(Vec::new()));
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let mut request = [0_u8; 1024];
+            let _ = sse.read(&mut request);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
+            )
+            .expect("write endpoint");
+
+            let (mut initialize, initialize_request) = accept_sse_post(&listener, &methods);
+            initialize
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("initialize ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_request["id"].clone(),
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {
+                            "tools": {},
+                            "resources": {},
+                            "prompts": {}
+                        },
+                        "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write initialize");
+
+            let (mut notification, _) = accept_sse_post(&listener, &methods);
+            notification
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("notification ack");
+
+            let (mut ping, ping_request) = accept_sse_post(&listener, &methods);
+            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("ping ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
+            );
+            sse.write_all(frame.as_bytes()).expect("write ping");
+
+            let (mut tools, tools_request) = accept_sse_post(&listener, &methods);
+            tools
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("tools ack");
+            let frame = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": tools_request["id"].clone(),
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "inspect",
+                                "description": "Inspect fixture",
+                                "inputSchema": { "type": "object" }
+                            }
+                        ]
+                    }
+                })
+            );
+            sse.write_all(frame.as_bytes()).expect("write tools");
+        });
+
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2025-03-26".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let report = runtime.block_on(manager.discover_catalogs_best_effort());
+
+        assert!(report.failed_servers.is_empty());
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].qualified_name, "mcp__remote__inspect");
+        assert_eq!(report.catalogs.len(), 1);
+        let catalog = &report.catalogs[0];
+        assert_eq!(
+            catalog.server_info.as_ref().map(|info| info.name.as_str()),
+            Some("legacy-sse")
+        );
+        assert!(catalog
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.tools
+                && capabilities.resources
+                && capabilities.prompts));
+        assert!(catalog.tools_complete);
+        assert!(!catalog.resources_complete);
+        assert!(!catalog.resource_templates_complete);
+        assert!(!catalog.prompts_complete);
+        assert_eq!(report.degraded_capabilities.len(), 3);
+        assert!(report
+            .degraded_capabilities
+            .iter()
+            .any(|degradation| degradation.method == "resources/list"
+                && degradation.capability == McpCapabilityKind::Resources));
+        assert!(report
+            .degraded_capabilities
+            .iter()
+            .any(
+                |degradation| degradation.method == "resources/templates/list"
+                    && degradation.capability == McpCapabilityKind::ResourceTemplates
+            ));
+        assert!(report
+            .degraded_capabilities
+            .iter()
+            .any(|degradation| degradation.method == "prompts/list"
+                && degradation.capability == McpCapabilityKind::Prompts));
+        assert!(report.degraded_startup.is_none());
         handle.join().expect("fixture thread");
     }
 

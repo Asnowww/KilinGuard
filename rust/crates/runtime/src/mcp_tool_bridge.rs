@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::mcp::mcp_tool_name;
-use crate::mcp_stdio::{McpGetPromptResult, McpServerManager};
+use crate::mcp_stdio::{
+    McpGetPromptResult, McpListPromptsResult, McpListResourceTemplatesResult,
+    McpListResourcesResult, McpReadResourceResult, McpServerManager,
+};
 use serde::{Deserialize, Serialize};
 
 /// Status of a managed MCP server connection.
@@ -51,6 +54,15 @@ pub struct McpResourceInfo {
     pub mime_type: Option<String>,
 }
 
+/// Metadata about an MCP resource template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceTemplateInfo {
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
 /// Metadata about an MCP tool exposed by a server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolInfo {
@@ -74,6 +86,16 @@ pub struct McpPromptArgumentInfo {
     pub required: bool,
 }
 
+fn thread_panic_message(panic_payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic_payload.downcast_ref::<&str>() {
+        format!("MCP worker thread panicked: {message}")
+    } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+        format!("MCP worker thread panicked: {message}")
+    } else {
+        "MCP worker thread panicked".to_string()
+    }
+}
+
 /// Tracked state of an MCP server connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerState {
@@ -81,6 +103,7 @@ pub struct McpServerState {
     pub status: McpConnectionStatus,
     pub tools: Vec<McpToolInfo>,
     pub resources: Vec<McpResourceInfo>,
+    pub resource_templates: Vec<McpResourceTemplateInfo>,
     pub prompts: Vec<McpPromptInfo>,
     pub server_info: Option<String>,
     pub error_message: Option<String>,
@@ -132,6 +155,27 @@ impl McpToolRegistry {
         prompts: Vec<McpPromptInfo>,
         server_info: Option<String>,
     ) {
+        self.register_server_with_catalog(
+            server_name,
+            status,
+            tools,
+            resources,
+            Vec::new(),
+            prompts,
+            server_info,
+        );
+    }
+
+    pub fn register_server_with_catalog(
+        &self,
+        server_name: &str,
+        status: McpConnectionStatus,
+        tools: Vec<McpToolInfo>,
+        resources: Vec<McpResourceInfo>,
+        resource_templates: Vec<McpResourceTemplateInfo>,
+        prompts: Vec<McpPromptInfo>,
+        server_info: Option<String>,
+    ) {
         let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
         inner.insert(
             server_name.to_owned(),
@@ -140,6 +184,7 @@ impl McpToolRegistry {
                 status,
                 tools,
                 resources,
+                resource_templates,
                 prompts,
                 server_info,
                 error_message: None,
@@ -157,7 +202,30 @@ impl McpToolRegistry {
         inner.values().cloned().collect()
     }
 
+    pub fn server_names(&self) -> Vec<String> {
+        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut server_names = inner.keys().cloned().collect::<Vec<_>>();
+        server_names.sort();
+        server_names
+    }
+
     pub fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, String> {
+        self.ensure_connected(server_name)?;
+        if let Some(manager) = self.manager.get().cloned() {
+            return Self::spawn_list_resources(manager, server_name.to_string()).map(|result| {
+                result
+                    .resources
+                    .into_iter()
+                    .map(|resource| McpResourceInfo {
+                        name: resource.name.unwrap_or_else(|| resource.uri.clone()),
+                        uri: resource.uri,
+                        description: resource.description,
+                        mime_type: resource.mime_type,
+                    })
+                    .collect()
+            });
+        }
+
         let inner = self.inner.lock().expect("mcp registry lock poisoned");
         match inner.get(server_name) {
             Some(state) => {
@@ -173,7 +241,60 @@ impl McpToolRegistry {
         }
     }
 
-    pub fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpResourceInfo, String> {
+    pub fn list_resource_templates(
+        &self,
+        server_name: &str,
+    ) -> Result<Vec<McpResourceTemplateInfo>, String> {
+        self.ensure_connected(server_name)?;
+        if let Some(manager) = self.manager.get().cloned() {
+            return Self::spawn_list_resource_templates(manager, server_name.to_string()).map(
+                |result| {
+                    result
+                        .resource_templates
+                        .into_iter()
+                        .map(|resource_template| McpResourceTemplateInfo {
+                            name: resource_template
+                                .name
+                                .unwrap_or_else(|| resource_template.uri_template.clone()),
+                            uri_template: resource_template.uri_template,
+                            description: resource_template.description,
+                            mime_type: resource_template.mime_type,
+                        })
+                        .collect()
+                },
+            );
+        }
+
+        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        match inner.get(server_name) {
+            Some(state) => {
+                if state.status != McpConnectionStatus::Connected {
+                    return Err(format!(
+                        "server '{}' is not connected (status: {})",
+                        server_name, state.status
+                    ));
+                }
+                Ok(state.resource_templates.clone())
+            }
+            None => Err(format!("server '{}' not found", server_name)),
+        }
+    }
+
+    pub fn read_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, String> {
+        self.ensure_connected(server_name)?;
+        let manager = self
+            .manager
+            .get()
+            .cloned()
+            .ok_or_else(|| "MCP server manager is not configured".to_string())?;
+        Self::spawn_read_resource(manager, server_name.to_string(), uri.to_string())
+    }
+
+    fn ensure_connected(&self, server_name: &str) -> Result<(), String> {
         let inner = self.inner.lock().expect("mcp registry lock poisoned");
         let state = inner
             .get(server_name)
@@ -185,13 +306,7 @@ impl McpToolRegistry {
                 server_name, state.status
             ));
         }
-
-        state
-            .resources
-            .iter()
-            .find(|r| r.uri == uri)
-            .cloned()
-            .ok_or_else(|| format!("resource '{}' not found on server '{}'", uri, server_name))
+        Ok(())
     }
 
     pub fn list_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>, String> {
@@ -211,6 +326,29 @@ impl McpToolRegistry {
     }
 
     pub fn list_prompts(&self, server_name: &str) -> Result<Vec<McpPromptInfo>, String> {
+        self.ensure_connected(server_name)?;
+        if let Some(manager) = self.manager.get().cloned() {
+            return Self::spawn_list_prompts(manager, server_name.to_string()).map(|result| {
+                result
+                    .prompts
+                    .into_iter()
+                    .map(|prompt| McpPromptInfo {
+                        name: prompt.name,
+                        description: prompt.description,
+                        arguments: prompt
+                            .arguments
+                            .into_iter()
+                            .map(|argument| McpPromptArgumentInfo {
+                                name: argument.name,
+                                description: argument.description,
+                                required: argument.required,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            });
+        }
+
         let inner = self.inner.lock().expect("mcp registry lock poisoned");
         match inner.get(server_name) {
             Some(state) => {
@@ -299,6 +437,141 @@ impl McpToolRegistry {
 
         serde_json::from_value(value)
             .map_err(|error| format!("failed to deserialize MCP prompt result: {error}"))
+    }
+
+    fn spawn_list_resources(
+        manager: Arc<Mutex<McpServerManager>>,
+        server_name: String,
+    ) -> Result<McpListResourcesResult, String> {
+        let thread_name = format!("mcp-resource-list-{server_name}");
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to create MCP resource runtime: {error}"))?;
+
+                runtime.block_on(async move {
+                    let mut manager = manager
+                        .lock()
+                        .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+                    let response = manager
+                        .list_resources(&server_name)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_value(response)
+                        .map_err(|error| format!("failed to serialize MCP resources: {error}"))
+                })
+            })
+            .map_err(|error| format!("failed to spawn MCP resource list thread: {error}"))?;
+
+        let value = join_handle.join().map_err(thread_panic_message)??;
+        serde_json::from_value(value)
+            .map_err(|error| format!("failed to deserialize MCP resources: {error}"))
+    }
+
+    fn spawn_list_resource_templates(
+        manager: Arc<Mutex<McpServerManager>>,
+        server_name: String,
+    ) -> Result<McpListResourceTemplatesResult, String> {
+        let thread_name = format!("mcp-resource-template-list-{server_name}");
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        format!("failed to create MCP resource template runtime: {error}")
+                    })?;
+
+                runtime.block_on(async move {
+                    let mut manager = manager
+                        .lock()
+                        .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+                    let response = manager
+                        .list_resource_templates(&server_name)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_value(response).map_err(|error| {
+                        format!("failed to serialize MCP resource templates: {error}")
+                    })
+                })
+            })
+            .map_err(|error| {
+                format!("failed to spawn MCP resource template list thread: {error}")
+            })?;
+
+        let value = join_handle.join().map_err(thread_panic_message)??;
+        serde_json::from_value(value)
+            .map_err(|error| format!("failed to deserialize MCP resource templates: {error}"))
+    }
+
+    fn spawn_read_resource(
+        manager: Arc<Mutex<McpServerManager>>,
+        server_name: String,
+        uri: String,
+    ) -> Result<McpReadResourceResult, String> {
+        let thread_name = format!("mcp-resource-read-{server_name}");
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to create MCP resource runtime: {error}"))?;
+
+                runtime.block_on(async move {
+                    let mut manager = manager
+                        .lock()
+                        .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+                    let response = manager
+                        .read_resource(&server_name, &uri)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_value(response).map_err(|error| {
+                        format!("failed to serialize MCP resource result: {error}")
+                    })
+                })
+            })
+            .map_err(|error| format!("failed to spawn MCP resource read thread: {error}"))?;
+
+        let value = join_handle.join().map_err(thread_panic_message)??;
+        serde_json::from_value(value)
+            .map_err(|error| format!("failed to deserialize MCP resource result: {error}"))
+    }
+
+    fn spawn_list_prompts(
+        manager: Arc<Mutex<McpServerManager>>,
+        server_name: String,
+    ) -> Result<McpListPromptsResult, String> {
+        let thread_name = format!("mcp-prompt-list-{server_name}");
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to create MCP prompt runtime: {error}"))?;
+
+                runtime.block_on(async move {
+                    let mut manager = manager
+                        .lock()
+                        .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+                    let response = manager
+                        .list_prompts(&server_name)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_value(response)
+                        .map_err(|error| format!("failed to serialize MCP prompts: {error}"))
+                })
+            })
+            .map_err(|error| format!("failed to spawn MCP prompt list thread: {error}"))?;
+
+        let value = join_handle.join().map_err(thread_panic_message)??;
+        serde_json::from_value(value)
+            .map_err(|error| format!("failed to deserialize MCP prompts: {error}"))
     }
 
     fn spawn_tool_call(
@@ -484,22 +757,14 @@ mod tests {
             "            handle.write(f'{method}\\n')",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(payload + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -516,7 +781,7 @@ mod tests {
             "            'id': request['id'],",
             "            'result': {",
             "                'protocolVersion': request['params']['protocolVersion'],",
-            "                'capabilities': {'tools': {}},",
+            "                'capabilities': {'tools': {}, 'resources': {}, 'prompts': {}},",
             "                'serverInfo': {'name': LABEL, 'version': '1.0.0'}",
             "            }",
             "        })",
@@ -537,6 +802,41 @@ mod tests {
             "                    }",
             "                ]",
             "            }",
+            "        })",
+            "    elif method == 'resources/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resources': [{'uri': 'file://bridge.txt', 'name': 'bridge', 'mimeType': 'text/plain'}]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/templates/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resourceTemplates': [{'uriTemplate': 'file://bridge/{name}.txt', 'name': 'bridge-template', 'mimeType': 'text/plain'}]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/read':",
+            "        uri = request['params']['uri']",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': f'live contents for {uri}'}]}",
+            "        })",
+            "    elif method == 'prompts/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'prompts': [{'name': 'triage', 'description': 'Triage prompt', 'arguments': []}]}",
+            "        })",
+            "    elif method == 'prompts/get':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'description': 'Triage prompt', 'messages': [{'role': 'user', 'content': {'type': 'text', 'text': 'triage'}}]}",
             "        })",
             "    elif method == 'tools/call':",
             "        args = request['params'].get('arguments') or {}",
@@ -640,6 +940,31 @@ mod tests {
     }
 
     #[test]
+    fn lists_resource_templates_from_connected_server() {
+        let registry = McpToolRegistry::new();
+        registry.register_server_with_catalog(
+            "srv",
+            McpConnectionStatus::Connected,
+            vec![],
+            vec![],
+            vec![McpResourceTemplateInfo {
+                uri_template: "res://{id}".into(),
+                name: "Template".into(),
+                description: Some("Resource template".into()),
+                mime_type: Some("text/plain".into()),
+            }],
+            vec![],
+            None,
+        );
+
+        let templates = registry
+            .list_resource_templates("srv")
+            .expect("templates should list");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].uri_template, "res://{id}");
+    }
+
+    #[test]
     fn lists_prompts_from_connected_server() {
         let registry = McpToolRegistry::new();
         registry.register_server_with_prompts(
@@ -679,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_specific_resource() {
+    fn read_resource_requires_manager_backed_read() {
         let registry = McpToolRegistry::new();
         registry.register_server(
             "srv",
@@ -694,12 +1019,101 @@ mod tests {
             None,
         );
 
-        let resource = registry
+        let error = registry
             .read_resource("srv", "res://data")
-            .expect("should find");
-        assert_eq!(resource.name, "Data");
+            .expect_err("cache metadata alone must not satisfy resources/read");
+        assert!(error.contains("MCP server manager is not configured"));
 
         assert!(registry.read_resource("srv", "res://missing").is_err());
+    }
+
+    #[test]
+    fn read_resource_with_manager_returns_live_contents_for_concrete_template_uri() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("resource-read.log");
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config(&script_path, "alpha", &log_path),
+        )]);
+        let manager = Arc::new(Mutex::new(McpServerManager::from_servers(&servers)));
+
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            McpConnectionStatus::Connected,
+            vec![],
+            vec![McpResourceInfo {
+                uri: "file://bridge.txt".into(),
+                name: "cached-only-name".into(),
+                description: None,
+                mime_type: Some("text/plain".into()),
+            }],
+            Some("bridge test server".into()),
+        );
+        registry
+            .set_manager(Arc::clone(&manager))
+            .expect("manager should only be set once");
+
+        let resource = registry
+            .read_resource("alpha", "file://bridge/api.txt")
+            .expect("should return live resource contents");
+        assert_eq!(resource.contents.len(), 1);
+        assert_eq!(
+            resource.contents[0].text.as_deref(),
+            Some("live contents for file://bridge/api.txt")
+        );
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec!["initialize", "notifications/initialized", "resources/read"]
+        );
+
+        cleanup_script(&script_path);
+    }
+
+    #[test]
+    fn list_resource_templates_with_manager_returns_live_templates() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("resource-template-list.log");
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config(&script_path, "alpha", &log_path),
+        )]);
+        let manager = Arc::new(Mutex::new(McpServerManager::from_servers(&servers)));
+
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            McpConnectionStatus::Connected,
+            vec![],
+            vec![],
+            Some("bridge test server".into()),
+        );
+        registry
+            .set_manager(Arc::clone(&manager))
+            .expect("manager should only be set once");
+
+        let templates = registry
+            .list_resource_templates("alpha")
+            .expect("should return live resource templates");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].uri_template, "file://bridge/{name}.txt");
+        assert_eq!(templates[0].name, "bridge-template");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "resources/templates/list",
+            ]
+        );
+
+        cleanup_script(&script_path);
     }
 
     #[test]
@@ -836,6 +1250,7 @@ mod tests {
     fn rejects_operations_on_missing_server() {
         let registry = McpToolRegistry::new();
         assert!(registry.list_resources("missing").is_err());
+        assert!(registry.list_resource_templates("missing").is_err());
         assert!(registry.read_resource("missing", "uri").is_err());
         assert!(registry.list_tools("missing").is_err());
         assert!(registry

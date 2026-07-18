@@ -2664,8 +2664,10 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|spec| McpTool {
             name: spec.name.to_string(),
+            title: None,
             description: Some(spec.description.to_string()),
             input_schema: Some(spec.input_schema),
+            output_schema: None,
             annotations: None,
             meta: None,
         })
@@ -5089,6 +5091,8 @@ struct RuntimeMcpState {
     degraded_report: Option<runtime::McpDegradedReport>,
 }
 
+const CLI_MCP_TOOL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
@@ -5188,6 +5192,11 @@ struct ListMcpResourcesRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListMcpResourceTemplatesRequest {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ReadMcpResourceRequest {
     server: String,
     uri: String,
@@ -5205,17 +5214,27 @@ struct GetMcpPromptRequest {
     arguments: Option<serde_json::Value>,
 }
 
+fn degraded_capability_name(capability: runtime::McpCapabilityKind) -> &'static str {
+    match capability {
+        runtime::McpCapabilityKind::Tools => "tools",
+        runtime::McpCapabilityKind::Resources => "resources",
+        runtime::McpCapabilityKind::ResourceTemplates => "resource_templates",
+        runtime::McpCapabilityKind::Prompts => "prompts",
+    }
+}
+
 impl RuntimeMcpState {
     fn new(
         servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
-    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<(Self, runtime::McpCapabilityDiscoveryReport)>, Box<dyn std::error::Error>>
+    {
         let mut manager = McpServerManager::from_servers(servers);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
 
         let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
+        let discovery = runtime.block_on(manager.discover_catalogs_best_effort());
         let pending_servers = discovery
             .failed_servers
             .iter()
@@ -5278,14 +5297,29 @@ impl RuntimeMcpState {
                     }
                 }))
                 .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
-            runtime::McpDegradedReport::new(
-                working_servers,
-                failed_servers,
-                available_tools.clone(),
-                available_tools,
-            )
-        });
+        let degraded_capabilities = discovery
+            .degraded_capabilities
+            .iter()
+            .map(|degradation| runtime::McpDegradedCapability {
+                server_name: degradation.server_name.clone(),
+                phase: degradation.phase,
+                required: degradation.required,
+                capability: degraded_capability_name(degradation.capability).to_string(),
+                method: degradation.method.to_string(),
+                reason: degradation.reason.clone(),
+                context: degradation.context.clone(),
+            })
+            .collect::<Vec<_>>();
+        let degraded_report = (!failed_servers.is_empty() || !degraded_capabilities.is_empty())
+            .then(|| {
+                runtime::McpDegradedReport::new(
+                    working_servers,
+                    failed_servers,
+                    available_tools.clone(),
+                    available_tools,
+                )
+                .with_degraded_capabilities(degraded_capabilities)
+            });
 
         Ok(Some((
             Self {
@@ -5336,7 +5370,9 @@ impl RuntimeMcpState {
                 "MCP tool `{qualified_tool_name}` returned no result payload"
             ))
         })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
+        bounded_mcp_tool_json(&serde_json::to_value(result).map_err(|error| {
+            ToolError::new(format!("failed to serialize MCP tool result: {error}"))
+        })?)
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
@@ -5344,47 +5380,66 @@ impl RuntimeMcpState {
             .runtime
             .block_on(self.manager.list_resources(server_name))
             .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
+        bounded_mcp_tool_json(&json!({
             "server": server_name,
             "resources": result.resources,
         }))
-        .map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut resources = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
+        bounded_multi_server_mcp_list_json(
+            "resources",
+            self.server_names(),
+            CLI_MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server_name| match self
                 .runtime
-                .block_on(self.manager.list_resources(&server_name))
+                .block_on(self.manager.list_resources(server_name))
             {
-                Ok(result) => resources.push(json!({
+                Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
                     "resources": result.resources,
                 })),
-                Err(error) => failures.push(json!({
+                Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
                     "error": error.to_string(),
                 })),
-            }
-        }
+            },
+        )
+    }
 
-        if resources.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "resources": resources,
-            "failures": failures,
+    fn list_resource_templates_for_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<String, ToolError> {
+        let result = self
+            .runtime
+            .block_on(self.manager.list_resource_templates(server_name))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        bounded_mcp_tool_json(&json!({
+            "server": server_name,
+            "resource_templates": result.resource_templates,
         }))
-        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn list_resource_templates_for_all_servers(&mut self) -> Result<String, ToolError> {
+        bounded_multi_server_mcp_list_json(
+            "resource_templates",
+            self.server_names(),
+            CLI_MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server_name| match self
+                .runtime
+                .block_on(self.manager.list_resource_templates(server_name))
+            {
+                Ok(result) => McpAggregateEntry::item(json!({
+                    "server": server_name,
+                    "resource_templates": result.resource_templates,
+                })),
+                Err(error) => McpAggregateEntry::failure(json!({
+                    "server": server_name,
+                    "error": error.to_string(),
+                })),
+            },
+        )
     }
 
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
@@ -5392,11 +5447,10 @@ impl RuntimeMcpState {
             .runtime
             .block_on(self.manager.read_resource(server_name, uri))
             .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
+        bounded_mcp_tool_json(&json!({
             "server": server_name,
             "contents": result.contents,
         }))
-        .map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn list_prompts_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
@@ -5404,47 +5458,31 @@ impl RuntimeMcpState {
             .runtime
             .block_on(self.manager.list_prompts(server_name))
             .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
+        bounded_mcp_tool_json(&json!({
             "server": server_name,
             "prompts": result.prompts,
         }))
-        .map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn list_prompts_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut prompts = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
+        bounded_multi_server_mcp_list_json(
+            "prompts",
+            self.server_names(),
+            CLI_MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server_name| match self
                 .runtime
-                .block_on(self.manager.list_prompts(&server_name))
+                .block_on(self.manager.list_prompts(server_name))
             {
-                Ok(result) => prompts.push(json!({
+                Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
                     "prompts": result.prompts,
                 })),
-                Err(error) => failures.push(json!({
+                Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
                     "error": error.to_string(),
                 })),
-            }
-        }
-
-        if prompts.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "prompts": prompts,
-            "failures": failures,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
+            },
+        )
     }
 
     fn get_prompt(
@@ -5457,11 +5495,132 @@ impl RuntimeMcpState {
             .runtime
             .block_on(self.manager.get_prompt(server_name, name, arguments))
             .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
+        bounded_mcp_tool_json(&json!({
             "server": server_name,
             "prompt": result,
         }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum McpAggregateBucket {
+    Items,
+    Failures,
+}
+
+#[derive(Debug)]
+struct McpAggregateEntry {
+    bucket: McpAggregateBucket,
+    value: Value,
+}
+
+impl McpAggregateEntry {
+    fn item(value: Value) -> Self {
+        Self {
+            bucket: McpAggregateBucket::Items,
+            value,
+        }
+    }
+
+    fn failure(value: Value) -> Self {
+        Self {
+            bucket: McpAggregateBucket::Failures,
+            value,
+        }
+    }
+}
+
+fn bounded_multi_server_mcp_list_json<F>(
+    list_key: &'static str,
+    server_names: Vec<String>,
+    limit_bytes: usize,
+    mut entry_for_server: F,
+) -> Result<String, ToolError>
+where
+    F: FnMut(&str) -> McpAggregateEntry,
+{
+    let total_servers = server_names.len();
+    let mut output = empty_mcp_list_aggregate(list_key, limit_bytes);
+
+    for (index, server_name) in server_names.iter().enumerate() {
+        let entry = entry_for_server(server_name);
+        let mut candidate = output.clone();
+        push_mcp_aggregate_entry(&mut candidate, list_key, entry);
+
+        let mut budget_candidate = candidate.clone();
+        if index + 1 < total_servers {
+            set_mcp_aggregate_truncation(&mut budget_candidate, true, total_servers - index - 1);
+        }
+
+        if serialized_mcp_json_len(&budget_candidate)? > limit_bytes {
+            set_mcp_aggregate_truncation(&mut output, true, total_servers - index);
+            return serialize_mcp_json_with_limit(&output, limit_bytes);
+        }
+
+        output = candidate;
+    }
+
+    serialize_mcp_json_with_limit(&output, limit_bytes)
+}
+
+fn empty_mcp_list_aggregate(list_key: &'static str, limit_bytes: usize) -> Value {
+    let mut object = Map::new();
+    object.insert(list_key.to_string(), Value::Array(Vec::new()));
+    object.insert("failures".to_string(), Value::Array(Vec::new()));
+    object.insert("truncated".to_string(), Value::Bool(false));
+    object.insert("omitted_count".to_string(), json!(0));
+    object.insert("limit_bytes".to_string(), json!(limit_bytes));
+    Value::Object(object)
+}
+
+fn push_mcp_aggregate_entry(output: &mut Value, list_key: &'static str, entry: McpAggregateEntry) {
+    let key = match entry.bucket {
+        McpAggregateBucket::Items => list_key,
+        McpAggregateBucket::Failures => "failures",
+    };
+    output
+        .get_mut(key)
+        .and_then(Value::as_array_mut)
+        .expect("MCP aggregate array should exist")
+        .push(entry.value);
+}
+
+fn set_mcp_aggregate_truncation(output: &mut Value, truncated: bool, omitted_count: usize) {
+    output["truncated"] = Value::Bool(truncated);
+    output["omitted_count"] = json!(omitted_count);
+}
+
+fn serialized_mcp_json_len(value: &Value) -> Result<usize, ToolError> {
+    serde_json::to_string_pretty(value)
+        .map(|output| output.len())
         .map_err(|error| ToolError::new(error.to_string()))
+}
+
+fn serialize_mcp_json_with_limit(value: &Value, limit_bytes: usize) -> Result<String, ToolError> {
+    let output =
+        serde_json::to_string_pretty(value).map_err(|error| ToolError::new(error.to_string()))?;
+    if output.len() > limit_bytes {
+        return Err(ToolError::new(format!(
+            "MCP list output exceeded byte limit after truncation metadata: {} > {limit_bytes}",
+            output.len()
+        )));
+    }
+    Ok(output)
+}
+
+fn bounded_mcp_tool_json(value: &serde_json::Value) -> Result<String, ToolError> {
+    let output =
+        serde_json::to_string_pretty(value).map_err(|error| ToolError::new(error.to_string()))?;
+    if output.len() > CLI_MCP_TOOL_OUTPUT_MAX_BYTES {
+        serde_json::to_string_pretty(&json!({
+            "status": "error",
+            "error": "MCP tool output exceeded byte limit",
+            "limit_bytes": CLI_MCP_TOOL_OUTPUT_MAX_BYTES,
+            "actual_bytes": output.len()
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    } else {
+        Ok(output)
     }
 }
 
@@ -5624,6 +5783,21 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
             name: "ListMcpResourcesTool".to_string(),
             description: Some(
                 "List MCP resources from one configured server or from every connected server."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "ListMcpResourceTemplatesTool".to_string(),
+            description: Some(
+                "List MCP resource templates from one configured server or from every connected server."
                     .to_string(),
             ),
             input_schema: json!({
@@ -11509,6 +11683,14 @@ impl CliToolExecutor {
                     None => mcp_state.list_resources_for_all_servers(),
                 }
             }
+            "ListMcpResourceTemplatesTool" => {
+                let input: ListMcpResourceTemplatesRequest = serde_json::from_value(value)
+                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                match input.server {
+                    Some(server_name) => mcp_state.list_resource_templates_for_server(&server_name),
+                    None => mcp_state.list_resource_templates_for_all_servers(),
+                }
+            }
             "ReadMcpResourceTool" => {
                 let input: ReadMcpResourceRequest = serde_json::from_value(value)
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -16699,6 +16881,8 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let script_arg =
+            serde_json::to_string(&script_path.to_string_lossy()).expect("script path JSON");
         fs::write(
             config_home.join("settings.json"),
             format!(
@@ -16706,7 +16890,7 @@ UU conflicted.rs",
                   "mcpServers": {{
                     "alpha": {{
                       "command": "python3",
-                      "args": ["{}"]
+                      "args": [{}]
                     }},
                     "broken": {{
                       "command": "python3",
@@ -16714,7 +16898,7 @@ UU conflicted.rs",
                     }}
                   }}
                 }}"#,
-                script_path.to_string_lossy()
+                script_arg
             ),
         )
         .expect("write mcp settings");
@@ -16784,17 +16968,27 @@ UU conflicted.rs",
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
 
+        let templates = executor
+            .execute("ListMcpResourceTemplatesTool", r#"{"server":"alpha"}"#)
+            .expect("resource templates should list");
+        let templates_json: serde_json::Value =
+            serde_json::from_str(&templates).expect("template output should be json");
+        assert_eq!(
+            templates_json["resource_templates"][0]["uriTemplate"],
+            "file://logs/{unit}.txt"
+        );
+
         let read = executor
             .execute(
                 "ReadMcpResourceTool",
-                r#"{"server":"alpha","uri":"file://guide.txt"}"#,
+                r#"{"server":"alpha","uri":"file://logs/api.txt"}"#,
             )
             .expect("resource should read");
         let read_json: serde_json::Value =
             serde_json::from_str(&read).expect("resource read output should be json");
         assert_eq!(
             read_json["contents"][0]["text"],
-            "contents for file://guide.txt"
+            "contents for file://logs/api.txt"
         );
 
         let prompts = executor
@@ -16824,6 +17018,66 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn cli_multi_server_resources_json_truncates_with_valid_byte_budget() {
+        let mut queried = Vec::new();
+        let output = super::bounded_multi_server_mcp_list_json(
+            "resources",
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            260,
+            |server| {
+                queried.push(server.to_string());
+                super::McpAggregateEntry::item(json!({
+                    "server": server,
+                    "resources": [{
+                        "uri": format!("file://{server}.txt"),
+                        "description": "x".repeat(512)
+                    }]
+                }))
+            },
+        )
+        .expect("truncated resources JSON should serialize");
+
+        assert_eq!(queried, vec!["alpha"]);
+        assert!(output.len() <= 260);
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["omitted_count"], 3);
+        assert_eq!(value["limit_bytes"], 260);
+        assert!(value["resources"].as_array().is_some_and(Vec::is_empty));
+        assert!(value["failures"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn cli_multi_server_prompts_json_truncates_with_valid_byte_budget() {
+        let mut queried = Vec::new();
+        let output = super::bounded_multi_server_mcp_list_json(
+            "prompts",
+            vec!["alpha".to_string(), "beta".to_string()],
+            240,
+            |server| {
+                queried.push(server.to_string());
+                super::McpAggregateEntry::item(json!({
+                    "server": server,
+                    "prompts": [{
+                        "name": format!("{server}-triage"),
+                        "description": "y".repeat(512)
+                    }]
+                }))
+            },
+        )
+        .expect("truncated prompts JSON should serialize");
+
+        assert_eq!(queried, vec!["alpha"]);
+        assert!(output.len() <= 240);
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["omitted_count"], 2);
+        assert_eq!(value["limit_bytes"], 240);
+        assert!(value["prompts"].as_array().is_some_and(Vec::is_empty));
+        assert!(value["failures"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -17075,22 +17329,14 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "import json, sys",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            "            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(payload + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -17106,7 +17352,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "            'id': request['id'],",
             "            'result': {",
             "                'protocolVersion': request['params']['protocolVersion'],",
-            "                'capabilities': {'tools': {}, 'resources': {}},",
+            "                'capabilities': {'tools': {}, 'resources': {}, 'prompts': {}},",
             "                'serverInfo': {'name': 'fixture', 'version': '1.0.0'}",
             "            }",
             "        })",
@@ -17147,6 +17393,14 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "            'id': request['id'],",
             "            'result': {",
             "                'resources': [{'uri': 'file://guide.txt', 'name': 'guide', 'mimeType': 'text/plain'}]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/templates/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resourceTemplates': [{'uriTemplate': 'file://logs/{unit}.txt', 'name': 'unit-log', 'mimeType': 'text/plain'}]",
             "            }",
             "        })",
             "    elif method == 'resources/read':",

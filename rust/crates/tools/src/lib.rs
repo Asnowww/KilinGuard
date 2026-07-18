@@ -41,7 +41,9 @@ use runtime::{
     Session, SystemPromptProvider, TaskPacket, ToolError, ToolExecutor, WorkspacePathPolicy,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+const MCP_TOOL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -1287,6 +1289,18 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "ListMcpResourceTemplates",
+            description: "List available resource templates from connected MCP servers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "ReadMcpResource",
             description: "Read a specific resource from an MCP server by URI.",
             input_schema: json!({
@@ -1296,6 +1310,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "uri": { "type": "string" }
                 },
                 "required": ["uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ListMcpPrompts",
+            description: "List available prompts from connected MCP servers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "GetMcpPrompt",
+            description: "Get a specific prompt from a connected MCP server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "name": { "type": "string" },
+                    "arguments": {}
+                },
+                "required": ["name"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1789,7 +1830,12 @@ fn execute_tool_with_enforcer(
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
         }
+        "ListMcpResourceTemplates" => {
+            from_value::<McpResourceInput>(input).and_then(run_list_mcp_resource_templates)
+        }
         "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
+        "ListMcpPrompts" => from_value::<McpPromptInput>(input).and_then(run_list_mcp_prompts),
+        "GetMcpPrompt" => from_value::<McpPromptInput>(input).and_then(run_get_mcp_prompt),
         "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
@@ -2249,7 +2295,39 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
     let registry = global_mcp_registry();
-    let server = input.server.as_deref().unwrap_or("default");
+    let Some(server) = input.server.as_deref() else {
+        return bounded_multi_server_mcp_list_json(
+            "resources",
+            registry.server_names(),
+            MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server| match registry.list_resources(server) {
+                Ok(resources) => {
+                    let items: Vec<_> = resources
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "uri": r.uri,
+                                "name": r.name,
+                                "description": r.description,
+                                "mime_type": r.mime_type,
+                            })
+                        })
+                        .collect();
+                    let count = items.len();
+                    McpAggregateEntry::item(json!({
+                        "server": server,
+                        "resources": items,
+                        "count": count
+                    }))
+                }
+                Err(e) => McpAggregateEntry::failure(json!({
+                    "server": server,
+                    "resources": [],
+                    "error": e
+                })),
+            },
+        );
+    };
     match registry.list_resources(server) {
         Ok(resources) => {
             let items: Vec<_> = resources
@@ -2263,15 +2341,80 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
                     })
                 })
                 .collect();
-            to_pretty_json(json!({
+            let count = items.len();
+            to_bounded_mcp_json(json!({
                 "server": server,
                 "resources": items,
-                "count": items.len()
+                "count": count
             }))
         }
-        Err(e) => to_pretty_json(json!({
+        Err(e) => to_bounded_mcp_json(json!({
             "server": server,
             "resources": [],
+            "error": e
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_list_mcp_resource_templates(input: McpResourceInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let Some(server) = input.server.as_deref() else {
+        return bounded_multi_server_mcp_list_json(
+            "resource_templates",
+            registry.server_names(),
+            MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server| match registry.list_resource_templates(server) {
+                Ok(resource_templates) => {
+                    let items: Vec<_> = resource_templates
+                        .iter()
+                        .map(|template| {
+                            json!({
+                                "uri_template": template.uri_template,
+                                "name": template.name,
+                                "description": template.description,
+                                "mime_type": template.mime_type,
+                            })
+                        })
+                        .collect();
+                    let count = items.len();
+                    McpAggregateEntry::item(json!({
+                        "server": server,
+                        "resource_templates": items,
+                        "count": count
+                    }))
+                }
+                Err(e) => McpAggregateEntry::failure(json!({
+                    "server": server,
+                    "resource_templates": [],
+                    "error": e
+                })),
+            },
+        );
+    };
+    match registry.list_resource_templates(server) {
+        Ok(resource_templates) => {
+            let items: Vec<_> = resource_templates
+                .iter()
+                .map(|template| {
+                    json!({
+                        "uri_template": template.uri_template,
+                        "name": template.name,
+                        "description": template.description,
+                        "mime_type": template.mime_type,
+                    })
+                })
+                .collect();
+            let count = items.len();
+            to_bounded_mcp_json(json!({
+                "server": server,
+                "resource_templates": items,
+                "count": count
+            }))
+        }
+        Err(e) => to_bounded_mcp_json(json!({
+            "server": server,
+            "resource_templates": [],
             "error": e
         })),
     }
@@ -2283,16 +2426,96 @@ fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
     let uri = input.uri.as_deref().unwrap_or("");
     let server = input.server.as_deref().unwrap_or("default");
     match registry.read_resource(server, uri) {
-        Ok(resource) => to_pretty_json(json!({
-            "server": server,
-            "uri": resource.uri,
-            "name": resource.name,
-            "description": resource.description,
-            "mime_type": resource.mime_type
-        })),
-        Err(e) => to_pretty_json(json!({
+        Ok(resource) => to_bounded_mcp_json(json!({
             "server": server,
             "uri": uri,
+            "contents": resource.contents,
+            "count": resource.contents.len()
+        })),
+        Err(e) => to_bounded_mcp_json(json!({
+            "server": server,
+            "uri": uri,
+            "error": e
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_list_mcp_prompts(input: McpPromptInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let Some(server) = input.server.as_deref() else {
+        return bounded_multi_server_mcp_list_json(
+            "prompts",
+            registry.server_names(),
+            MCP_TOOL_OUTPUT_MAX_BYTES,
+            |server| match registry.list_prompts(server) {
+                Ok(prompts) => {
+                    let items: Vec<_> = prompts
+                        .iter()
+                        .map(|prompt| {
+                            json!({
+                                "name": prompt.name,
+                                "description": prompt.description,
+                                "arguments": prompt.arguments,
+                            })
+                        })
+                        .collect();
+                    let count = items.len();
+                    McpAggregateEntry::item(json!({
+                        "server": server,
+                        "prompts": items,
+                        "count": count
+                    }))
+                }
+                Err(e) => McpAggregateEntry::failure(json!({
+                    "server": server,
+                    "prompts": [],
+                    "error": e
+                })),
+            },
+        );
+    };
+    match registry.list_prompts(server) {
+        Ok(prompts) => {
+            let items: Vec<_> = prompts
+                .iter()
+                .map(|prompt| {
+                    json!({
+                        "name": prompt.name,
+                        "description": prompt.description,
+                        "arguments": prompt.arguments,
+                    })
+                })
+                .collect();
+            let count = items.len();
+            to_bounded_mcp_json(json!({
+                "server": server,
+                "prompts": items,
+                "count": count
+            }))
+        }
+        Err(e) => to_bounded_mcp_json(json!({
+            "server": server,
+            "prompts": [],
+            "error": e
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_get_mcp_prompt(input: McpPromptInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let server = input.server.as_deref().unwrap_or("default");
+    let name = input.name.as_deref().unwrap_or("");
+    match registry.get_prompt(server, name, input.arguments) {
+        Ok(prompt) => to_bounded_mcp_json(json!({
+            "server": server,
+            "name": name,
+            "prompt": prompt
+        })),
+        Err(e) => to_bounded_mcp_json(json!({
+            "server": server,
+            "name": name,
             "error": e
         })),
     }
@@ -3543,6 +3766,126 @@ fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum McpAggregateBucket {
+    Items,
+    Failures,
+}
+
+#[derive(Debug)]
+struct McpAggregateEntry {
+    bucket: McpAggregateBucket,
+    value: Value,
+}
+
+impl McpAggregateEntry {
+    fn item(value: Value) -> Self {
+        Self {
+            bucket: McpAggregateBucket::Items,
+            value,
+        }
+    }
+
+    fn failure(value: Value) -> Self {
+        Self {
+            bucket: McpAggregateBucket::Failures,
+            value,
+        }
+    }
+}
+
+fn bounded_multi_server_mcp_list_json<F>(
+    list_key: &'static str,
+    server_names: Vec<String>,
+    limit_bytes: usize,
+    mut entry_for_server: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> McpAggregateEntry,
+{
+    let total_servers = server_names.len();
+    let mut output = empty_mcp_list_aggregate(list_key, limit_bytes);
+
+    for (index, server_name) in server_names.iter().enumerate() {
+        let entry = entry_for_server(server_name);
+        let mut candidate = output.clone();
+        push_mcp_aggregate_entry(&mut candidate, list_key, entry);
+
+        let mut budget_candidate = candidate.clone();
+        if index + 1 < total_servers {
+            set_mcp_aggregate_truncation(&mut budget_candidate, true, total_servers - index - 1);
+        }
+
+        if serialized_mcp_json_len(&budget_candidate)? > limit_bytes {
+            set_mcp_aggregate_truncation(&mut output, true, total_servers - index);
+            return serialize_mcp_json_with_limit(&output, limit_bytes);
+        }
+
+        output = candidate;
+    }
+
+    serialize_mcp_json_with_limit(&output, limit_bytes)
+}
+
+fn empty_mcp_list_aggregate(list_key: &'static str, limit_bytes: usize) -> Value {
+    let mut object = Map::new();
+    object.insert(list_key.to_string(), Value::Array(Vec::new()));
+    object.insert("failures".to_string(), Value::Array(Vec::new()));
+    object.insert("truncated".to_string(), Value::Bool(false));
+    object.insert("omitted_count".to_string(), json!(0));
+    object.insert("limit_bytes".to_string(), json!(limit_bytes));
+    Value::Object(object)
+}
+
+fn push_mcp_aggregate_entry(output: &mut Value, list_key: &'static str, entry: McpAggregateEntry) {
+    let key = match entry.bucket {
+        McpAggregateBucket::Items => list_key,
+        McpAggregateBucket::Failures => "failures",
+    };
+    output
+        .get_mut(key)
+        .and_then(Value::as_array_mut)
+        .expect("MCP aggregate array should exist")
+        .push(entry.value);
+}
+
+fn set_mcp_aggregate_truncation(output: &mut Value, truncated: bool, omitted_count: usize) {
+    output["truncated"] = Value::Bool(truncated);
+    output["omitted_count"] = json!(omitted_count);
+}
+
+fn serialized_mcp_json_len(value: &Value) -> Result<usize, String> {
+    serde_json::to_string_pretty(value)
+        .map(|output| output.len())
+        .map_err(|error| error.to_string())
+}
+
+fn serialize_mcp_json_with_limit(value: &Value, limit_bytes: usize) -> Result<String, String> {
+    let output = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    if output.len() > limit_bytes {
+        return Err(format!(
+            "MCP list output exceeded byte limit after truncation metadata: {} > {limit_bytes}",
+            output.len()
+        ));
+    }
+    Ok(output)
+}
+
+fn to_bounded_mcp_json<T: serde::Serialize>(value: T) -> Result<String, String> {
+    let json = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    if json.len() > MCP_TOOL_OUTPUT_MAX_BYTES {
+        serde_json::to_string_pretty(&json!({
+            "status": "error",
+            "error": "MCP tool output exceeded byte limit",
+            "limit_bytes": MCP_TOOL_OUTPUT_MAX_BYTES,
+            "actual_bytes": json.len()
+        }))
+        .map_err(|error| error.to_string())
+    } else {
+        Ok(json)
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
@@ -3822,6 +4165,16 @@ struct McpResourceInput {
     server: Option<String>,
     #[serde(default)]
     uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpPromptInput {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8018,10 +8371,117 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
+        assert!(names.contains(&"ListMcpResources"));
+        assert!(names.contains(&"ListMcpResourceTemplates"));
+        assert!(names.contains(&"ReadMcpResource"));
+        assert!(names.contains(&"ListMcpPrompts"));
+        assert!(names.contains(&"GetMcpPrompt"));
         assert!(names.contains(&"WorkerCreate"));
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
         assert!(names.contains(&"WorkerSendPrompt"));
+    }
+
+    #[test]
+    fn multi_server_resources_json_truncates_with_valid_byte_budget() {
+        let mut queried = Vec::new();
+        let output = super::bounded_multi_server_mcp_list_json(
+            "resources",
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            260,
+            |server| {
+                queried.push(server.to_string());
+                super::McpAggregateEntry::item(json!({
+                    "server": server,
+                    "resources": [{
+                        "uri": format!("file://{server}.txt"),
+                        "description": "x".repeat(512)
+                    }],
+                    "count": 1
+                }))
+            },
+        )
+        .expect("truncated resources JSON should serialize");
+
+        assert_eq!(queried, vec!["alpha"]);
+        assert!(output.len() <= 260);
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["omitted_count"], 3);
+        assert_eq!(value["limit_bytes"], 260);
+        assert!(value["resources"].as_array().is_some_and(Vec::is_empty));
+        assert!(value["failures"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn multi_server_prompts_json_truncates_with_valid_byte_budget() {
+        let mut queried = Vec::new();
+        let output = super::bounded_multi_server_mcp_list_json(
+            "prompts",
+            vec!["alpha".to_string(), "beta".to_string()],
+            240,
+            |server| {
+                queried.push(server.to_string());
+                super::McpAggregateEntry::item(json!({
+                    "server": server,
+                    "prompts": [{
+                        "name": format!("{server}-triage"),
+                        "description": "y".repeat(512)
+                    }],
+                    "count": 1
+                }))
+            },
+        )
+        .expect("truncated prompts JSON should serialize");
+
+        assert_eq!(queried, vec!["alpha"]);
+        assert!(output.len() <= 240);
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["omitted_count"], 2);
+        assert_eq!(value["limit_bytes"], 240);
+        assert!(value["prompts"].as_array().is_some_and(Vec::is_empty));
+        assert!(value["failures"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn list_mcp_resource_templates_tool_returns_registered_templates() {
+        let server_name = format!(
+            "template-server-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let registry = super::global_mcp_registry();
+        registry.register_server_with_catalog(
+            &server_name,
+            runtime::mcp_tool_bridge::McpConnectionStatus::Connected,
+            vec![],
+            vec![],
+            vec![runtime::mcp_tool_bridge::McpResourceTemplateInfo {
+                uri_template: "file://logs/{unit}.txt".to_string(),
+                name: "unit-log".to_string(),
+                description: Some("Unit log".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }],
+            vec![],
+            None,
+        );
+
+        let output = execute_tool(
+            "ListMcpResourceTemplates",
+            &json!({ "server": server_name.clone() }),
+        )
+        .expect("template list should execute");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(
+            value["resource_templates"][0]["uri_template"],
+            "file://logs/{unit}.txt"
+        );
+        assert_eq!(value["count"], 1);
+
+        let _ = registry.disconnect(&server_name);
     }
 
     #[test]

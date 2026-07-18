@@ -113,17 +113,20 @@ pub use mcp_client::{
     McpTransportHealthStatus, McpTransportHealthcheck,
 };
 pub use mcp_lifecycle_hardened::{
-    McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
-    McpLifecycleValidator, McpPhaseResult,
+    McpDegradedCapability, McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
+    McpLifecycleState, McpLifecycleValidator, McpPhaseResult,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    ManagedMcpTool, McpDiscoveryFailure, McpGetPromptParams, McpGetPromptResult,
-    McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-    McpListPromptsParams, McpListPromptsResult, McpListResourcesParams, McpListResourcesResult,
-    McpListToolsParams, McpListToolsResult, McpPrompt, McpPromptArgument, McpPromptMessage,
-    McpReadResourceParams, McpReadResourceResult, McpResource, McpResourceContents,
+    ManagedMcpPrompt, ManagedMcpResource, ManagedMcpResourceTemplate, ManagedMcpTool,
+    McpCapabilityDegradation, McpCapabilityDiscoveryReport, McpCapabilityKind, McpDiscoveryFailure,
+    McpGetPromptParams, McpGetPromptResult, McpInitializeClientInfo, McpInitializeParams,
+    McpInitializeResult, McpInitializeServerInfo, McpListPromptsParams, McpListPromptsResult,
+    McpListResourceTemplatesParams, McpListResourceTemplatesResult, McpListResourcesParams,
+    McpListResourcesResult, McpListToolsParams, McpListToolsResult, McpPrompt, McpPromptArgument,
+    McpPromptMessage, McpReadResourceParams, McpReadResourceResult, McpResource,
+    McpResourceContents, McpResourceTemplate, McpServerCapabilities, McpServerCatalog,
     McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallContent,
     McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };

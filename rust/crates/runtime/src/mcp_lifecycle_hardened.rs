@@ -220,11 +220,24 @@ pub struct McpFailedServer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpDegradedCapability {
+    pub server_name: String,
+    pub phase: McpLifecyclePhase,
+    pub required: bool,
+    pub capability: String,
+    pub method: String,
+    pub reason: String,
+    pub context: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpDegradedReport {
     pub working_servers: Vec<String>,
     pub failed_servers: Vec<McpFailedServer>,
     pub available_tools: Vec<String>,
     pub missing_tools: Vec<String>,
+    #[serde(default)]
+    pub degraded_capabilities: Vec<McpDegradedCapability>,
 }
 
 impl McpDegradedReport {
@@ -249,7 +262,17 @@ impl McpDegradedReport {
             failed_servers,
             available_tools,
             missing_tools,
+            degraded_capabilities: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_degraded_capabilities(
+        mut self,
+        degraded_capabilities: Vec<McpDegradedCapability>,
+    ) -> Self {
+        self.degraded_capabilities = degraded_capabilities;
+        self
     }
 }
 
