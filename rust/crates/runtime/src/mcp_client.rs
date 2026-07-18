@@ -8,7 +8,7 @@ use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS: u64 = 5_000;
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26"];
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpClientTransport {
@@ -124,19 +124,6 @@ impl McpClientBootstrap {
                 heartbeat_timeout_ms: transport.resolved_tool_call_timeout_ms(),
                 message: "stdio MCP transport is handled by the local process manager".to_string(),
             },
-            McpClientTransport::Sse(transport) if transport.url.starts_with("https://") => {
-                McpTransportHealthcheck {
-                    server_name: self.server_name.clone(),
-                    status: McpTransportHealthStatus::Unsupported,
-                    heartbeat_timeout_ms: transport
-                        .heartbeat_timeout_ms
-                        .unwrap_or(DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS),
-                    message: format!(
-                        "SSE MCP endpoint `{}` uses https://, which is unsupported by the minimal runtime SSE client; it will not be counted as a successful remote SSE server",
-                        transport.url
-                    ),
-                }
-            }
             McpClientTransport::Sse(transport) => McpTransportHealthcheck {
                 server_name: self.server_name.clone(),
                 status: McpTransportHealthStatus::Degraded,
@@ -144,8 +131,8 @@ impl McpClientBootstrap {
                     .heartbeat_timeout_ms
                     .unwrap_or(DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS),
                 message: format!(
-                    "SSE MCP endpoint `{}` is configured; runtime will attempt the legacy SSE + POST JSON-RPC transport and surface degraded errors on connection failure",
-                    transport.url
+                    "SSE MCP endpoint at {} is configured; runtime will attempt the legacy SSE + POST JSON-RPC transport over http:// or https:// and surface degraded errors on connection failure",
+                    sanitized_remote_origin(&transport.url)
                 ),
             },
             other => McpTransportHealthcheck {
@@ -156,6 +143,27 @@ impl McpClientBootstrap {
             },
         }
     }
+}
+
+fn sanitized_remote_origin(raw_url: &str) -> String {
+    reqwest::Url::parse(raw_url).map_or_else(
+        |_| "<invalid-url>".to_string(),
+        |url| {
+            let scheme = url.scheme();
+            let Some(host) = url.host_str() else {
+                return format!("{scheme}://<unknown-host>");
+            };
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            url.port_or_known_default().map_or_else(
+                || format!("{scheme}://{host}"),
+                |port| format!("{scheme}://{host}:{port}"),
+            )
+        },
+    )
 }
 
 impl McpClientTransport {
@@ -359,12 +367,12 @@ mod tests {
         let negotiation = bootstrap.negotiate_protocol("2025-03-26", "2025-03-26");
         assert!(negotiation.compatible);
 
-        let older_negotiation = bootstrap.negotiate_protocol("2025-03-26", "2024-11-05");
-        assert!(!older_negotiation.compatible);
+        let legacy_negotiation = bootstrap.negotiate_protocol("2024-11-05", "2024-11-05");
+        assert!(legacy_negotiation.compatible);
     }
 
     #[test]
-    fn https_sse_transport_reports_unsupported_health_model() {
+    fn https_sse_transport_reports_attemptable_health_model() {
         let config = ScopedMcpServerConfig {
             required: false,
             scope: ConfigSource::Project,
@@ -382,9 +390,34 @@ mod tests {
 
         let bootstrap = McpClientBootstrap::from_scoped_config("remote sse", &config);
         let health = bootstrap.healthcheck_model();
-        assert_eq!(health.status, McpTransportHealthStatus::Unsupported);
+        assert_eq!(health.status, McpTransportHealthStatus::Degraded);
         assert!(health.message.contains("https://"));
-        assert!(health.message.contains("unsupported"));
+        assert!(health.message.contains("attempt"));
+    }
+
+    #[test]
+    fn sse_health_model_does_not_echo_url_userinfo() {
+        let config = ScopedMcpServerConfig {
+            required: false,
+            scope: ConfigSource::Project,
+            config: McpServerConfig::Sse(McpRemoteServerConfig {
+                url: "https://user:secret@vendor.example/sse".to_string(),
+                headers: BTreeMap::new(),
+                headers_helper: None,
+                oauth: None,
+                tool_call_timeout_ms: Some(15_000),
+                heartbeat_timeout_ms: Some(2_500),
+                protocol_version: Some("2025-03-26".to_string()),
+                capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
+            }),
+        };
+
+        let bootstrap = McpClientBootstrap::from_scoped_config("remote sse", &config);
+        let health = bootstrap.healthcheck_model();
+        assert_eq!(health.status, McpTransportHealthStatus::Degraded);
+        assert!(health.message.contains("https://vendor.example"));
+        assert!(!health.message.contains("user"));
+        assert!(!health.message.contains("secret"));
     }
 
     #[test]

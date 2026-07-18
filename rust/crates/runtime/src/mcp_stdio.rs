@@ -1,11 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
-use std::io::{Read as StdRead, Write as StdWrite};
-use std::net::TcpStream;
+use std::io::Read as StdRead;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use reqwest::blocking::{Client as ReqwestBlockingClient, Response as ReqwestBlockingResponse};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH,
+    CONTENT_TYPE, TRANSFER_ENCODING,
+};
+use reqwest::redirect;
+use reqwest::{Client as ReqwestAsyncClient, Response as ReqwestAsyncResponse, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -22,7 +28,7 @@ use crate::mcp_client::{
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
-use crate::sse::IncrementalSseParser;
+use crate::sse::SseEvent;
 
 #[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 1_000;
@@ -42,6 +48,12 @@ const MCP_MAX_CATALOG_ITEM_JSON_BYTES: usize = 64 * 1024;
 const MCP_MAX_RESULT_JSON_BYTES: usize = 1024 * 1024;
 const MCP_MAX_RESOURCE_CONTENTS: usize = 64;
 const MCP_MAX_PROMPT_MESSAGES: usize = 128;
+const MCP_SSE_MAX_OPERATION_TIMEOUT_MS: u64 = u32::MAX as u64;
+const MCP_SSE_MAX_URL_BYTES: usize = 8 * 1024;
+const MCP_SSE_MAX_HEADER_BYTES: usize = 16 * 1024;
+const MCP_SSE_MAX_EVENT_BYTES: usize = MCP_MAX_JSONRPC_FRAME_BYTES + 4096;
+const MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const MCP_SSE_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -984,23 +996,7 @@ impl McpServerManager {
         let mut heartbeat = BTreeMap::new();
 
         for (server_name, server_config) in servers {
-            if matches!(server_config.transport(), McpTransport::Sse)
-                && matches!(
-                    &server_config.config,
-                    McpServerConfig::Sse(config) if config.url.starts_with("https://")
-                )
-            {
-                unsupported_servers.push(UnsupportedMcpServer {
-                    server_name: server_name.clone(),
-                    transport: server_config.transport(),
-                    required: server_config.required,
-                    reason: "HTTPS remote SSE is unsupported by the minimal runtime SSE client; only http:// endpoints are eligible".to_string(),
-                });
-                heartbeat.insert(
-                    server_name.clone(),
-                    McpServerHeartbeat::new(server_name.clone(), McpHeartbeatStatus::NotConfigured),
-                );
-            } else if matches!(
+            if matches!(
                 server_config.transport(),
                 McpTransport::Stdio | McpTransport::Sse
             ) {
@@ -1272,6 +1268,15 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(&route.server_name, &response);
+            if let Ok(response) = &response {
+                Self::validate_json_size(
+                    &route.server_name,
+                    "tools/call",
+                    response,
+                    MCP_MAX_RESULT_JSON_BYTES,
+                    "tools/call response JSON",
+                )?;
+            }
             return response;
         }
 
@@ -1626,71 +1631,6 @@ impl McpServerManager {
         Ok(())
     }
 
-    fn legacy_sse_catalog_degradations(
-        &self,
-        catalog: &McpServerCatalog,
-    ) -> Vec<McpCapabilityDegradation> {
-        let Some(server) = self.servers.get(&catalog.server_name) else {
-            return Vec::new();
-        };
-        if !matches!(server.bootstrap.transport, McpClientTransport::Sse(_)) {
-            return Vec::new();
-        }
-
-        let required = server.required;
-        let Some(capabilities) = catalog.capabilities.as_ref() else {
-            return Vec::new();
-        };
-        let mut degradations = Vec::new();
-        if capabilities.resources {
-            degradations.push(Self::legacy_sse_capability_degradation(
-                &catalog.server_name,
-                required,
-                McpCapabilityKind::Resources,
-                "resources/list",
-            ));
-            degradations.push(Self::legacy_sse_capability_degradation(
-                &catalog.server_name,
-                required,
-                McpCapabilityKind::ResourceTemplates,
-                "resources/templates/list",
-            ));
-        }
-        if capabilities.prompts {
-            degradations.push(Self::legacy_sse_capability_degradation(
-                &catalog.server_name,
-                required,
-                McpCapabilityKind::Prompts,
-                "prompts/list",
-            ));
-        }
-        degradations
-    }
-
-    fn legacy_sse_capability_degradation(
-        server_name: &str,
-        required: bool,
-        capability: McpCapabilityKind,
-        method: &'static str,
-    ) -> McpCapabilityDegradation {
-        McpCapabilityDegradation {
-            server_name: server_name.to_string(),
-            phase: lifecycle_phase_for_method(method),
-            required,
-            capability,
-            method,
-            reason: format!(
-                "legacy SSE MCP transport does not support {method} in this runtime client"
-            ),
-            context: BTreeMap::from([
-                ("transport".to_string(), "sse".to_string()),
-                ("method".to_string(), method.to_string()),
-                ("capability".to_string(), capability.as_str().to_string()),
-                ("unsupported".to_string(), "true".to_string()),
-            ]),
-        }
-    }
-
     fn required_for_server(&self, server_name: &str) -> bool {
         self.servers
             .get(server_name)
@@ -1806,6 +1746,63 @@ impl McpServerManager {
         server.catalog.prompts = managed;
         server.catalog.prompts_complete = true;
         Ok(())
+    }
+
+    fn update_sse_catalog_from_discovery(
+        &mut self,
+        server_name: &str,
+        discovery: McpSseCatalogDiscovery,
+    ) -> Result<McpCatalogDiscoveryOutcome, McpServerManagerError> {
+        let capabilities =
+            McpServerCapabilities::from_raw(discovery.initialize_result.capabilities);
+        let tools = discovery.tools;
+        let resources = discovery
+            .resources
+            .into_iter()
+            .map(|resource| ManagedMcpResource {
+                server_name: server_name.to_string(),
+                uri: resource.uri.clone(),
+                resource,
+            })
+            .collect::<Vec<_>>();
+        let resource_templates = discovery
+            .resource_templates
+            .into_iter()
+            .map(|resource_template| ManagedMcpResourceTemplate {
+                server_name: server_name.to_string(),
+                uri_template: resource_template.uri_template.clone(),
+                resource_template,
+            })
+            .collect::<Vec<_>>();
+        let prompts = discovery
+            .prompts
+            .into_iter()
+            .map(|prompt| ManagedMcpPrompt {
+                server_name: server_name.to_string(),
+                name: prompt.name.clone(),
+                prompt,
+            })
+            .collect::<Vec<_>>();
+        let degraded_capabilities = discovery.degraded_capabilities;
+        let catalog = {
+            let server = self.server_mut(server_name)?;
+            server.catalog.server_info = Some(discovery.initialize_result.server_info);
+            server.catalog.capabilities = Some(capabilities);
+            server.catalog.tools = tools;
+            server.catalog.resources = resources;
+            server.catalog.resource_templates = resource_templates;
+            server.catalog.prompts = prompts;
+            server.catalog.tools_complete = discovery.tools_complete;
+            server.catalog.resources_complete = discovery.resources_complete;
+            server.catalog.resource_templates_complete = discovery.resource_templates_complete;
+            server.catalog.prompts_complete = discovery.prompts_complete;
+            server.initialized = true;
+            server.catalog.clone()
+        };
+        Ok(McpCatalogDiscoveryOutcome {
+            catalog,
+            degraded_capabilities,
+        })
     }
 
     async fn ensure_prompt_catalog(
@@ -1997,10 +1994,14 @@ impl McpServerManager {
         server_name: &str,
     ) -> Result<McpServerCatalog, McpServerManagerError> {
         if let Some(transport) = self.sse_transport(server_name)? {
-            let _ = self
-                .discover_sse_tools_for_server_once(server_name, transport)
-                .await?;
-            return self.server_catalog(server_name);
+            return Ok(self
+                .discover_sse_catalog_for_server_once(
+                    server_name,
+                    transport,
+                    SseDiscoveryMode::Strict,
+                )
+                .await?
+                .catalog);
         }
 
         self.ensure_server_ready(server_name).await?;
@@ -2041,15 +2042,13 @@ impl McpServerManager {
         server_name: &str,
     ) -> Result<McpCatalogDiscoveryOutcome, McpServerManagerError> {
         if let Some(transport) = self.sse_transport(server_name)? {
-            let _ = self
-                .discover_sse_tools_for_server_once(server_name, transport)
-                .await?;
-            let catalog = self.server_catalog(server_name)?;
-            let degraded_capabilities = self.legacy_sse_catalog_degradations(&catalog);
-            return Ok(McpCatalogDiscoveryOutcome {
-                catalog,
-                degraded_capabilities,
-            });
+            return self
+                .discover_sse_catalog_for_server_once(
+                    server_name,
+                    transport,
+                    SseDiscoveryMode::BestEffort,
+                )
+                .await;
         }
 
         self.ensure_server_ready(server_name).await?;
@@ -2299,10 +2298,52 @@ impl McpServerManager {
         Ok(discovery.tools)
     }
 
+    async fn discover_sse_catalog_for_server_once(
+        &mut self,
+        server_name: &str,
+        transport: McpRemoteTransport,
+        mode: SseDiscoveryMode,
+    ) -> Result<McpCatalogDiscoveryOutcome, McpServerManagerError> {
+        let request_id = self.take_request_id_block(2 + (MCP_MAX_PAGINATION_PAGES as u64 * 4));
+        let server_name_owned = server_name.to_string();
+        let required = self.required_for_server(server_name);
+        let discovery = tokio::task::spawn_blocking(move || {
+            discover_sse_catalog(&server_name_owned, required, &transport, request_id, mode)
+        })
+        .await
+        .map_err(|error| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse",
+            details: format!("SSE worker task failed: {error}"),
+        })?;
+        self.record_heartbeat_result(server_name, &discovery);
+        let discovery = discovery?;
+        self.update_sse_catalog_from_discovery(server_name, discovery)
+    }
+
     async fn list_resources_once(
         &mut self,
         server_name: &str,
     ) -> Result<McpListResourcesResult, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let request_id = self.take_request_id_block((MCP_MAX_PAGINATION_PAGES + 2) as u64);
+            let server_name_owned = server_name.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                list_sse_resources(&server_name_owned, &transport, request_id)
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "resources/list",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+            self.record_heartbeat_result(server_name, &response);
+            let response = response?;
+            self.update_initialize_catalog(server_name, response.initialize_result)?;
+            self.update_resource_catalog(server_name, response.result.resources.clone())?;
+            return Ok(response.result);
+        }
+
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
 
@@ -2419,6 +2460,28 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<McpListResourceTemplatesResult, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let request_id = self.take_request_id_block((MCP_MAX_PAGINATION_PAGES + 2) as u64);
+            let server_name_owned = server_name.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                list_sse_resource_templates(&server_name_owned, &transport, request_id)
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "resources/templates/list",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+            self.record_heartbeat_result(server_name, &response);
+            let response = response?;
+            self.update_initialize_catalog(server_name, response.initialize_result)?;
+            self.update_resource_template_catalog(
+                server_name,
+                response.result.resource_templates.clone(),
+            )?;
+            return Ok(response.result);
+        }
+
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::ResourceTemplates)?;
 
@@ -2544,6 +2607,25 @@ impl McpServerManager {
         server_name: &str,
         uri: &str,
     ) -> Result<McpReadResourceResult, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let request_id = self.take_request_id_block(3);
+            let server_name_owned = server_name.to_string();
+            let uri = uri.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                read_sse_resource(&server_name_owned, &transport, request_id, uri)
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+            self.record_heartbeat_result(server_name, &response);
+            let response = response?;
+            self.update_initialize_catalog(server_name, response.initialize_result)?;
+            return Ok(response.result);
+        }
+
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
 
@@ -2621,6 +2703,25 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<McpListPromptsResult, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let request_id = self.take_request_id_block((MCP_MAX_PAGINATION_PAGES + 2) as u64);
+            let server_name_owned = server_name.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                list_sse_prompts(&server_name_owned, &transport, request_id)
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "prompts/list",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+            self.record_heartbeat_result(server_name, &response);
+            let response = response?;
+            self.update_initialize_catalog(server_name, response.initialize_result)?;
+            self.update_prompt_catalog(server_name, response.result.prompts.clone())?;
+            return Ok(response.result);
+        }
+
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
 
@@ -2739,6 +2840,27 @@ impl McpServerManager {
         name: &str,
         arguments: Option<JsonValue>,
     ) -> Result<McpGetPromptResult, McpServerManagerError> {
+        if let Some(transport) = self.sse_transport(server_name)? {
+            self.ensure_prompt_catalog(server_name).await?;
+            self.ensure_prompt_known(server_name, name)?;
+            let request_id = self.take_request_id_block(3);
+            let server_name_owned = server_name.to_string();
+            let name = name.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                get_sse_prompt(&server_name_owned, &transport, request_id, name, arguments)
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "prompts/get",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+            self.record_heartbeat_result(server_name, &response);
+            let response = response?;
+            self.update_initialize_catalog(server_name, response.initialize_result)?;
+            return Ok(response.result);
+        }
+
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
         self.ensure_prompt_catalog(server_name).await?;
@@ -3086,42 +3208,68 @@ impl McpServerManager {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedHttpUrl {
-    host: String,
-    port: u16,
-    path: String,
-}
-
 struct McpSseSession {
-    transport: McpRemoteTransport,
-    stream: TcpStream,
-    parser: IncrementalSseParser,
-    post_url: String,
+    server_name: String,
+    post_client: ReqwestBlockingClient,
+    headers: HeaderMap,
+    stream: LimitedSseStream,
+    post_url: Url,
 }
 
 impl McpSseSession {
-    fn connect(transport: McpRemoteTransport, timeout_ms: u64) -> io::Result<Self> {
-        let url = parse_http_url(&transport.url)?;
-        let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
-        stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}\r\n",
-            url.path,
-            url.host,
-            format_http_headers(&transport.headers)
-        );
-        stream.write_all(request.as_bytes())?;
-        let mut session = Self {
-            transport,
+    fn connect(
+        server_name: &str,
+        transport: McpRemoteTransport,
+        timeout_ms: u64,
+    ) -> Result<Self, McpServerManagerError> {
+        validate_sse_operation_timeout(server_name, "sse/connect", timeout_ms)?;
+        let base_url = parse_and_validate_sse_url(server_name, "sse/connect", &transport.url)?;
+        let headers = build_sse_headers(server_name, "sse/connect", &transport.headers)?;
+        let get_runtime =
+            build_sse_get_runtime().map_err(|source| McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "sse/connect",
+                source,
+            })?;
+        let get_client = build_sse_get_client(timeout_ms).map_err(|source| {
+            McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "sse/connect",
+                source,
+            }
+        })?;
+        let post_client = build_sse_post_client(timeout_ms).map_err(|source| {
+            McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "sse/connect",
+                source,
+            }
+        })?;
+        let response = get_runtime
+            .block_on(async {
+                get_client
+                    .get(base_url.clone())
+                    .headers(headers.clone())
+                    .header(ACCEPT, "text/event-stream")
+                    .header(CACHE_CONTROL, "no-cache")
+                    .send()
+                    .await
+            })
+            .map_err(|error| McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "sse/connect",
+                source: reqwest_error_to_io(error),
+            })?;
+        validate_sse_get_response(server_name, response.status(), response.headers())?;
+        let mut stream = LimitedSseStream::new(server_name.to_string(), get_runtime, response);
+        let post_url = read_sse_endpoint_event(server_name, &base_url, &mut stream, timeout_ms)?;
+        Ok(Self {
+            server_name: server_name.to_string(),
+            post_client,
+            headers,
             stream,
-            parser: IncrementalSseParser::new(),
-            post_url: String::new(),
-        };
-        session.read_http_response_headers()?;
-        session.post_url = session.read_endpoint_event(timeout_ms)?;
-        Ok(session)
+            post_url,
+        })
     }
 
     fn request<TParams: Serialize, TResult: DeserializeOwned>(
@@ -3132,13 +3280,7 @@ impl McpSseSession {
         timeout_ms: u64,
     ) -> Result<JsonRpcResponse<TResult>, McpServerManagerError> {
         let request = JsonRpcRequest::new(id.clone(), method, params);
-        self.post_jsonrpc(&request, timeout_ms).map_err(|source| {
-            McpServerManagerError::Transport {
-                server_name: self.transport.url.clone(),
-                method,
-                source,
-            }
-        })?;
+        self.post_jsonrpc(&request, method, timeout_ms)?;
         self.read_response(id, method, timeout_ms)
     }
 
@@ -3149,40 +3291,45 @@ impl McpSseSession {
         timeout_ms: u64,
     ) -> Result<(), McpServerManagerError> {
         let notification = JsonRpcNotification::new(method, params);
-        self.post_jsonrpc(&notification, timeout_ms)
-            .map_err(|source| McpServerManagerError::Transport {
-                server_name: self.transport.url.clone(),
-                method,
-                source,
-            })
+        self.post_jsonrpc(&notification, method, timeout_ms)
     }
 
-    fn post_jsonrpc<T: Serialize>(&self, message: &T, timeout_ms: u64) -> io::Result<()> {
-        let body = serde_json::to_vec(message)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let url = parse_http_url(&self.post_url)?;
-        let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
-        stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
-        let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
-            url.path,
-            url.host,
-            body.len(),
-            format_http_headers(&self.transport.headers)
-        );
-        stream.write_all(request.as_bytes())?;
-        stream.write_all(&body)?;
-        let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
-        let status = String::from_utf8_lossy(&response);
-        if !status.starts_with("HTTP/1.1 2") && !status.starts_with("HTTP/1.0 2") {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("SSE POST endpoint returned non-2xx response: {status}"),
-            ));
+    fn post_jsonrpc<T: Serialize>(
+        &self,
+        message: &T,
+        method: &'static str,
+        timeout_ms: u64,
+    ) -> Result<(), McpServerManagerError> {
+        let body = serde_json::to_vec(message).map_err(|error| {
+            McpServerManagerError::InvalidResponse {
+                server_name: self.server_name.clone(),
+                method,
+                details: format!("failed to serialize JSON-RPC request: {error}"),
+            }
+        })?;
+        if body.len() > MCP_MAX_JSONRPC_FRAME_BYTES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: self.server_name.clone(),
+                method,
+                limit: MCP_MAX_JSONRPC_FRAME_BYTES,
+                details: format!("JSON-RPC request body was {} bytes", body.len()),
+            });
         }
-        Ok(())
+
+        let mut response = self
+            .post_client
+            .post(self.post_url.clone())
+            .headers(self.headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .map_err(|error| McpServerManagerError::Transport {
+                server_name: self.server_name.clone(),
+                method,
+                source: reqwest_error_to_io(error),
+            })?;
+        validate_sse_post_response(&self.server_name, method, &mut response)
     }
 
     fn read_response<TResult: DeserializeOwned>(
@@ -3191,119 +3338,742 @@ impl McpSseSession {
         method: &'static str,
         timeout_ms: u64,
     ) -> Result<JsonRpcResponse<TResult>, McpServerManagerError> {
-        self.stream
-            .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
-            .map_err(|source| McpServerManagerError::Transport {
-                server_name: self.transport.url.clone(),
-                method,
-                source,
-            })?;
-        let mut buffer = [0_u8; 1024];
+        let deadline = sse_operation_deadline(&self.server_name, method, timeout_ms)?;
         loop {
-            let read = self.stream.read(&mut buffer).map_err(|source| {
-                McpServerManagerError::Transport {
-                    server_name: self.transport.url.clone(),
-                    method,
-                    source,
-                }
-            })?;
-            if read == 0 {
+            let event = self.stream.next_event_until(method, deadline, timeout_ms)?;
+            if event.event.as_deref() != Some("message") {
+                continue;
+            }
+            if event.data.trim().is_empty() {
                 return Err(McpServerManagerError::InvalidResponse {
-                    server_name: self.transport.url.clone(),
+                    server_name: self.server_name.clone(),
                     method,
-                    details: "SSE stream ended before JSON-RPC response".to_string(),
+                    details: "empty SSE message event for JSON-RPC response".to_string(),
                 });
             }
-            let chunk = String::from_utf8_lossy(&buffer[..read]);
-            for event in self.parser.push_chunk(&chunk) {
-                if event.data.trim().is_empty() {
-                    continue;
+            if event.data.len() > MCP_MAX_JSONRPC_FRAME_BYTES {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: self.server_name.clone(),
+                    method,
+                    limit: MCP_MAX_JSONRPC_FRAME_BYTES,
+                    details: format!("SSE JSON-RPC response was {} bytes", event.data.len()),
+                });
+            }
+            let value = serde_json::from_str::<JsonValue>(&event.data).map_err(|error| {
+                McpServerManagerError::InvalidResponse {
+                    server_name: self.server_name.clone(),
+                    method,
+                    details: format!("invalid SSE JSON data: {error}"),
                 }
-                let value = serde_json::from_str::<JsonValue>(&event.data).map_err(|error| {
+            })?;
+            if value.get("id").is_none() {
+                continue;
+            }
+            let response =
+                serde_json::from_value::<JsonRpcResponse<TResult>>(value).map_err(|error| {
                     McpServerManagerError::InvalidResponse {
-                        server_name: self.transport.url.clone(),
+                        server_name: self.server_name.clone(),
                         method,
-                        details: format!("invalid SSE JSON data: {error}"),
+                        details: format!("invalid SSE JSON-RPC response: {error}"),
                     }
                 })?;
-                if value.get("id").is_none() {
-                    continue;
-                }
-                let response =
-                    serde_json::from_value::<JsonRpcResponse<TResult>>(value).map_err(|error| {
-                        McpServerManagerError::InvalidResponse {
-                            server_name: self.transport.url.clone(),
-                            method,
-                            details: format!("invalid SSE JSON-RPC response: {error}"),
-                        }
-                    })?;
-                if response.id == id {
-                    return Ok(response);
-                }
+            if response.jsonrpc != "2.0" {
+                return Err(McpServerManagerError::InvalidResponse {
+                    server_name: self.server_name.clone(),
+                    method,
+                    details: format!(
+                        "SSE JSON-RPC response used unsupported jsonrpc version `{}`",
+                        response.jsonrpc
+                    ),
+                });
             }
-        }
-    }
-
-    fn read_http_response_headers(&mut self) -> io::Result<()> {
-        let mut header = Vec::new();
-        let mut byte = [0_u8; 1];
-        while self.stream.read(&mut byte)? == 1 {
-            header.push(byte[0]);
-            if header.ends_with(b"\r\n\r\n") {
-                break;
+            if response.id != id {
+                return Err(McpServerManagerError::InvalidResponse {
+                    server_name: self.server_name.clone(),
+                    method,
+                    details: format!(
+                        "SSE JSON-RPC response used mismatched id: expected {id:?}, got {:?}",
+                        response.id
+                    ),
+                });
             }
-        }
-        let header = String::from_utf8_lossy(&header);
-        if !header.starts_with("HTTP/1.1 2") && !header.starts_with("HTTP/1.0 2") {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("SSE endpoint returned non-2xx response: {header}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_endpoint_event(&mut self, timeout_ms: u64) -> io::Result<String> {
-        self.stream
-            .set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-        let mut buffer = [0_u8; 1024];
-        loop {
-            let read = self.stream.read(&mut buffer)?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "SSE stream ended before endpoint event",
-                ));
-            }
-            let chunk = String::from_utf8_lossy(&buffer[..read]);
-            for event in self.parser.push_chunk(&chunk) {
-                if event.event.as_deref() == Some("endpoint") || event.data.starts_with('/') {
-                    return Ok(resolve_sse_endpoint(
-                        &self.transport.url,
-                        event.data.trim(),
-                    )?);
-                }
-            }
+            return Ok(response);
         }
     }
 }
 
-fn discover_sse_tools(
+struct LimitedSseStream {
+    server_name: String,
+    runtime: tokio::runtime::Runtime,
+    response: ReqwestAsyncResponse,
+    buffer: Vec<u8>,
+    event_name: Option<String>,
+    data_lines: Vec<String>,
+    id: Option<String>,
+    retry: Option<u64>,
+    event_bytes: usize,
+}
+
+impl LimitedSseStream {
+    fn new(
+        server_name: String,
+        runtime: tokio::runtime::Runtime,
+        response: ReqwestAsyncResponse,
+    ) -> Self {
+        Self {
+            server_name,
+            runtime,
+            response,
+            buffer: Vec::new(),
+            event_name: None,
+            data_lines: Vec::new(),
+            id: None,
+            retry: None,
+            event_bytes: 0,
+        }
+    }
+
+    fn next_event_until(
+        &mut self,
+        method: &'static str,
+        deadline: Instant,
+        timeout_ms: u64,
+    ) -> Result<SseEvent, McpServerManagerError> {
+        loop {
+            remaining_sse_operation_time(&self.server_name, method, timeout_ms, deadline)?;
+            if let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line = self.buffer.drain(..=index).collect::<Vec<_>>();
+                self.event_bytes = self.event_bytes.saturating_add(line.len());
+                if self.event_bytes > MCP_SSE_MAX_EVENT_BYTES {
+                    return Err(McpServerManagerError::LimitExceeded {
+                        server_name: self.server_name.clone(),
+                        method,
+                        limit: MCP_SSE_MAX_EVENT_BYTES,
+                        details: "SSE event exceeded byte limit".to_string(),
+                    });
+                }
+                if line.ends_with(b"\n") {
+                    line.pop();
+                }
+                if line.ends_with(b"\r") {
+                    line.pop();
+                }
+                if line.is_empty() {
+                    if let Some(event) = self.take_event() {
+                        self.event_bytes = 0;
+                        return Ok(event);
+                    }
+                    self.event_bytes = 0;
+                    continue;
+                }
+                self.process_line(method, line)?;
+                continue;
+            }
+
+            if self.buffer.len().saturating_add(MCP_SSE_READ_CHUNK_BYTES) > MCP_SSE_MAX_EVENT_BYTES
+            {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: self.server_name.clone(),
+                    method,
+                    limit: MCP_SSE_MAX_EVENT_BYTES,
+                    details: "SSE event line exceeded byte limit before delimiter".to_string(),
+                });
+            }
+            let remaining =
+                remaining_sse_operation_time(&self.server_name, method, timeout_ms, deadline)?;
+            let maybe_chunk = self
+                .runtime
+                .block_on(async { tokio::time::timeout(remaining, self.response.chunk()).await });
+            let maybe_chunk = match maybe_chunk {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(error)) => {
+                    return Err(McpServerManagerError::Transport {
+                        server_name: self.server_name.clone(),
+                        method,
+                        source: reqwest_error_to_io(error),
+                    });
+                }
+                Err(_) => {
+                    return Err(McpServerManagerError::Timeout {
+                        server_name: self.server_name.clone(),
+                        method,
+                        timeout_ms,
+                    });
+                }
+            };
+            let Some(chunk) = maybe_chunk else {
+                return Err(McpServerManagerError::InvalidResponse {
+                    server_name: self.server_name.clone(),
+                    method,
+                    details: "SSE stream ended before expected event".to_string(),
+                });
+            };
+            if chunk.len() > MCP_SSE_MAX_EVENT_BYTES {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: self.server_name.clone(),
+                    method,
+                    limit: MCP_SSE_MAX_EVENT_BYTES,
+                    details: "SSE event read chunk exceeded byte limit".to_string(),
+                });
+            }
+            if self.buffer.len().saturating_add(chunk.len()) > MCP_SSE_MAX_EVENT_BYTES {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: self.server_name.clone(),
+                    method,
+                    limit: MCP_SSE_MAX_EVENT_BYTES,
+                    details: "SSE event buffer exceeded byte limit".to_string(),
+                });
+            }
+            self.buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    fn process_line(
+        &mut self,
+        method: &'static str,
+        line: Vec<u8>,
+    ) -> Result<(), McpServerManagerError> {
+        let line =
+            String::from_utf8(line).map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: self.server_name.clone(),
+                method,
+                details: format!("SSE stream used invalid UTF-8: {error}"),
+            })?;
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map_or((line.as_str(), ""), |(field, value)| {
+                (field, value.strip_prefix(' ').unwrap_or(value))
+            });
+        match field {
+            "event" => self.event_name = Some(value.to_string()),
+            "data" => self.data_lines.push(value.to_string()),
+            "id" => self.id = Some(value.to_string()),
+            "retry" => self.retry = value.parse::<u64>().ok(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn take_event(&mut self) -> Option<SseEvent> {
+        if self.data_lines.is_empty()
+            && self.event_name.is_none()
+            && self.id.is_none()
+            && self.retry.is_none()
+        {
+            return None;
+        }
+        let data = self.data_lines.join("\n");
+        self.data_lines.clear();
+        Some(SseEvent {
+            event: self.event_name.take(),
+            data,
+            id: self.id.take(),
+            retry: self.retry.take(),
+        })
+    }
+}
+
+fn build_sse_get_runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+}
+
+fn build_sse_get_client(timeout_ms: u64) -> io::Result<ReqwestAsyncClient> {
+    let timeout = Duration::from_millis(timeout_ms);
+    ReqwestAsyncClient::builder()
+        .use_rustls_tls()
+        .tls_built_in_native_certs(true)
+        .redirect(redirect::Policy::none())
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .build()
+        .map_err(reqwest_error_to_io)
+}
+
+fn build_sse_post_client(timeout_ms: u64) -> io::Result<ReqwestBlockingClient> {
+    let timeout = Duration::from_millis(timeout_ms);
+    ReqwestBlockingClient::builder()
+        .use_rustls_tls()
+        .tls_built_in_native_certs(true)
+        .redirect(redirect::Policy::none())
+        .connect_timeout(timeout)
+        .build()
+        .map_err(reqwest_error_to_io)
+}
+
+#[cfg(test)]
+fn build_sse_client(timeout_ms: u64) -> io::Result<ReqwestBlockingClient> {
+    build_sse_post_client(timeout_ms)
+}
+
+fn sse_operation_deadline(
+    server_name: &str,
+    method: &'static str,
+    timeout_ms: u64,
+) -> Result<Instant, McpServerManagerError> {
+    validate_sse_operation_timeout(server_name, method, timeout_ms)?;
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!("SSE operation timeout {timeout_ms} ms is too large to represent"),
+        })
+}
+
+fn validate_sse_operation_timeout(
+    server_name: &str,
+    method: &'static str,
+    timeout_ms: u64,
+) -> Result<(), McpServerManagerError> {
+    if timeout_ms == 0 {
+        return Err(McpServerManagerError::Timeout {
+            server_name: server_name.to_string(),
+            method,
+            timeout_ms,
+        });
+    }
+    if timeout_ms > MCP_SSE_MAX_OPERATION_TIMEOUT_MS {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!(
+                "SSE operation timeout {timeout_ms} ms is too large to represent safely"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn remaining_sse_operation_time(
+    server_name: &str,
+    method: &'static str,
+    timeout_ms: u64,
+    deadline: Instant,
+) -> Result<Duration, McpServerManagerError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| McpServerManagerError::Timeout {
+            server_name: server_name.to_string(),
+            method,
+            timeout_ms,
+        })
+}
+
+fn parse_and_validate_sse_url(
+    server_name: &str,
+    method: &'static str,
+    raw_url: &str,
+) -> Result<Url, McpServerManagerError> {
+    if raw_url.len() > MCP_SSE_MAX_URL_BYTES {
+        return Err(McpServerManagerError::LimitExceeded {
+            server_name: server_name.to_string(),
+            method,
+            limit: MCP_SSE_MAX_URL_BYTES,
+            details: format!("SSE URL was {} bytes", raw_url.len()),
+        });
+    }
+    let url = Url::parse(raw_url).map_err(|error| McpServerManagerError::InvalidResponse {
+        server_name: server_name.to_string(),
+        method,
+        details: format!("invalid SSE URL: {error}"),
+    })?;
+    validate_sse_url(server_name, method, url)
+}
+
+fn validate_sse_url(
+    server_name: &str,
+    method: &'static str,
+    url: Url,
+) -> Result<Url, McpServerManagerError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: "SSE URLs must use http:// or https://".to_string(),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: "SSE URLs must not contain userinfo".to_string(),
+        });
+    }
+    if url.fragment().is_some() {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: "SSE URLs must not contain fragments".to_string(),
+        });
+    }
+    Ok(url)
+}
+
+fn build_sse_headers(
+    server_name: &str,
+    method: &'static str,
+    headers: &BTreeMap<String, String>,
+) -> Result<HeaderMap, McpServerManagerError> {
+    let mut total_bytes = 0_usize;
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        total_bytes = total_bytes
+            .saturating_add(name.len())
+            .saturating_add(value.len())
+            .saturating_add(4);
+        if total_bytes > MCP_SSE_MAX_HEADER_BYTES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_SSE_MAX_HEADER_BYTES,
+                details: "SSE custom headers exceeded byte budget".to_string(),
+            });
+        }
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method,
+                details: "SSE custom headers must not contain line breaks".to_string(),
+            });
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method,
+                details: format!("invalid SSE custom header name: {error}"),
+            }
+        })?;
+        if is_blocked_sse_custom_header(&header_name) {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method,
+                details: format!(
+                    "SSE custom header `{}` is reserved by the transport",
+                    header_name.as_str()
+                ),
+            });
+        }
+        let header_value = HeaderValue::from_str(value).map_err(|error| {
+            McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method,
+                details: format!("invalid SSE custom header value: {error}"),
+            }
+        })?;
+        map.insert(header_name, header_value);
+    }
+    Ok(map)
+}
+
+fn is_blocked_sse_custom_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "expect"
+            | "accept"
+            | "content-type"
+            | "cache-control"
+    )
+}
+
+fn validate_sse_get_response(
+    server_name: &str,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> Result<(), McpServerManagerError> {
+    validate_sse_response_header_budget(server_name, "sse/connect", headers)?;
+    if !status.is_success() {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse/connect",
+            details: format!("SSE GET returned non-2xx status {status}"),
+        });
+    }
+    let Some(content_type) = headers.get(CONTENT_TYPE) else {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse/connect",
+            details: "SSE GET response missing Content-Type".to_string(),
+        });
+    };
+    let content_type =
+        content_type
+            .to_str()
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "sse/connect",
+                details: format!("invalid SSE Content-Type header: {error}"),
+            })?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    if !media_type.eq_ignore_ascii_case("text/event-stream") {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse/connect",
+            details: format!("SSE GET Content-Type was `{media_type}`"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sse_post_response(
+    server_name: &str,
+    method: &'static str,
+    response: &mut ReqwestBlockingResponse,
+) -> Result<(), McpServerManagerError> {
+    validate_sse_response_header_budget(server_name, method, response.headers())?;
+    if !response.status().is_success() {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!("SSE POST returned non-2xx status {}", response.status()),
+        });
+    }
+    validate_sse_post_response_framing(server_name, method, response.headers())?;
+    let status = response.status();
+    let body_bytes = read_limited_sse_http_response_body(server_name, method, response)?;
+    if status == reqwest::StatusCode::ACCEPTED && body_bytes != 0 {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: "SSE POST 202 Accepted response must not include a body".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sse_post_response_framing(
+    server_name: &str,
+    method: &'static str,
+    headers: &HeaderMap,
+) -> Result<(), McpServerManagerError> {
+    let has_content_length = headers.get(CONTENT_LENGTH).is_some();
+    let has_transfer_encoding = headers.get(TRANSFER_ENCODING).is_some();
+    if has_content_length
+        || has_transfer_encoding
+        || header_contains_token(headers, CONNECTION, "close")
+    {
+        return Ok(());
+    }
+    Err(McpServerManagerError::InvalidResponse {
+        server_name: server_name.to_string(),
+        method,
+        details: "SSE POST response must use Content-Length, Transfer-Encoding, or Connection: close framing".to_string(),
+    })
+}
+
+fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().ok().is_some_and(|raw| {
+            raw.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+fn validate_sse_response_header_budget(
+    server_name: &str,
+    method: &'static str,
+    headers: &HeaderMap,
+) -> Result<(), McpServerManagerError> {
+    let mut total_bytes = 0_usize;
+    for (name, value) in headers {
+        total_bytes = total_bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(4);
+        if total_bytes > MCP_SSE_MAX_HEADER_BYTES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_SSE_MAX_HEADER_BYTES,
+                details: "SSE response headers exceeded byte budget".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_limited_sse_http_response_body(
+    server_name: &str,
+    method: &'static str,
+    response: &mut ReqwestBlockingResponse,
+) -> Result<usize, McpServerManagerError> {
+    let mut total_bytes = 0_usize;
+    let mut buffer = [0_u8; MCP_SSE_READ_CHUNK_BYTES];
+    loop {
+        let remaining = MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES
+            .saturating_add(1)
+            .saturating_sub(total_bytes);
+        if remaining == 0 {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES,
+                details: "SSE POST response body exceeded byte budget".to_string(),
+            });
+        }
+        let read_len = remaining.min(buffer.len());
+        let read = response.read(&mut buffer[..read_len]).map_err(|source| {
+            McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method,
+                source,
+            }
+        })?;
+        if read == 0 {
+            return Ok(total_bytes);
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        if total_bytes > MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES {
+            return Err(McpServerManagerError::LimitExceeded {
+                server_name: server_name.to_string(),
+                method,
+                limit: MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES,
+                details: "SSE POST response body exceeded byte budget".to_string(),
+            });
+        }
+    }
+}
+
+fn read_sse_endpoint_event(
+    server_name: &str,
+    base_url: &Url,
+    stream: &mut LimitedSseStream,
+    timeout_ms: u64,
+) -> Result<Url, McpServerManagerError> {
+    let deadline = sse_operation_deadline(server_name, "sse/endpoint", timeout_ms)?;
+    loop {
+        let event = stream.next_event_until("sse/endpoint", deadline, timeout_ms)?;
+        if event.event.as_deref() != Some("endpoint") {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "sse/endpoint",
+                details: "first SSE event before JSON-RPC endpoint was not endpoint".to_string(),
+            });
+        }
+        if event.data.trim().is_empty() {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "sse/endpoint",
+                details: "SSE endpoint event had empty data".to_string(),
+            });
+        }
+        return resolve_sse_endpoint(server_name, base_url, event.data.trim());
+    }
+}
+
+fn resolve_sse_endpoint(
+    server_name: &str,
+    base_url: &Url,
+    endpoint: &str,
+) -> Result<Url, McpServerManagerError> {
+    if endpoint.len() > MCP_SSE_MAX_URL_BYTES {
+        return Err(McpServerManagerError::LimitExceeded {
+            server_name: server_name.to_string(),
+            method: "sse/endpoint",
+            limit: MCP_SSE_MAX_URL_BYTES,
+            details: format!("SSE endpoint URL was {} bytes", endpoint.len()),
+        });
+    }
+    let endpoint_url =
+        base_url
+            .join(endpoint)
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "sse/endpoint",
+                details: format!("invalid SSE endpoint URL: {error}"),
+            })?;
+    let endpoint_url = validate_sse_url(server_name, "sse/endpoint", endpoint_url)?;
+    if !same_origin(base_url, &endpoint_url) {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "sse/endpoint",
+            details:
+                "SSE endpoint URL must have the same scheme, host, and effective port as config URL"
+                    .to_string(),
+        });
+    }
+    Ok(endpoint_url)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn reqwest_error_to_io(error: reqwest::Error) -> io::Error {
+    let is_timeout = error.is_timeout();
+    let is_connect = error.is_connect();
+    let status = error.status();
+    let kind = if is_timeout {
+        io::ErrorKind::TimedOut
+    } else if is_connect {
+        io::ErrorKind::ConnectionRefused
+    } else {
+        io::ErrorKind::Other
+    };
+    let safe_error = error.without_url().to_string();
+    let details = if is_timeout {
+        format!("reqwest SSE transport timed out: {safe_error}")
+    } else if is_connect {
+        format!("reqwest SSE connect failed: {safe_error}")
+    } else if let Some(status) = status {
+        format!("reqwest SSE transport failed with HTTP status {status}: {safe_error}")
+    } else {
+        format!("reqwest SSE transport failed: {safe_error}")
+    };
+    io::Error::new(kind, details)
+}
+
+fn jsonrpc_result<T>(
+    server_name: &str,
+    method: &'static str,
+    response: JsonRpcResponse<T>,
+) -> Result<T, McpServerManagerError> {
+    if let Some(error) = response.error {
+        return Err(McpServerManagerError::JsonRpc {
+            server_name: server_name.to_string(),
+            method,
+            error,
+        });
+    }
+    response
+        .result
+        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: "missing result payload".to_string(),
+        })
+}
+
+fn connect_initialized_sse_session(
     server_name: &str,
     transport: &McpRemoteTransport,
     request_id: u64,
-) -> Result<McpSseToolDiscovery, McpServerManagerError> {
-    let timeout_ms = transport
-        .tool_call_timeout_ms
-        .or(transport.heartbeat_timeout_ms)
-        .unwrap_or(MCP_LIST_TOOLS_TIMEOUT_MS);
-    let mut session = McpSseSession::connect(transport.clone(), timeout_ms).map_err(|source| {
-        McpServerManagerError::Transport {
-            server_name: server_name.to_string(),
-            method: "sse/connect",
-            source,
-        }
-    })?;
+    timeout_ms: u64,
+) -> Result<(McpSseSession, McpInitializeResult, McpServerCapabilities), McpServerManagerError> {
+    let mut session = McpSseSession::connect(server_name, transport.clone(), timeout_ms)?;
     let initialize_result =
         initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
     session.notify(
@@ -3312,21 +4082,33 @@ fn discover_sse_tools(
         timeout_ms,
     )?;
     let capabilities = McpServerCapabilities::from_raw(initialize_result.capabilities.clone());
-    if !capabilities.tools {
-        return Ok(McpSseToolDiscovery {
-            initialize_result,
-            tools: Vec::new(),
-        });
-    }
+    Ok((session, initialize_result, capabilities))
+}
 
+fn ping_sse_session(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    session: &mut McpSseSession,
+    request_id: u64,
+    timeout_ms: u64,
+) -> Result<(), McpServerManagerError> {
     let heartbeat_timeout_ms = transport.heartbeat_timeout_ms.unwrap_or(timeout_ms);
-    let _ping = session.request::<_, JsonValue>(
-        JsonRpcId::Number(request_id + 1),
+    let response = session.request::<_, JsonValue>(
+        JsonRpcId::Number(request_id),
         "ping",
         Some(JsonValue::Object(serde_json::Map::new())),
         heartbeat_timeout_ms,
     )?;
+    let _ = jsonrpc_result(server_name, "ping", response)?;
+    Ok(())
+}
 
+fn list_sse_tools_pages(
+    server_name: &str,
+    session: &mut McpSseSession,
+    request_id: u64,
+    timeout_ms: u64,
+) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
     let mut tools = Vec::new();
     let mut cursor = None;
     let mut page_count = 0;
@@ -3335,7 +4117,7 @@ fn discover_sse_tools(
     let mut seen_names = BTreeSet::new();
     loop {
         McpServerManager::validate_page_limit(server_name, "tools/list", page_count)?;
-        let page_request_id = request_id + 2 + page_count as u64;
+        let page_request_id = request_id + page_count as u64;
         page_count += 1;
 
         let list = session.request::<_, McpListToolsResult>(
@@ -3346,20 +4128,7 @@ fn discover_sse_tools(
             }),
             timeout_ms,
         )?;
-        if let Some(error) = list.error {
-            return Err(McpServerManagerError::JsonRpc {
-                server_name: server_name.to_string(),
-                method: "tools/list",
-                error,
-            });
-        }
-        let result = list
-            .result
-            .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                server_name: server_name.to_string(),
-                method: "tools/list",
-                details: "missing result payload".to_string(),
-            })?;
+        let result = jsonrpc_result(server_name, "tools/list", list)?;
 
         let page_json = McpServerManager::json_size(server_name, "tools/list", &result)?;
         McpServerManager::validate_json_size(
@@ -3424,6 +4193,326 @@ fn discover_sse_tools(
         MCP_MAX_RESULT_JSON_BYTES,
         "tools/list aggregate JSON",
     )?;
+    Ok(tools)
+}
+
+fn list_sse_resources_pages(
+    server_name: &str,
+    session: &mut McpSseSession,
+    request_id: u64,
+    timeout_ms: u64,
+) -> Result<McpListResourcesResult, McpServerManagerError> {
+    let mut resources = Vec::new();
+    let mut cursor = None;
+    let mut page_count = 0;
+    let mut total_json_bytes = 0_usize;
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen_uris = BTreeSet::new();
+    loop {
+        McpServerManager::validate_page_limit(server_name, "resources/list", page_count)?;
+        let page_request_id = request_id + page_count as u64;
+        page_count += 1;
+
+        let list = session.request::<_, McpListResourcesResult>(
+            JsonRpcId::Number(page_request_id),
+            "resources/list",
+            Some(McpListResourcesParams {
+                cursor: cursor.clone(),
+            }),
+            timeout_ms,
+        )?;
+        let result = jsonrpc_result(server_name, "resources/list", list)?;
+
+        let page_json = McpServerManager::json_size(server_name, "resources/list", &result)?;
+        McpServerManager::validate_json_size(
+            server_name,
+            "resources/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "resources/list page JSON",
+        )?;
+        total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+        McpServerManager::validate_aggregate_json_size(
+            server_name,
+            "resources/list",
+            total_json_bytes,
+        )?;
+
+        for resource in &result.resources {
+            McpServerManager::validate_json_size(
+                server_name,
+                "resources/list",
+                resource,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "resource catalog item JSON",
+            )?;
+            if !seen_uris.insert(resource.uri.clone()) {
+                return Err(McpServerManager::duplicate_catalog_item(
+                    server_name,
+                    "resources/list",
+                    "resource uri",
+                    &resource.uri,
+                ));
+            }
+        }
+
+        resources.extend(result.resources);
+        McpServerManager::validate_total_items(server_name, "resources/list", resources.len())?;
+
+        match result.next_cursor {
+            Some(next_cursor) => {
+                cursor = Some(McpServerManager::validate_next_cursor(
+                    server_name,
+                    "resources/list",
+                    next_cursor,
+                    &mut seen_cursors,
+                )?);
+            }
+            None => break,
+        }
+    }
+
+    let result = McpListResourcesResult {
+        resources,
+        next_cursor: None,
+    };
+    McpServerManager::validate_json_size(
+        server_name,
+        "resources/list",
+        &result,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "resources/list aggregate JSON",
+    )?;
+    Ok(result)
+}
+
+fn list_sse_resource_templates_pages(
+    server_name: &str,
+    session: &mut McpSseSession,
+    request_id: u64,
+    timeout_ms: u64,
+) -> Result<McpListResourceTemplatesResult, McpServerManagerError> {
+    let mut resource_templates = Vec::new();
+    let mut cursor = None;
+    let mut page_count = 0;
+    let mut total_json_bytes = 0_usize;
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen_templates = BTreeSet::new();
+    loop {
+        McpServerManager::validate_page_limit(server_name, "resources/templates/list", page_count)?;
+        let page_request_id = request_id + page_count as u64;
+        page_count += 1;
+
+        let list = session.request::<_, McpListResourceTemplatesResult>(
+            JsonRpcId::Number(page_request_id),
+            "resources/templates/list",
+            Some(McpListResourceTemplatesParams {
+                cursor: cursor.clone(),
+            }),
+            timeout_ms,
+        )?;
+        let result = jsonrpc_result(server_name, "resources/templates/list", list)?;
+
+        let page_json =
+            McpServerManager::json_size(server_name, "resources/templates/list", &result)?;
+        McpServerManager::validate_json_size(
+            server_name,
+            "resources/templates/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "resources/templates/list page JSON",
+        )?;
+        total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+        McpServerManager::validate_aggregate_json_size(
+            server_name,
+            "resources/templates/list",
+            total_json_bytes,
+        )?;
+
+        for template in &result.resource_templates {
+            McpServerManager::validate_json_size(
+                server_name,
+                "resources/templates/list",
+                template,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "resource template catalog item JSON",
+            )?;
+            if !seen_templates.insert(template.uri_template.clone()) {
+                return Err(McpServerManager::duplicate_catalog_item(
+                    server_name,
+                    "resources/templates/list",
+                    "resource template uriTemplate",
+                    &template.uri_template,
+                ));
+            }
+        }
+
+        resource_templates.extend(result.resource_templates);
+        McpServerManager::validate_total_items(
+            server_name,
+            "resources/templates/list",
+            resource_templates.len(),
+        )?;
+
+        match result.next_cursor {
+            Some(next_cursor) => {
+                cursor = Some(McpServerManager::validate_next_cursor(
+                    server_name,
+                    "resources/templates/list",
+                    next_cursor,
+                    &mut seen_cursors,
+                )?);
+            }
+            None => break,
+        }
+    }
+
+    let result = McpListResourceTemplatesResult {
+        resource_templates,
+        next_cursor: None,
+    };
+    McpServerManager::validate_json_size(
+        server_name,
+        "resources/templates/list",
+        &result,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "resources/templates/list aggregate JSON",
+    )?;
+    Ok(result)
+}
+
+fn list_sse_prompts_pages(
+    server_name: &str,
+    session: &mut McpSseSession,
+    request_id: u64,
+    timeout_ms: u64,
+) -> Result<McpListPromptsResult, McpServerManagerError> {
+    let mut prompts = Vec::new();
+    let mut cursor = None;
+    let mut page_count = 0;
+    let mut total_json_bytes = 0_usize;
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    loop {
+        McpServerManager::validate_page_limit(server_name, "prompts/list", page_count)?;
+        let page_request_id = request_id + page_count as u64;
+        page_count += 1;
+
+        let list = session.request::<_, McpListPromptsResult>(
+            JsonRpcId::Number(page_request_id),
+            "prompts/list",
+            Some(McpListPromptsParams {
+                cursor: cursor.clone(),
+            }),
+            timeout_ms,
+        )?;
+        let result = jsonrpc_result(server_name, "prompts/list", list)?;
+
+        let page_json = McpServerManager::json_size(server_name, "prompts/list", &result)?;
+        McpServerManager::validate_json_size(
+            server_name,
+            "prompts/list",
+            &result,
+            MCP_MAX_RESULT_JSON_BYTES,
+            "prompts/list page JSON",
+        )?;
+        total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+        McpServerManager::validate_aggregate_json_size(
+            server_name,
+            "prompts/list",
+            total_json_bytes,
+        )?;
+
+        for prompt in &result.prompts {
+            McpServerManager::validate_json_size(
+                server_name,
+                "prompts/list",
+                prompt,
+                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                "prompt catalog item JSON",
+            )?;
+            if !seen_names.insert(prompt.name.clone()) {
+                return Err(McpServerManager::duplicate_catalog_item(
+                    server_name,
+                    "prompts/list",
+                    "prompt name",
+                    &prompt.name,
+                ));
+            }
+        }
+
+        prompts.extend(result.prompts);
+        McpServerManager::validate_total_items(server_name, "prompts/list", prompts.len())?;
+
+        match result.next_cursor {
+            Some(next_cursor) => {
+                cursor = Some(McpServerManager::validate_next_cursor(
+                    server_name,
+                    "prompts/list",
+                    next_cursor,
+                    &mut seen_cursors,
+                )?);
+            }
+            None => break,
+        }
+    }
+
+    let result = McpListPromptsResult {
+        prompts,
+        next_cursor: None,
+    };
+    McpServerManager::validate_json_size(
+        server_name,
+        "prompts/list",
+        &result,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "prompts/list aggregate JSON",
+    )?;
+    Ok(result)
+}
+
+struct SseOperationResult<T> {
+    initialize_result: McpInitializeResult,
+    result: T,
+}
+
+fn ensure_sse_capability(
+    server_name: &str,
+    capabilities: &McpServerCapabilities,
+    capability: McpCapabilityKind,
+) -> Result<(), McpServerManagerError> {
+    if capabilities.supports(capability) {
+        Ok(())
+    } else {
+        Err(McpServerManagerError::UnsupportedCapability {
+            server_name: server_name.to_string(),
+            capability,
+        })
+    }
+}
+
+fn discover_sse_tools(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+) -> Result<McpSseToolDiscovery, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    if !capabilities.tools {
+        return Ok(McpSseToolDiscovery {
+            initialize_result,
+            tools: Vec::new(),
+        });
+    }
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let tools = list_sse_tools_pages(server_name, &mut session, request_id + 2, timeout_ms)?;
     Ok(McpSseToolDiscovery {
         initialize_result,
         tools,
@@ -3438,26 +4527,15 @@ fn call_sse_tool(
     arguments: Option<JsonValue>,
     timeout_ms: u64,
 ) -> Result<JsonRpcResponse<McpToolCallResult>, McpServerManagerError> {
-    let mut session = McpSseSession::connect(transport.clone(), timeout_ms).map_err(|source| {
-        McpServerManagerError::Transport {
-            server_name: server_name.to_string(),
-            method: "sse/connect",
-            source,
-        }
-    })?;
-    let _initialize_result =
-        initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
-    session.notify(
-        "notifications/initialized",
-        Some(JsonValue::Object(serde_json::Map::new())),
+    let (mut session, _initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(server_name, &capabilities, McpCapabilityKind::Tools)?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
         timeout_ms,
-    )?;
-    let heartbeat_timeout_ms = transport.heartbeat_timeout_ms.unwrap_or(timeout_ms);
-    let _ping = session.request::<_, JsonValue>(
-        JsonRpcId::Number(request_id + 1),
-        "ping",
-        Some(JsonValue::Object(serde_json::Map::new())),
-        heartbeat_timeout_ms,
     )?;
     session.request(
         JsonRpcId::Number(request_id + 2),
@@ -3471,6 +4549,385 @@ fn call_sse_tool(
     )
 }
 
+fn list_sse_resources(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+) -> Result<SseOperationResult<McpListResourcesResult>, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(server_name, &capabilities, McpCapabilityKind::Resources)?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let result = list_sse_resources_pages(server_name, &mut session, request_id + 2, timeout_ms)?;
+    Ok(SseOperationResult {
+        initialize_result,
+        result,
+    })
+}
+
+fn list_sse_resource_templates(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+) -> Result<SseOperationResult<McpListResourceTemplatesResult>, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(
+        server_name,
+        &capabilities,
+        McpCapabilityKind::ResourceTemplates,
+    )?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let result =
+        list_sse_resource_templates_pages(server_name, &mut session, request_id + 2, timeout_ms)?;
+    Ok(SseOperationResult {
+        initialize_result,
+        result,
+    })
+}
+
+fn read_sse_resource(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+    uri: String,
+) -> Result<SseOperationResult<McpReadResourceResult>, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(server_name, &capabilities, McpCapabilityKind::Resources)?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let response: JsonRpcResponse<McpReadResourceResult> = session.request(
+        JsonRpcId::Number(request_id + 2),
+        "resources/read",
+        Some(McpReadResourceParams { uri }),
+        timeout_ms,
+    )?;
+    let result: McpReadResourceResult = jsonrpc_result(server_name, "resources/read", response)?;
+    if result.contents.len() > MCP_MAX_RESOURCE_CONTENTS {
+        return Err(McpServerManagerError::LimitExceeded {
+            server_name: server_name.to_string(),
+            method: "resources/read",
+            limit: MCP_MAX_RESOURCE_CONTENTS,
+            details: format!(
+                "server returned {} resource contents",
+                result.contents.len()
+            ),
+        });
+    }
+    McpServerManager::validate_json_size(
+        server_name,
+        "resources/read",
+        &result,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "resources/read result JSON",
+    )?;
+    for content in &result.contents {
+        McpServerManager::validate_json_size(
+            server_name,
+            "resources/read",
+            content,
+            MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+            "resource content JSON",
+        )?;
+    }
+    Ok(SseOperationResult {
+        initialize_result,
+        result,
+    })
+}
+
+fn list_sse_prompts(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+) -> Result<SseOperationResult<McpListPromptsResult>, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(server_name, &capabilities, McpCapabilityKind::Prompts)?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let result = list_sse_prompts_pages(server_name, &mut session, request_id + 2, timeout_ms)?;
+    Ok(SseOperationResult {
+        initialize_result,
+        result,
+    })
+}
+
+fn get_sse_prompt(
+    server_name: &str,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+    name: String,
+    arguments: Option<JsonValue>,
+) -> Result<SseOperationResult<McpGetPromptResult>, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    ensure_sse_capability(server_name, &capabilities, McpCapabilityKind::Prompts)?;
+    ping_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id + 1,
+        timeout_ms,
+    )?;
+    let response: JsonRpcResponse<McpGetPromptResult> = session.request(
+        JsonRpcId::Number(request_id + 2),
+        "prompts/get",
+        Some(McpGetPromptParams { name, arguments }),
+        timeout_ms,
+    )?;
+    let result: McpGetPromptResult = jsonrpc_result(server_name, "prompts/get", response)?;
+    if result.messages.len() > MCP_MAX_PROMPT_MESSAGES {
+        return Err(McpServerManagerError::LimitExceeded {
+            server_name: server_name.to_string(),
+            method: "prompts/get",
+            limit: MCP_MAX_PROMPT_MESSAGES,
+            details: format!("server returned {} prompt messages", result.messages.len()),
+        });
+    }
+    McpServerManager::validate_json_size(
+        server_name,
+        "prompts/get",
+        &result,
+        MCP_MAX_RESULT_JSON_BYTES,
+        "prompts/get result JSON",
+    )?;
+    for message in &result.messages {
+        McpServerManager::validate_json_size(
+            server_name,
+            "prompts/get",
+            message,
+            MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+            "prompt message JSON",
+        )?;
+    }
+    Ok(SseOperationResult {
+        initialize_result,
+        result,
+    })
+}
+
+struct McpSseToolDiscovery {
+    initialize_result: McpInitializeResult,
+    tools: Vec<ManagedMcpTool>,
+}
+
+struct McpSseCatalogDiscovery {
+    initialize_result: McpInitializeResult,
+    tools: Vec<ManagedMcpTool>,
+    resources: Vec<McpResource>,
+    resource_templates: Vec<McpResourceTemplate>,
+    prompts: Vec<McpPrompt>,
+    tools_complete: bool,
+    resources_complete: bool,
+    resource_templates_complete: bool,
+    prompts_complete: bool,
+    degraded_capabilities: Vec<McpCapabilityDegradation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseDiscoveryMode {
+    Strict,
+    BestEffort,
+}
+
+impl SseDiscoveryMode {
+    fn best_effort(self) -> bool {
+        matches!(self, Self::BestEffort)
+    }
+}
+
+fn sse_operation_timeout_ms(transport: &McpRemoteTransport) -> u64 {
+    transport
+        .tool_call_timeout_ms
+        .or(transport.heartbeat_timeout_ms)
+        .unwrap_or(MCP_LIST_TOOLS_TIMEOUT_MS)
+}
+
+fn discover_sse_catalog(
+    server_name: &str,
+    required: bool,
+    transport: &McpRemoteTransport,
+    request_id: u64,
+    mode: SseDiscoveryMode,
+) -> Result<McpSseCatalogDiscovery, McpServerManagerError> {
+    let timeout_ms = sse_operation_timeout_ms(transport);
+    let (mut session, initialize_result, capabilities) =
+        connect_initialized_sse_session(server_name, transport, request_id, timeout_ms)?;
+    let mut tools = Vec::new();
+    let mut resources = Vec::new();
+    let mut resource_templates = Vec::new();
+    let mut prompts = Vec::new();
+    let mut tools_complete = true;
+    let mut resources_complete = true;
+    let mut resource_templates_complete = true;
+    let mut prompts_complete = true;
+    let mut degraded_capabilities = Vec::new();
+
+    let should_ping = capabilities.tools || capabilities.resources || capabilities.prompts;
+    if should_ping {
+        ping_sse_session(
+            server_name,
+            transport,
+            &mut session,
+            request_id + 1,
+            timeout_ms,
+        )?;
+    }
+
+    if capabilities.tools {
+        tools = list_sse_tools_pages(server_name, &mut session, request_id + 2, timeout_ms)?;
+    }
+
+    if capabilities.resources {
+        match list_sse_resources_pages(
+            server_name,
+            &mut session,
+            request_id + 2 + MCP_MAX_PAGINATION_PAGES as u64,
+            timeout_ms,
+        ) {
+            Ok(result) => {
+                resources = result.resources;
+                match list_sse_resource_templates_pages(
+                    server_name,
+                    &mut session,
+                    request_id + 2 + (MCP_MAX_PAGINATION_PAGES as u64 * 2),
+                    timeout_ms,
+                ) {
+                    Ok(result) => resource_templates = result.resource_templates,
+                    Err(error)
+                        if McpServerManager::is_method_not_found(
+                            &error,
+                            "resources/templates/list",
+                        ) =>
+                    {
+                        resource_templates.clear();
+                    }
+                    Err(error) if mode.best_effort() => {
+                        resource_templates_complete = false;
+                        degraded_capabilities.push(capability_degradation_for_sse_error(
+                            server_name,
+                            required,
+                            McpCapabilityKind::ResourceTemplates,
+                            "resources/templates/list",
+                            &error,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if mode.best_effort() => {
+                resources_complete = false;
+                resource_templates_complete = false;
+                degraded_capabilities.push(capability_degradation_for_sse_error(
+                    server_name,
+                    required,
+                    McpCapabilityKind::Resources,
+                    "resources/list",
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if capabilities.prompts {
+        match list_sse_prompts_pages(
+            server_name,
+            &mut session,
+            request_id + 2 + (MCP_MAX_PAGINATION_PAGES as u64 * 3),
+            timeout_ms,
+        ) {
+            Ok(result) => prompts = result.prompts,
+            Err(error) if mode.best_effort() => {
+                prompts_complete = false;
+                degraded_capabilities.push(capability_degradation_for_sse_error(
+                    server_name,
+                    required,
+                    McpCapabilityKind::Prompts,
+                    "prompts/list",
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if !capabilities.tools {
+        tools_complete = true;
+    }
+    if !capabilities.resources {
+        resources_complete = true;
+        resource_templates_complete = true;
+    }
+    if !capabilities.prompts {
+        prompts_complete = true;
+    }
+
+    Ok(McpSseCatalogDiscovery {
+        initialize_result,
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        tools_complete,
+        resources_complete,
+        resource_templates_complete,
+        prompts_complete,
+        degraded_capabilities,
+    })
+}
+
+fn capability_degradation_for_sse_error(
+    server_name: &str,
+    required: bool,
+    capability: McpCapabilityKind,
+    method: &'static str,
+    error: &McpServerManagerError,
+) -> McpCapabilityDegradation {
+    let mut context = error.error_context();
+    context.insert("capability".to_string(), capability.as_str().to_string());
+    context.insert("method".to_string(), method.to_string());
+    context.insert("transport".to_string(), "sse".to_string());
+    McpCapabilityDegradation {
+        server_name: server_name.to_string(),
+        phase: lifecycle_phase_for_method(method),
+        required,
+        capability,
+        method,
+        reason: error.to_string(),
+        context,
+    }
+}
+
 fn initialize_sse_session(
     server_name: &str,
     transport: &McpRemoteTransport,
@@ -3481,7 +4938,7 @@ fn initialize_sse_session(
     let requested_protocol_version = transport
         .protocol_version
         .clone()
-        .unwrap_or_else(|| "2025-03-26".to_string());
+        .unwrap_or_else(|| "2024-11-05".to_string());
     let initialize = session.request::<_, McpInitializeResult>(
         JsonRpcId::Number(request_id),
         "initialize",
@@ -3522,50 +4979,6 @@ fn initialize_sse_session(
         });
     }
     Ok(result)
-}
-
-fn parse_http_url(url: &str) -> io::Result<ParsedHttpUrl> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "minimal SSE MCP client only supports http:// endpoints; https:// remains unsupported",
-        ));
-    };
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = authority
-        .split_once(':')
-        .map_or((authority, 80), |(host, port)| {
-            (host, port.parse::<u16>().unwrap_or(80))
-        });
-    Ok(ParsedHttpUrl {
-        host: host.to_string(),
-        port,
-        path: format!("/{}", path),
-    })
-}
-
-fn resolve_sse_endpoint(base_url: &str, endpoint: &str) -> io::Result<String> {
-    if endpoint.starts_with("http://") {
-        return Ok(endpoint.to_string());
-    }
-    let base = parse_http_url(base_url)?;
-    if endpoint.starts_with('/') {
-        Ok(format!("http://{}:{}{}", base.host, base.port, endpoint))
-    } else {
-        Ok(format!("http://{}:{}/{}", base.host, base.port, endpoint))
-    }
-}
-
-fn format_http_headers(headers: &BTreeMap<String, String>) -> String {
-    headers
-        .iter()
-        .map(|(key, value)| format!("{key}: {value}\r\n"))
-        .collect::<String>()
-}
-
-struct McpSseToolDiscovery {
-    initialize_result: McpInitializeResult,
-    tools: Vec<ManagedMcpTool>,
 }
 
 #[derive(Debug)]
@@ -4012,7 +5425,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
     use tokio::io::BufReader;
@@ -4023,15 +5436,19 @@ mod tests {
         McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
     use crate::mcp::mcp_tool_name;
-    use crate::mcp_client::McpClientBootstrap;
+    use crate::mcp_client::{McpClientAuth, McpClientBootstrap, McpRemoteTransport};
 
     use super::{
-        read_limited_jsonrpc_line, spawn_mcp_stdio_process, unsupported_server_failed_server,
-        JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpGetPromptParams, McpHeartbeatStatus,
-        McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-        McpListPromptsParams, McpListResourceTemplatesParams, McpListResourcesParams,
-        McpListToolsParams, McpReadResourceParams, McpReadResourceResult, McpServerManager,
-        McpServerManagerError, McpStdioProcess, McpToolCallParams, MCP_MAX_JSONRPC_FRAME_BYTES,
+        build_sse_client, build_sse_get_client, build_sse_get_runtime, build_sse_headers,
+        parse_and_validate_sse_url, read_limited_jsonrpc_line, resolve_sse_endpoint,
+        spawn_mcp_stdio_process, sse_operation_deadline, unsupported_server_failed_server,
+        validate_sse_get_response, validate_sse_response_header_budget, JsonRpcId, JsonRpcRequest,
+        JsonRpcResponse, McpGetPromptParams, McpHeartbeatStatus, McpInitializeClientInfo,
+        McpInitializeParams, McpInitializeResult, McpInitializeServerInfo, McpListPromptsParams,
+        McpListResourceTemplatesParams, McpListResourcesParams, McpListToolsParams,
+        McpReadResourceParams, McpReadResourceResult, McpServerManager, McpServerManagerError,
+        McpSseSession, McpStdioProcess, McpToolCallParams, MCP_MAX_JSONRPC_FRAME_BYTES,
+        MCP_SSE_MAX_HEADER_BYTES, MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES, MCP_SSE_MAX_URL_BYTES,
     };
     use crate::{McpCapabilityKind, McpLifecyclePhase};
 
@@ -4525,7 +5942,7 @@ mod tests {
         }
     }
 
-    fn read_sse_post_json(stream: &mut TcpStream) -> serde_json::Value {
+    fn read_sse_http_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set read timeout");
@@ -4544,8 +5961,11 @@ mod tests {
                                 .then(|| value.trim().parse::<usize>().ok())
                                 .flatten()
                         });
-                        if content_length.is_some_and(|length| body.as_bytes().len() >= length) {
-                            return serde_json::from_str(body.trim()).expect("json body");
+                        if content_length
+                            .map(|length| body.as_bytes().len() >= length)
+                            .unwrap_or(true)
+                        {
+                            return request.into_owned();
                         }
                     }
                 }
@@ -4557,27 +5977,193 @@ mod tests {
                 Err(error) => panic!("read SSE POST: {error}"),
             }
         }
-        let request = String::from_utf8_lossy(&buffer);
+        String::from_utf8(buffer).expect("utf8 request")
+    }
+
+    fn parse_sse_post_json(request: &str) -> serde_json::Value {
         let body = request
             .split_once("\r\n\r\n")
             .map(|(_, body)| body.trim())
             .unwrap_or("");
-        serde_json::from_str(body).expect("json body")
+        serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("json body from request {request:?}: {error}"))
+    }
+
+    fn read_sse_get_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(
+                        buffer.len() <= 16 * 1024,
+                        "SSE GET request headers exceeded fixture limit"
+                    );
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("read SSE GET: {error}"),
+            }
+        }
+        String::from_utf8(buffer).expect("utf8 request")
+    }
+
+    fn write_sse_headers(stream: &mut TcpStream) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .expect("write SSE headers");
+    }
+
+    fn write_sse_event(stream: &mut TcpStream, event: &str) {
+        let bytes = event.as_bytes();
+        stream
+            .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+            .expect("write SSE chunk length");
+        stream.write_all(bytes).expect("write SSE chunk");
+        stream.write_all(b"\r\n").expect("finish SSE chunk");
+        stream.flush().expect("flush SSE chunk");
+    }
+
+    fn try_write_sse_event(stream: &mut TcpStream, event: &str) -> std::io::Result<()> {
+        let bytes = event.as_bytes();
+        stream.write_all(format!("{:x}\r\n", bytes.len()).as_bytes())?;
+        stream.write_all(bytes)?;
+        stream.write_all(b"\r\n")?;
+        stream.flush()
+    }
+
+    fn write_sse_post_ack(stream: &mut TcpStream) {
+        stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("write SSE POST ack");
+        stream.flush().expect("flush SSE POST ack");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown SSE POST ack");
+    }
+
+    fn write_sse_post_chunked_body(stream: &mut TcpStream, status: &str, body: &[u8]) {
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write SSE POST chunked headers");
+        stream
+            .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+            .expect("write SSE POST chunk length");
+        stream.write_all(body).expect("write SSE POST chunk");
+        stream
+            .write_all(b"\r\n0\r\n\r\n")
+            .expect("finish SSE POST chunked body");
+        stream.flush().expect("flush SSE POST chunked body");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown SSE POST chunked body");
+    }
+
+    fn sse_transport_for_url(
+        url: String,
+        headers: BTreeMap<String, String>,
+        timeout_ms: u64,
+    ) -> McpRemoteTransport {
+        McpRemoteTransport {
+            url,
+            headers,
+            headers_helper: None,
+            auth: McpClientAuth::None,
+            tool_call_timeout_ms: Some(timeout_ms),
+            heartbeat_timeout_ms: Some(timeout_ms),
+            protocol_version: Some("2024-11-05".to_string()),
+            capabilities: json!({}),
+        }
+    }
+
+    fn accept_sse_stream(listener: &TcpListener) -> TcpStream {
+        let (mut sse, _) = listener.accept().expect("accept sse");
+        let request = read_sse_get_request(&mut sse);
+        assert!(request.starts_with("GET "), "expected GET, got {request:?}");
+        write_sse_headers(&mut sse);
+        write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
+        sse
+    }
+
+    fn write_sse_jsonrpc_result(
+        sse: &mut TcpStream,
+        id: serde_json::Value,
+        result: serde_json::Value,
+    ) {
+        let frame = format!(
+            "event: message\ndata: {}\r\n\r\n",
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        );
+        write_sse_event(sse, &frame);
+    }
+
+    fn complete_sse_initialize_and_ping(
+        listener: &TcpListener,
+        methods: &Arc<Mutex<Vec<String>>>,
+        sse: &mut TcpStream,
+        capabilities: serde_json::Value,
+    ) {
+        let (mut initialize, initialize_request) = accept_sse_post(listener, methods, sse);
+        write_sse_post_ack(&mut initialize);
+        write_sse_jsonrpc_result(
+            sse,
+            initialize_request["id"].clone(),
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": capabilities,
+                "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
+            }),
+        );
+
+        let (mut notification, _) = accept_sse_post(listener, methods, sse);
+        write_sse_post_ack(&mut notification);
+
+        let (mut ping, ping_request) = accept_sse_post(listener, methods, sse);
+        write_sse_post_ack(&mut ping);
+        write_sse_jsonrpc_result(sse, ping_request["id"].clone(), json!({}));
     }
 
     fn accept_sse_post(
         listener: &TcpListener,
         methods: &Arc<Mutex<Vec<String>>>,
+        sse: &mut TcpStream,
     ) -> (TcpStream, serde_json::Value) {
-        let (mut post, _) = listener.accept().expect("accept post");
-        let value = read_sse_post_json(&mut post);
-        let method = value
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .expect("method")
-            .to_string();
-        methods.lock().expect("methods lock").push(method);
-        (post, value)
+        loop {
+            let (mut post, _) = listener.accept().expect("accept post");
+            let request = read_sse_http_request(&mut post);
+            if request.starts_with("GET ") {
+                *sse = post;
+                write_sse_headers(sse);
+                write_sse_event(sse, "event: endpoint\ndata: /message\r\n\r\n");
+                continue;
+            }
+            let value = parse_sse_post_json(&request);
+            let method = value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .expect("method")
+                .to_string();
+            methods.lock().expect("methods lock").push(method);
+            return (post, value);
+        }
     }
 
     fn manager_server_config(
@@ -6115,18 +7701,15 @@ mod tests {
         let manager = McpServerManager::from_servers(&servers);
         let unsupported = manager.unsupported_servers();
 
-        assert_eq!(unsupported.len(), 4);
+        assert_eq!(unsupported.len(), 3);
         assert_eq!(unsupported[0].server_name, "http");
         assert!(unsupported[0].required);
-        assert_eq!(unsupported[1].server_name, "https-sse");
-        assert!(unsupported[1]
-            .reason
-            .contains("HTTPS remote SSE is unsupported"));
-        assert_eq!(unsupported[2].server_name, "sdk");
-        assert_eq!(unsupported[3].server_name, "ws");
+        assert_eq!(unsupported[1].server_name, "sdk");
+        assert_eq!(unsupported[2].server_name, "ws");
+        assert!(manager.server_names().contains(&"https-sse".to_string()));
         let heartbeat = manager.heartbeat_report();
         assert!(heartbeat.iter().any(|entry| {
-            entry.server_name == "https-sse" && entry.status == McpHeartbeatStatus::NotConfigured
+            entry.server_name == "https-sse" && entry.status == McpHeartbeatStatus::Unknown
         }));
         let failed = unsupported_server_failed_server(&unsupported[0]);
         assert_eq!(failed.phase, McpLifecyclePhase::ServerRegistration);
@@ -6187,17 +7770,13 @@ mod tests {
         let handle = thread::spawn(move || {
             let methods = Arc::new(Mutex::new(Vec::new()));
             let (mut sse, _) = listener.accept().expect("accept sse");
-            let mut request = [0_u8; 1024];
-            let _ = sse.read(&mut request);
-            sse.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
-            )
-            .expect("write endpoint");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
 
-            let (mut initialize, initialize_request) = accept_sse_post(&listener, &methods);
-            initialize
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("initialize ack");
+            let (mut initialize, initialize_request) =
+                accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut initialize);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6210,23 +7789,20 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write initialize");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut notification, _) = accept_sse_post(&listener, &methods);
-            notification
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("notification ack");
+            let (mut notification, _) = accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut notification);
 
-            let (mut ping, ping_request) = accept_sse_post(&listener, &methods);
-            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("ping ack");
+            let (mut ping, ping_request) = accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut ping);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
             );
-            sse.write_all(frame.as_bytes()).expect("write ping");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut tools, tools_request) = accept_sse_post(&listener, &methods);
+            let (mut tools, tools_request) = accept_sse_post(&listener, &methods, &mut sse);
             assert_eq!(
                 tools_request
                     .get("params")
@@ -6234,9 +7810,7 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 None
             );
-            tools
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("tools ack");
+            write_sse_post_ack(&mut tools);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6253,7 +7827,7 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write tools");
+            write_sse_event(&mut sse, &frame);
         });
 
         let servers = BTreeMap::from([(
@@ -6291,6 +7865,741 @@ mod tests {
     }
 
     #[test]
+    fn http_sse_discovers_three_capabilities_and_invokes_operations() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let capabilities = json!({ "tools": {}, "resources": {}, "prompts": {} });
+
+            let mut sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(
+                &listener,
+                &fixture_methods,
+                &mut sse,
+                capabilities.clone(),
+            );
+            for (expected_method, result) in [
+                (
+                    "tools/list",
+                    json!({
+                        "tools": [{
+                            "name": "inspect",
+                            "description": "Inspect fixture",
+                            "inputSchema": { "type": "object" }
+                        }]
+                    }),
+                ),
+                (
+                    "resources/list",
+                    json!({
+                        "resources": [{
+                            "uri": "file://guide.txt",
+                            "name": "guide",
+                            "mimeType": "text/plain"
+                        }]
+                    }),
+                ),
+                (
+                    "resources/templates/list",
+                    json!({
+                        "resourceTemplates": [{
+                            "uriTemplate": "file://logs/{unit}.txt",
+                            "name": "unit-log"
+                        }]
+                    }),
+                ),
+                (
+                    "prompts/list",
+                    json!({
+                        "prompts": [{
+                            "name": "triage",
+                            "description": "Triage a service",
+                            "arguments": [{"name": "service", "required": true}]
+                        }]
+                    }),
+                ),
+            ] {
+                let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+                assert_eq!(request["method"], expected_method);
+                write_sse_post_ack(&mut post);
+                write_sse_jsonrpc_result(&mut sse, request["id"].clone(), result);
+            }
+
+            let mut sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(
+                &listener,
+                &fixture_methods,
+                &mut sse,
+                capabilities.clone(),
+            );
+            let (mut call, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["params"]["name"], "inspect");
+            write_sse_post_ack(&mut call);
+            write_sse_jsonrpc_result(
+                &mut sse,
+                request["id"].clone(),
+                json!({
+                    "content": [{"type": "text", "text": "inspected"}],
+                    "structuredContent": {"ok": true},
+                    "isError": false
+                }),
+            );
+
+            let mut sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(
+                &listener,
+                &fixture_methods,
+                &mut sse,
+                capabilities.clone(),
+            );
+            let (mut read, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "resources/read");
+            assert_eq!(request["params"]["uri"], "file://logs/api.txt");
+            write_sse_post_ack(&mut read);
+            write_sse_jsonrpc_result(
+                &mut sse,
+                request["id"].clone(),
+                json!({
+                    "contents": [{
+                        "uri": "file://logs/api.txt",
+                        "mimeType": "text/plain",
+                        "text": "api log"
+                    }]
+                }),
+            );
+
+            let mut sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(&listener, &fixture_methods, &mut sse, capabilities);
+            let (mut prompt, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "prompts/get");
+            assert_eq!(request["params"]["name"], "triage");
+            write_sse_post_ack(&mut prompt);
+            write_sse_jsonrpc_result(
+                &mut sse,
+                request["id"].clone(),
+                json!({
+                    "description": "Triage a service",
+                    "messages": [{
+                        "role": "user",
+                        "content": {"type": "text", "text": "triage api"}
+                    }]
+                }),
+            );
+        });
+
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer secret-token".to_string(),
+                    )]),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2024-11-05".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        runtime.block_on(async {
+            let catalogs = manager.discover_catalogs().await.expect("discover catalog");
+            let catalog = &catalogs[0];
+            assert_eq!(catalog.tools.len(), 1);
+            assert_eq!(catalog.resources.len(), 1);
+            assert_eq!(catalog.resource_templates.len(), 1);
+            assert_eq!(catalog.prompts.len(), 1);
+            assert!(catalog.tools_complete);
+            assert!(catalog.resources_complete);
+            assert!(catalog.resource_templates_complete);
+            assert!(catalog.prompts_complete);
+
+            let call = manager
+                .call_tool(
+                    &mcp_tool_name("remote", "inspect"),
+                    Some(json!({"target": "api"})),
+                )
+                .await
+                .expect("call tool")
+                .result
+                .expect("tool result");
+            assert_eq!(call.structured_content, Some(json!({"ok": true})));
+
+            let resource = manager
+                .read_resource("remote", "file://logs/api.txt")
+                .await
+                .expect("read resource");
+            assert_eq!(resource.contents[0].text.as_deref(), Some("api log"));
+
+            let prompt = manager
+                .get_prompt("remote", "triage", Some(json!({"service": "api"})))
+                .await
+                .expect("get prompt");
+            assert_eq!(prompt.messages.len(), 1);
+        });
+
+        handle.join().expect("fixture thread");
+        assert!(methods
+            .lock()
+            .expect("methods lock")
+            .contains(&"resources/templates/list".to_string()));
+    }
+
+    #[test]
+    fn sse_endpoint_rejects_cross_origin_urls_without_blocking_loopback() {
+        let base = reqwest::Url::parse("http://127.0.0.1:8000/sse").expect("base url");
+        let same_origin =
+            resolve_sse_endpoint("remote", &base, "/message").expect("same-origin endpoint");
+        assert_eq!(same_origin.as_str(), "http://127.0.0.1:8000/message");
+
+        let error = resolve_sse_endpoint("remote", &base, "http://127.0.0.1:8001/message")
+            .expect_err("different effective port should be rejected");
+        assert!(error
+            .to_string()
+            .contains("same scheme, host, and effective port"));
+
+        let userinfo = parse_and_validate_sse_url(
+            "remote",
+            "sse/connect",
+            "http://user:pass@127.0.0.1:8000/sse",
+        )
+        .expect_err("userinfo should be rejected");
+        assert!(userinfo.to_string().contains("userinfo"));
+    }
+
+    #[test]
+    fn sse_custom_headers_reject_reserved_names_without_leaking_values() {
+        let allowed = build_sse_headers(
+            "remote",
+            "sse/connect",
+            &BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            )]),
+        )
+        .expect("authorization header should be allowed");
+        assert_eq!(
+            allowed
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret-token")
+        );
+
+        for name in [
+            "Host",
+            "Connection",
+            "Content-Length",
+            "Transfer-Encoding",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Connection",
+            "Proxy-Authorization",
+            "Keep-Alive",
+            "eXpEcT",
+            "Accept",
+            "Content-Type",
+            "Cache-Control",
+        ] {
+            let error = build_sse_headers(
+                "remote",
+                "sse/connect",
+                &BTreeMap::from([(name.to_string(), "secret-token".to_string())]),
+            )
+            .expect_err("reserved SSE transport header should be rejected");
+            let text = error.to_string();
+            assert!(text.contains("reserved"));
+            assert!(!text.contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn sse_limits_reject_bad_content_type_and_oversize_headers_or_urls() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let content_type = validate_sse_get_response("remote", reqwest::StatusCode::OK, &headers)
+            .expect_err("SSE GET content-type must be event-stream");
+        assert!(content_type.to_string().contains("Content-Type"));
+
+        let status = validate_sse_get_response(
+            "remote",
+            reqwest::StatusCode::FOUND,
+            &reqwest::header::HeaderMap::new(),
+        )
+        .expect_err("SSE GET redirect must be a non-2xx failure");
+        assert!(status.to_string().contains("non-2xx status"));
+
+        let mut oversized_response_headers = reqwest::header::HeaderMap::new();
+        oversized_response_headers.insert(
+            reqwest::header::HeaderName::from_static("x-large"),
+            reqwest::header::HeaderValue::from_str(&"x".repeat(MCP_SSE_MAX_HEADER_BYTES + 1))
+                .expect("oversized header value should parse"),
+        );
+        let response_headers = validate_sse_response_header_budget(
+            "remote",
+            "tools/list",
+            &oversized_response_headers,
+        )
+        .expect_err("oversized response headers should be rejected");
+        assert!(response_headers.to_string().contains("limit"));
+
+        let oversized_header = build_sse_headers(
+            "remote",
+            "sse/connect",
+            &BTreeMap::from([(
+                "X-Large".to_string(),
+                "x".repeat(MCP_SSE_MAX_HEADER_BYTES + 1),
+            )]),
+        )
+        .expect_err("oversize headers should be rejected");
+        assert!(oversized_header.to_string().contains("limit"));
+
+        let oversized_url = parse_and_validate_sse_url(
+            "remote",
+            "sse/connect",
+            &format!(
+                "http://example.test/{}",
+                "x".repeat(MCP_SSE_MAX_URL_BYTES + 1)
+            ),
+        )
+        .expect_err("oversize URL should be rejected");
+        assert!(oversized_url.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn sse_redirects_are_not_followed_or_leak_credentials() {
+        for same_origin in [true, false] {
+            let source = TcpListener::bind("127.0.0.1:0").expect("bind source fixture");
+            let source_addr = source.local_addr().expect("source addr");
+            let target = TcpListener::bind("127.0.0.1:0").expect("bind target fixture");
+            let target_addr = target.local_addr().expect("target addr");
+            target
+                .set_nonblocking(true)
+                .expect("target fixture nonblocking");
+            let target_handle = thread::spawn(move || {
+                let start = Instant::now();
+                let mut requests = Vec::new();
+                while start.elapsed() < Duration::from_millis(250) {
+                    match target.accept() {
+                        Ok((mut stream, _)) => requests.push(read_sse_get_request(&mut stream)),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("target accept: {error}"),
+                    }
+                }
+                requests
+            });
+
+            let location = if same_origin {
+                format!("http://{source_addr}/target")
+            } else {
+                format!("http://{target_addr}/target")
+            };
+            let source_handle = thread::spawn(move || {
+                let (mut stream, _) = source.accept().expect("accept source request");
+                let request = read_sse_get_request(&mut stream);
+                assert!(request.starts_with("GET /sse "));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer secret-token"));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write redirect response");
+                stream.flush().expect("flush redirect response");
+                source
+                    .set_nonblocking(true)
+                    .expect("source fixture nonblocking");
+                let start = Instant::now();
+                let mut followups = Vec::new();
+                while start.elapsed() < Duration::from_millis(250) {
+                    match source.accept() {
+                        Ok((mut stream, _)) => followups.push(read_sse_get_request(&mut stream)),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("source follow-up accept: {error}"),
+                    }
+                }
+                followups
+            });
+
+            let error = match McpSseSession::connect(
+                "remote",
+                sse_transport_for_url(
+                    format!("http://{source_addr}/sse"),
+                    BTreeMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer secret-token".to_string(),
+                    )]),
+                    500,
+                ),
+                500,
+            ) {
+                Ok(_) => panic!("SSE redirect should not be followed"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("non-2xx status 302"));
+
+            let source_followups = source_handle.join().expect("source fixture thread");
+            let target_requests = target_handle.join().expect("target fixture thread");
+            assert!(
+                source_followups.is_empty(),
+                "same-origin redirect target must not receive requests or credentials: {source_followups:?}"
+            );
+            assert!(
+                target_requests.is_empty(),
+                "cross-origin redirect target must not receive requests or credentials: {target_requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_get_stream_timeout_is_idle_not_total_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
+            for _ in 0..6 {
+                thread::sleep(Duration::from_millis(120));
+                try_write_sse_event(&mut sse, ": keepalive\r\n\r\n")
+                    .expect("write keepalive before request");
+            }
+            let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "ping");
+            write_sse_post_ack(&mut post);
+            write_sse_jsonrpc_result(&mut sse, request["id"].clone(), json!({}));
+        });
+
+        let mut session = McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 200),
+            200,
+        )
+        .expect("SSE endpoint should connect");
+        thread::sleep(Duration::from_millis(800));
+        session
+            .request::<serde_json::Value, serde_json::Value>(
+                JsonRpcId::Number(77),
+                "ping",
+                None,
+                200,
+            )
+            .expect("active long-lived SSE stream should not hit a total GET lifecycle timeout");
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_endpoint_wait_has_operation_deadline_despite_comments() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(300) {
+                if try_write_sse_event(&mut sse, ": keepalive\r\n\r\n").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+
+        let start = Instant::now();
+        let error = match McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 120),
+            120,
+        ) {
+            Ok(_) => panic!("endpoint comments should not bypass operation timeout"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            McpServerManagerError::Timeout {
+                method: "sse/endpoint",
+                ..
+            }
+        ));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_get_stream_idle_timeout_fails_without_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let error = match McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 100),
+            100,
+        ) {
+            Ok(_) => panic!("idle SSE stream should time out while waiting for endpoint"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timed out"));
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_endpoint_rejects_first_non_comment_event_when_not_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let handle = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept sse");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, ": keepalive\r\n\r\n");
+            write_sse_event(&mut sse, "\r\n");
+            write_sse_event(&mut sse, "event: notice\ndata: {}\r\n\r\n");
+        });
+
+        let error = match McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 500),
+            500,
+        ) {
+            Ok(_) => panic!("first non-comment SSE event must be endpoint"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not endpoint"));
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_post_rejects_chunked_oversized_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let mut sse = accept_sse_stream(&listener);
+            let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "notifications/initialized");
+            let body = vec![b'x'; MCP_SSE_MAX_HTTP_RESPONSE_BODY_BYTES + 1];
+            write_sse_post_chunked_body(&mut post, "202 Accepted", &body);
+        });
+
+        let mut session = McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 500),
+            500,
+        )
+        .expect("connect SSE session");
+        let error = session
+            .notify::<serde_json::Value>("notifications/initialized", None, 500)
+            .expect_err("oversized chunked POST response body should be rejected");
+        assert!(error.to_string().contains("limit"));
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_response_wait_has_operation_deadline_despite_comments_and_notifications() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let mut sse = accept_sse_stream(&listener);
+            let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "ping");
+            write_sse_post_ack(&mut post);
+            let notification = format!(
+                "event: message\ndata: {}\r\n\r\n",
+                json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"tick":1}})
+            );
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(350) {
+                if try_write_sse_event(&mut sse, ": keepalive\r\n\r\n").is_err() {
+                    break;
+                }
+                if try_write_sse_event(&mut sse, &notification).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+
+        let mut session = McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 500),
+            500,
+        )
+        .expect("connect SSE session");
+        let start = Instant::now();
+        let error = session
+            .request::<serde_json::Value, serde_json::Value>(
+                JsonRpcId::Number(123),
+                "ping",
+                None,
+                120,
+            )
+            .expect_err("comments and no-id notifications should not bypass response timeout");
+        assert!(matches!(
+            error,
+            McpServerManagerError::Timeout { method: "ping", .. }
+        ));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn sse_post_rejects_keep_alive_without_response_framing_quickly() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let mut sse = accept_sse_stream(&listener);
+            let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            assert_eq!(request["method"], "notifications/initialized");
+            post.write_all(b"HTTP/1.1 202 Accepted\r\nConnection: keep-alive\r\n\r\n")
+                .expect("write ambiguous keep-alive response");
+            post.flush().expect("flush ambiguous keep-alive response");
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut session = McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(format!("http://{addr}/sse"), BTreeMap::new(), 2_000),
+            2_000,
+        )
+        .expect("connect SSE session");
+        let start = Instant::now();
+        let error = session
+            .notify::<serde_json::Value>("notifications/initialized", None, 2_000)
+            .expect_err("ambiguous keep-alive POST response framing should be rejected");
+        assert!(error.to_string().contains("Content-Length"));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "ambiguous framing should fail before operation timeout"
+        );
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn https_sse_url_is_attemptable_and_reqwest_rustls_client_builds() {
+        let url = parse_and_validate_sse_url("remote", "sse/connect", "https://example.test/sse")
+            .expect("https SSE URL should be accepted");
+        assert_eq!(url.scheme(), "https");
+
+        build_sse_client(1_000).expect("reqwest rustls blocking client should build");
+        build_sse_get_runtime().expect("SSE GET runtime should build");
+        build_sse_get_client(1_000).expect("reqwest rustls async GET client should build");
+    }
+
+    #[test]
+    fn sse_operation_deadline_rejects_zero_and_huge_timeout_without_panic() {
+        let zero = sse_operation_deadline("remote", "tools/list", 0)
+            .expect_err("zero SSE operation timeout should immediately time out");
+        assert!(matches!(
+            zero,
+            McpServerManagerError::Timeout {
+                server_name,
+                method: "tools/list",
+                timeout_ms: 0
+            } if server_name == "remote"
+        ));
+
+        let huge =
+            std::panic::catch_unwind(|| sse_operation_deadline("remote", "tools/list", u64::MAX));
+        let huge = huge.expect("huge SSE operation timeout must not panic");
+        let error = huge.expect_err("huge SSE operation timeout should be rejected structurally");
+        assert!(matches!(
+            error,
+            McpServerManagerError::InvalidResponse {
+                ref server_name,
+                method: "tools/list",
+                ..
+            } if server_name == "remote"
+        ));
+        assert!(error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn sse_connect_timeout_validation_fails_before_network_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("fixture nonblocking");
+        let addr = listener.local_addr().expect("fixture addr");
+        let url = format!("http://{addr}/sse");
+
+        let zero = match McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(url.clone(), BTreeMap::new(), 0),
+            0,
+        ) {
+            Ok(_) => panic!("zero SSE connect timeout should fail before network IO"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            zero,
+            McpServerManagerError::Timeout {
+                server_name,
+                method: "sse/connect",
+                timeout_ms: 0
+            } if server_name == "remote"
+        ));
+
+        let huge = match McpSseSession::connect(
+            "remote",
+            sse_transport_for_url(url, BTreeMap::new(), u64::MAX),
+            u64::MAX,
+        ) {
+            Ok(_) => panic!("huge SSE connect timeout should fail before network IO"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            huge,
+            McpServerManagerError::InvalidResponse {
+                ref server_name,
+                method: "sse/connect",
+                ..
+            } if server_name == "remote"
+        ));
+        assert!(huge.to_string().contains("too large"));
+
+        match listener.accept() {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => panic!("connect timeout validation unexpectedly opened {peer}"),
+            Err(error) => panic!("fixture accept failed: {error}"),
+        }
+    }
+
+    #[test]
     fn legacy_sse_without_object_tools_capability_does_not_request_tools_list() {
         for (label, capabilities) in [
             ("missing", json!({})),
@@ -6303,18 +8612,13 @@ mod tests {
             let fixture_methods = Arc::clone(&methods);
             let handle = thread::spawn(move || {
                 let (mut sse, _) = listener.accept().expect("accept sse");
-                let mut request = [0_u8; 1024];
-                let _ = sse.read(&mut request);
-                sse.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
-                )
-                .expect("write endpoint");
+                let _ = read_sse_get_request(&mut sse);
+                write_sse_headers(&mut sse);
+                write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
 
                 let (mut initialize, initialize_request) =
-                    accept_sse_post(&listener, &fixture_methods);
-                initialize
-                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                    .expect("initialize ack");
+                    accept_sse_post(&listener, &fixture_methods, &mut sse);
+                write_sse_post_ack(&mut initialize);
                 let frame = format!(
                     "event: message\ndata: {}\r\n\r\n",
                     json!({
@@ -6327,12 +8631,10 @@ mod tests {
                         }
                     })
                 );
-                sse.write_all(frame.as_bytes()).expect("write initialize");
+                write_sse_event(&mut sse, &frame);
 
-                let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
-                notification
-                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                    .expect("notification ack");
+                let (mut notification, _) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+                write_sse_post_ack(&mut notification);
             });
 
             let servers = BTreeMap::from([(
@@ -6389,17 +8691,13 @@ mod tests {
         let fixture_methods = Arc::clone(&methods);
         let handle = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept sse");
-            let mut request = [0_u8; 1024];
-            let _ = sse.read(&mut request);
-            sse.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
-            )
-            .expect("write endpoint");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
 
-            let (mut initialize, initialize_request) = accept_sse_post(&listener, &fixture_methods);
-            initialize
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("initialize ack");
+            let (mut initialize, initialize_request) =
+                accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut initialize);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6412,27 +8710,24 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write initialize");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
-            notification
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("notification ack");
+            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut notification);
 
-            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods);
-            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("ping ack");
+            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut ping);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
             );
-            sse.write_all(frame.as_bytes()).expect("write ping");
+            write_sse_event(&mut sse, &frame);
 
             for (expected_cursor, tool_name, next_cursor) in [
                 (None, "inspect", Some("page-2")),
                 (Some("page-2"), "repair", None),
             ] {
-                let (mut post, request) = accept_sse_post(&listener, &fixture_methods);
+                let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
                 assert_eq!(
                     request
                         .get("params")
@@ -6440,8 +8735,7 @@ mod tests {
                         .and_then(serde_json::Value::as_str),
                     expected_cursor
                 );
-                post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                    .expect("tools ack");
+                write_sse_post_ack(&mut post);
                 let frame = format!(
                     "event: message\ndata: {}\r\n\r\n",
                     json!({
@@ -6457,7 +8751,7 @@ mod tests {
                         }
                     })
                 );
-                sse.write_all(frame.as_bytes()).expect("write tools page");
+                write_sse_event(&mut sse, &frame);
             }
         });
 
@@ -6510,17 +8804,13 @@ mod tests {
         let fixture_methods = Arc::clone(&methods);
         let handle = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept sse");
-            let mut request = [0_u8; 1024];
-            let _ = sse.read(&mut request);
-            sse.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
-            )
-            .expect("write endpoint");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
 
-            let (mut initialize, initialize_request) = accept_sse_post(&listener, &fixture_methods);
-            initialize
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("initialize ack");
+            let (mut initialize, initialize_request) =
+                accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut initialize);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6533,26 +8823,22 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write initialize");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods);
-            notification
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("notification ack");
+            let (mut notification, _) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut notification);
 
-            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods);
-            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("ping ack");
+            let (mut ping, ping_request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+            write_sse_post_ack(&mut ping);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
             );
-            sse.write_all(frame.as_bytes()).expect("write ping");
+            write_sse_event(&mut sse, &frame);
 
             for tool_name in ["inspect", "repair"] {
-                let (mut post, request) = accept_sse_post(&listener, &fixture_methods);
-                post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                    .expect("tools ack");
+                let (mut post, request) = accept_sse_post(&listener, &fixture_methods, &mut sse);
+                write_sse_post_ack(&mut post);
                 let frame = format!(
                     "event: message\ndata: {}\r\n\r\n",
                     json!({
@@ -6568,7 +8854,7 @@ mod tests {
                         }
                     })
                 );
-                sse.write_all(frame.as_bytes()).expect("write tools page");
+                write_sse_event(&mut sse, &frame);
             }
         });
 
@@ -6619,17 +8905,13 @@ mod tests {
         let handle = thread::spawn(move || {
             let methods = Arc::new(Mutex::new(Vec::new()));
             let (mut sse, _) = listener.accept().expect("accept sse");
-            let mut request = [0_u8; 1024];
-            let _ = sse.read(&mut request);
-            sse.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\r\n\r\n",
-            )
-            .expect("write endpoint");
+            let _ = read_sse_get_request(&mut sse);
+            write_sse_headers(&mut sse);
+            write_sse_event(&mut sse, "event: endpoint\ndata: /message\r\n\r\n");
 
-            let (mut initialize, initialize_request) = accept_sse_post(&listener, &methods);
-            initialize
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("initialize ack");
+            let (mut initialize, initialize_request) =
+                accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut initialize);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6646,26 +8928,21 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write initialize");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut notification, _) = accept_sse_post(&listener, &methods);
-            notification
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("notification ack");
+            let (mut notification, _) = accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut notification);
 
-            let (mut ping, ping_request) = accept_sse_post(&listener, &methods);
-            ping.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("ping ack");
+            let (mut ping, ping_request) = accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut ping);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({"jsonrpc":"2.0","id":ping_request["id"].clone(),"result":{}})
             );
-            sse.write_all(frame.as_bytes()).expect("write ping");
+            write_sse_event(&mut sse, &frame);
 
-            let (mut tools, tools_request) = accept_sse_post(&listener, &methods);
-            tools
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
-                .expect("tools ack");
+            let (mut tools, tools_request) = accept_sse_post(&listener, &methods, &mut sse);
+            write_sse_post_ack(&mut tools);
             let frame = format!(
                 "event: message\ndata: {}\r\n\r\n",
                 json!({
@@ -6682,7 +8959,7 @@ mod tests {
                     }
                 })
             );
-            sse.write_all(frame.as_bytes()).expect("write tools");
+            write_sse_event(&mut sse, &frame);
         });
 
         let servers = BTreeMap::from([(
@@ -6728,19 +9005,12 @@ mod tests {
         assert!(!catalog.resources_complete);
         assert!(!catalog.resource_templates_complete);
         assert!(!catalog.prompts_complete);
-        assert_eq!(report.degraded_capabilities.len(), 3);
+        assert_eq!(report.degraded_capabilities.len(), 2);
         assert!(report
             .degraded_capabilities
             .iter()
             .any(|degradation| degradation.method == "resources/list"
                 && degradation.capability == McpCapabilityKind::Resources));
-        assert!(report
-            .degraded_capabilities
-            .iter()
-            .any(
-                |degradation| degradation.method == "resources/templates/list"
-                    && degradation.capability == McpCapabilityKind::ResourceTemplates
-            ));
         assert!(report
             .degraded_capabilities
             .iter()
