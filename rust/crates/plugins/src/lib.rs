@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,9 @@ const BUILTIN_OPS_PLACEHOLDER_COMMAND: &str = "__claw_builtin_ops_placeholder__"
 const BUILTIN_OPS_EXECUTOR_COMMAND: &str = "__claw_builtin_ops_executor__";
 const PLUGIN_TOOL_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 30_000;
+pub const PLUGIN_HOT_RELOAD_DEADLINE_MS: u64 = 3_000;
+const PLUGIN_COMMAND_MAX_ARGS: usize = 32;
+const PLUGIN_COMMAND_MAX_ARG_BYTES: usize = 4096;
 const PLUGIN_CHILD_POLL_MS: u64 = 25;
 const MIN_PLUGIN_MCP_TIMEOUT_MS: u64 = 1;
 const MAX_PLUGIN_MCP_TIMEOUT_MS: u64 = 300_000;
@@ -1992,6 +1996,7 @@ pub struct BuiltinPlugin {
     permissions: Vec<PluginPermission>,
     permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
+    commands: Vec<PluginCommandManifest>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
     capabilities: PluginCapabilities,
@@ -2011,6 +2016,7 @@ pub struct BundledPlugin {
     permissions: Vec<PluginPermission>,
     permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
+    commands: Vec<PluginCommandManifest>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
     capabilities: PluginCapabilities,
@@ -2030,6 +2036,7 @@ pub struct ExternalPlugin {
     permissions: Vec<PluginPermission>,
     permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
+    commands: Vec<PluginCommandManifest>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
     capabilities: PluginCapabilities,
@@ -2048,6 +2055,7 @@ pub trait Plugin {
     fn permissions(&self) -> &[PluginPermission];
     fn permission_declarations(&self) -> &[PluginPermissionDeclaration];
     fn tools(&self) -> &[PluginTool];
+    fn commands(&self) -> &[PluginCommandManifest];
     fn resources(&self) -> &[PluginResourceManifest];
     fn prompts(&self) -> &[PluginPromptManifest];
     fn capabilities(&self) -> &PluginCapabilities;
@@ -2058,7 +2066,9 @@ pub trait Plugin {
     fn ops_permissions(&self) -> &[PluginOpsPermission];
     fn validate(&self) -> Result<(), PluginError>;
     fn initialize(&self) -> Result<(), PluginError>;
+    fn initialize_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError>;
     fn shutdown(&self) -> Result<(), PluginError>;
+    fn shutdown_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2097,6 +2107,10 @@ impl Plugin for BuiltinPlugin {
         &self.tools
     }
 
+    fn commands(&self) -> &[PluginCommandManifest] {
+        &self.commands
+    }
+
     fn resources(&self) -> &[PluginResourceManifest] {
         &self.resources
     }
@@ -2137,7 +2151,15 @@ impl Plugin for BuiltinPlugin {
         Ok(())
     }
 
+    fn initialize_with_deadline(&self, _deadline: Option<Instant>) -> Result<(), PluginError> {
+        Ok(())
+    }
+
     fn shutdown(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn shutdown_with_deadline(&self, _deadline: Option<Instant>) -> Result<(), PluginError> {
         Ok(())
     }
 }
@@ -2171,6 +2193,10 @@ impl Plugin for BundledPlugin {
         &self.tools
     }
 
+    fn commands(&self) -> &[PluginCommandManifest] {
+        &self.commands
+    }
+
     fn resources(&self) -> &[PluginResourceManifest] {
         &self.resources
     }
@@ -2206,10 +2232,15 @@ impl Plugin for BundledPlugin {
     fn validate(&self) -> Result<(), PluginError> {
         validate_hook_paths(self.metadata.root.as_deref(), &self.hooks)?;
         validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)?;
+        validate_command_manifest_paths(self.metadata.root.as_deref(), &self.commands)?;
         validate_tool_paths(self.metadata.root.as_deref(), &self.tools)
     }
 
     fn initialize(&self) -> Result<(), PluginError> {
+        self.initialize_with_deadline(None)
+    }
+
+    fn initialize_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
         run_lifecycle_commands(
             self.metadata(),
             self.lifecycle(),
@@ -2217,10 +2248,15 @@ impl Plugin for BundledPlugin {
             self.permissions(),
             "init",
             &self.lifecycle.init,
+            deadline,
         )
     }
 
     fn shutdown(&self) -> Result<(), PluginError> {
+        self.shutdown_with_deadline(None)
+    }
+
+    fn shutdown_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
         run_lifecycle_commands(
             self.metadata(),
             self.lifecycle(),
@@ -2228,6 +2264,7 @@ impl Plugin for BundledPlugin {
             self.permissions(),
             "shutdown",
             &self.lifecycle.shutdown,
+            deadline,
         )
     }
 }
@@ -2261,6 +2298,10 @@ impl Plugin for ExternalPlugin {
         &self.tools
     }
 
+    fn commands(&self) -> &[PluginCommandManifest] {
+        &self.commands
+    }
+
     fn resources(&self) -> &[PluginResourceManifest] {
         &self.resources
     }
@@ -2296,10 +2337,15 @@ impl Plugin for ExternalPlugin {
     fn validate(&self) -> Result<(), PluginError> {
         validate_hook_paths(self.metadata.root.as_deref(), &self.hooks)?;
         validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)?;
+        validate_command_manifest_paths(self.metadata.root.as_deref(), &self.commands)?;
         validate_tool_paths(self.metadata.root.as_deref(), &self.tools)
     }
 
     fn initialize(&self) -> Result<(), PluginError> {
+        self.initialize_with_deadline(None)
+    }
+
+    fn initialize_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
         run_lifecycle_commands(
             self.metadata(),
             self.lifecycle(),
@@ -2307,10 +2353,15 @@ impl Plugin for ExternalPlugin {
             self.permissions(),
             "init",
             &self.lifecycle.init,
+            deadline,
         )
     }
 
     fn shutdown(&self) -> Result<(), PluginError> {
+        self.shutdown_with_deadline(None)
+    }
+
+    fn shutdown_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
         run_lifecycle_commands(
             self.metadata(),
             self.lifecycle(),
@@ -2318,6 +2369,7 @@ impl Plugin for ExternalPlugin {
             self.permissions(),
             "shutdown",
             &self.lifecycle.shutdown,
+            deadline,
         )
     }
 }
@@ -2362,6 +2414,14 @@ impl Plugin for PluginDefinition {
             Self::Builtin(plugin) => plugin.tools(),
             Self::Bundled(plugin) => plugin.tools(),
             Self::External(plugin) => plugin.tools(),
+        }
+    }
+
+    fn commands(&self) -> &[PluginCommandManifest] {
+        match self {
+            Self::Builtin(plugin) => plugin.commands(),
+            Self::Bundled(plugin) => plugin.commands(),
+            Self::External(plugin) => plugin.commands(),
         }
     }
 
@@ -2469,11 +2529,27 @@ impl Plugin for PluginDefinition {
         }
     }
 
+    fn initialize_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
+        match self {
+            Self::Builtin(plugin) => plugin.initialize_with_deadline(deadline),
+            Self::Bundled(plugin) => plugin.initialize_with_deadline(deadline),
+            Self::External(plugin) => plugin.initialize_with_deadline(deadline),
+        }
+    }
+
     fn shutdown(&self) -> Result<(), PluginError> {
         match self {
             Self::Builtin(plugin) => plugin.shutdown(),
             Self::Bundled(plugin) => plugin.shutdown(),
             Self::External(plugin) => plugin.shutdown(),
+        }
+    }
+
+    fn shutdown_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
+        match self {
+            Self::Builtin(plugin) => plugin.shutdown_with_deadline(deadline),
+            Self::Bundled(plugin) => plugin.shutdown_with_deadline(deadline),
+            Self::External(plugin) => plugin.shutdown_with_deadline(deadline),
         }
     }
 }
@@ -2506,6 +2582,11 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn tools(&self) -> &[PluginTool] {
         self.definition.tools()
+    }
+
+    #[must_use]
+    pub fn commands(&self) -> &[PluginCommandManifest] {
+        self.definition.commands()
     }
 
     #[must_use]
@@ -2561,8 +2642,16 @@ impl RegisteredPlugin {
         self.definition.initialize()
     }
 
+    pub fn initialize_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
+        self.definition.initialize_with_deadline(deadline)
+    }
+
     pub fn shutdown(&self) -> Result<(), PluginError> {
         self.definition.shutdown()
+    }
+
+    pub fn shutdown_with_deadline(&self, deadline: Option<Instant>) -> Result<(), PluginError> {
+        self.definition.shutdown_with_deadline(deadline)
     }
 
     #[must_use]
@@ -2622,6 +2711,7 @@ pub struct PluginPermissionDeclarationStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PluginActualSurfaces {
     pub tools: usize,
+    pub commands: usize,
     pub resources: usize,
     pub prompts: usize,
     pub mcp_servers: usize,
@@ -2959,6 +3049,32 @@ impl PluginRegistry {
         Ok(tools)
     }
 
+    pub fn aggregated_commands(&self) -> Result<Vec<PluginCommandManifest>, PluginError> {
+        let mut commands = Vec::new();
+        let mut seen_names = BTreeMap::new();
+        for plugin_id in self.dependency_order()? {
+            let plugin = self.get(&plugin_id).ok_or_else(|| {
+                PluginError::InvalidManifest(format!(
+                    "dependency order referenced missing plugin `{plugin_id}`"
+                ))
+            })?;
+            plugin.validate()?;
+            for command in plugin.commands() {
+                if let Some(existing_plugin) =
+                    seen_names.insert(command.name.clone(), plugin.metadata().id.clone())
+                {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin command `{}` is defined by both `{existing_plugin}` and `{}`",
+                        command.name,
+                        plugin.metadata().id
+                    )));
+                }
+                commands.push(command.clone());
+            }
+        }
+        Ok(commands)
+    }
+
     pub fn aggregated_resources(&self) -> Result<Vec<PluginResourceManifest>, PluginError> {
         let mut resources = Vec::new();
         let mut seen_uris = BTreeMap::new();
@@ -3046,14 +3162,26 @@ impl PluginRegistry {
 
     pub fn initialize(&self) -> Result<(), PluginError> {
         let order = self.dependency_order()?;
+        let mut initialized = Vec::<String>::new();
         for plugin_id in order {
             let plugin = self.get(&plugin_id).ok_or_else(|| {
                 PluginError::InvalidManifest(format!(
                     "dependency order referenced missing plugin `{plugin_id}`"
                 ))
             })?;
-            plugin.validate()?;
-            plugin.initialize()?;
+            let result = plugin.validate().and_then(|()| plugin.initialize());
+            if let Err(error) = result {
+                let rollback_error = self.shutdown_plugins_by_id(initialized.into_iter().rev());
+                return match rollback_error {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(PluginError::CommandFailed(format!(
+                        "{}; initialized plugin rollback also failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&rollback_error.to_string())
+                    ))),
+                };
+            }
+            initialized.push(plugin_id);
         }
         Ok(())
     }
@@ -3061,15 +3189,37 @@ impl PluginRegistry {
     pub fn shutdown(&self) -> Result<(), PluginError> {
         let mut order = self.dependency_order()?;
         order.reverse();
+        self.shutdown_plugins_by_id(order)
+    }
+
+    fn shutdown_plugins_by_id<I>(&self, order: I) -> Result<(), PluginError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut errors = Vec::new();
         for plugin_id in order {
             let plugin = self.get(&plugin_id).ok_or_else(|| {
                 PluginError::InvalidManifest(format!(
                     "dependency order referenced missing plugin `{plugin_id}`"
                 ))
             })?;
-            plugin.shutdown()?;
+            if let Err(error) = plugin.shutdown() {
+                errors.push(format!(
+                    "{}: {}",
+                    plugin_id,
+                    sanitize_plugin_error(&error.to_string())
+                ));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(PluginError::CommandFailed(format!(
+                "plugin shutdown failed for {} plugin(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
 
     pub fn validate_registration_conflicts(&self) -> Result<(), PluginError> {
@@ -3088,6 +3238,1106 @@ impl PluginRegistry {
         }
         Ok(())
     }
+
+    fn without_plugin(&self, plugin_id: &str) -> Self {
+        Self::new(
+            self.plugins
+                .iter()
+                .filter(|plugin| plugin.metadata().id != plugin_id)
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRuntimeStatus {
+    pub generation: u64,
+    pub phase: String,
+    pub plugin_count: usize,
+    pub tool_count: usize,
+    pub command_count: usize,
+    pub hook_count: usize,
+    pub resource_count: usize,
+    pub prompt_count: usize,
+    pub mcp_server_count: usize,
+    pub blocked_plugins: Vec<String>,
+    pub in_flight: BTreeMap<String, usize>,
+    pub last_operation: Option<String>,
+    pub last_error: Option<String>,
+    pub degraded_plugins: Vec<PluginRuntimeDegradation>,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRuntimeDegradation {
+    pub plugin_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug)]
+pub struct PreparedPluginRuntimeReplace {
+    accepted_registry: PluginRegistry,
+    changed_plugins: BTreeSet<String>,
+    degraded_plugins: Vec<PluginRuntimeDegradation>,
+    base_generation: u64,
+}
+
+impl PreparedPluginRuntimeReplace {
+    #[must_use]
+    pub fn accepted_registry(&self) -> &PluginRegistry {
+        &self.accepted_registry
+    }
+
+    #[must_use]
+    pub fn base_generation(&self) -> u64 {
+        self.base_generation
+    }
+}
+
+pub trait PluginRuntimeSupervisor {
+    fn prepare_hot_replace_registry(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PreparedPluginRuntimeReplace, PluginError>;
+
+    fn commit_prepared_hot_replace(
+        &self,
+        prepared: PreparedPluginRuntimeReplace,
+    ) -> Result<PluginRuntimeStatus, PluginError>;
+
+    fn hot_replace_registry(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PluginRuntimeStatus, PluginError>;
+    fn hot_unload_plugin(&self, plugin_id: &str) -> Result<PluginRuntimeStatus, PluginError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginHotLoadOutcome {
+    pub plugin_id: String,
+    pub version: String,
+    pub install_path: PathBuf,
+    pub runtime_status: PluginRuntimeStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginHotUnloadOutcome {
+    pub plugin_id: String,
+    pub runtime_status: PluginRuntimeStatus,
+}
+
+impl PluginRuntimeStatus {
+    fn from_inner(inner: &PluginRuntimeInner) -> Self {
+        let snapshot = inner.snapshot.as_ref();
+        let (tool_count, command_count, resource_count, prompt_count, mcp_server_count) =
+            runtime_capability_counts(snapshot);
+        Self {
+            generation: inner.generation,
+            phase: inner.phase.clone(),
+            plugin_count: snapshot.plugins.len(),
+            tool_count,
+            command_count,
+            hook_count: runtime_hook_count(snapshot),
+            resource_count,
+            prompt_count,
+            mcp_server_count,
+            blocked_plugins: inner.blocked_plugins.iter().cloned().collect(),
+            in_flight: inner.in_flight.clone(),
+            last_operation: inner.last_operation.clone(),
+            last_error: inner.last_error.clone(),
+            degraded_plugins: inner.degraded_plugins.clone(),
+            deadline_ms: PLUGIN_HOT_RELOAD_DEADLINE_MS,
+        }
+    }
+}
+
+fn runtime_status_with_cleanup_warning(
+    mut status: PluginRuntimeStatus,
+    cleanup_warning: Option<String>,
+) -> PluginRuntimeStatus {
+    if let Some(warning) = cleanup_warning {
+        status.phase = "degraded".to_string();
+        status.last_error = Some(match status.last_error.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {warning}"),
+            _ => warning,
+        });
+    }
+    status
+}
+
+#[derive(Debug)]
+struct PluginRuntimeInner {
+    snapshot: Arc<PluginRegistry>,
+    generation: u64,
+    phase: String,
+    mutating: bool,
+    blocked_plugins: BTreeSet<String>,
+    in_flight: BTreeMap<String, usize>,
+    last_operation: Option<String>,
+    last_error: Option<String>,
+    degraded_plugins: Vec<PluginRuntimeDegradation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeRegistry {
+    inner: Arc<(Mutex<PluginRuntimeInner>, Condvar)>,
+}
+
+impl PluginRuntimeRegistry {
+    #[must_use]
+    pub fn new(registry: PluginRegistry) -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(PluginRuntimeInner {
+                    snapshot: Arc::new(registry),
+                    generation: 0,
+                    phase: "ready".to_string(),
+                    mutating: false,
+                    blocked_plugins: BTreeSet::new(),
+                    in_flight: BTreeMap::new(),
+                    last_operation: None,
+                    last_error: None,
+                    degraded_plugins: Vec::new(),
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<PluginRegistry> {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .clone()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> PluginRuntimeStatus {
+        let (lock, _) = &*self.inner;
+        let inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PluginRuntimeStatus::from_inner(&inner)
+    }
+
+    pub fn execute_tool(&self, tool_name: &str, input: &Value) -> Result<String, PluginError> {
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tool = inner
+            .snapshot
+            .aggregated_tools()?
+            .into_iter()
+            .find(|tool| tool.definition().name == tool_name)
+            .ok_or_else(|| PluginError::NotFound(format!("plugin tool `{tool_name}` not found")))?;
+        let plugin_id = tool.plugin_id().to_string();
+        if inner.blocked_plugins.contains(&plugin_id) {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin `{plugin_id}` is unloading; new calls are blocked"
+            )));
+        }
+        *inner.in_flight.entry(plugin_id.clone()).or_default() += 1;
+        drop(inner);
+
+        let result = tool.execute(input);
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = inner.in_flight.get_mut(&plugin_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.in_flight.remove(&plugin_id);
+            }
+        }
+        cvar.notify_all();
+        result
+    }
+
+    pub fn command_specs(&self) -> Result<Vec<PluginCommandManifest>, PluginError> {
+        self.snapshot().aggregated_commands()
+    }
+
+    pub fn execute_command(
+        &self,
+        command_name: &str,
+        args: &[String],
+    ) -> Result<String, PluginError> {
+        validate_plugin_command_args(args)?;
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (plugin, command) = find_runtime_command(inner.snapshot.as_ref(), command_name)?;
+        let plugin_id = plugin.metadata().id.clone();
+        if inner.blocked_plugins.contains(&plugin_id) {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin `{plugin_id}` is unloading; new calls are blocked"
+            )));
+        }
+        *inner.in_flight.entry(plugin_id.clone()).or_default() += 1;
+        drop(inner);
+
+        let result = execute_registered_command(&plugin, &command, args);
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = inner.in_flight.get_mut(&plugin_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.in_flight.remove(&plugin_id);
+            }
+        }
+        cvar.notify_all();
+        result
+    }
+
+    pub fn hot_replace(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        self.hot_replace_with_timeout(
+            registry,
+            Duration::from_millis(PLUGIN_HOT_RELOAD_DEADLINE_MS),
+        )
+    }
+
+    pub fn hot_replace_with_timeout(
+        &self,
+        registry: PluginRegistry,
+        timeout: Duration,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        let prepared = self.prepare_hot_replace_with_timeout(registry, timeout)?;
+        self.commit_prepared_hot_replace_with_timeout(prepared, timeout)
+    }
+
+    pub fn prepare_hot_replace(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PreparedPluginRuntimeReplace, PluginError> {
+        self.prepare_hot_replace_with_timeout(
+            registry,
+            Duration::from_millis(PLUGIN_HOT_RELOAD_DEADLINE_MS),
+        )
+    }
+
+    pub fn prepare_hot_replace_with_timeout(
+        &self,
+        registry: PluginRegistry,
+        timeout: Duration,
+    ) -> Result<PreparedPluginRuntimeReplace, PluginError> {
+        let deadline = hot_reload_deadline(timeout)?;
+        let requested_snapshot = Arc::new(registry);
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner = wait_for_runtime_mutation_slot(inner, cvar, deadline)?;
+        let old_snapshot = inner.snapshot.clone();
+        let base_generation = inner.generation;
+        drop(inner);
+
+        let (prepared_registry, degradations) =
+            prepare_runtime_snapshot(old_snapshot.as_ref(), requested_snapshot.as_ref());
+        let changed_plugins = changed_enabled_plugins(old_snapshot.as_ref(), &prepared_registry);
+
+        if let Err(error) =
+            validate_hot_reload_allowed(old_snapshot.as_ref(), &prepared_registry, &changed_plugins)
+        {
+            return Err(error);
+        }
+
+        validate_runtime_snapshot(&prepared_registry)?;
+
+        Ok(PreparedPluginRuntimeReplace {
+            accepted_registry: prepared_registry,
+            changed_plugins,
+            degraded_plugins: degradations,
+            base_generation,
+        })
+    }
+
+    pub fn commit_prepared_hot_replace(
+        &self,
+        prepared: PreparedPluginRuntimeReplace,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        self.commit_prepared_hot_replace_with_timeout(
+            prepared,
+            Duration::from_millis(PLUGIN_HOT_RELOAD_DEADLINE_MS),
+        )
+    }
+
+    pub fn commit_prepared_hot_replace_with_timeout(
+        &self,
+        prepared: PreparedPluginRuntimeReplace,
+        timeout: Duration,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        let deadline = hot_reload_deadline(timeout)?;
+        let new_snapshot = Arc::new(prepared.accepted_registry);
+        let changed_plugins = prepared.changed_plugins;
+        let degradations = prepared.degraded_plugins;
+        let base_generation = prepared.base_generation;
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner = wait_for_runtime_mutation_slot(inner, cvar, deadline)?;
+        if inner.generation != base_generation {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin hot reload token generation mismatch: prepared at generation {base_generation}, current generation {}",
+                inner.generation
+            )));
+        }
+        inner.mutating = true;
+        inner.phase = "loading".to_string();
+        inner.last_operation = Some("hot_replace".to_string());
+        inner.last_error = None;
+        inner.degraded_plugins = degradations.clone();
+        let old_snapshot = inner.snapshot.clone();
+
+        inner
+            .blocked_plugins
+            .extend(changed_plugins.iter().cloned());
+        inner = match wait_for_runtime_in_flight(inner, cvar, &changed_plugins, deadline) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let mut inner = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                finish_runtime_mutation(
+                    &mut inner,
+                    cvar,
+                    "degraded",
+                    Some(sanitize_plugin_error(&error.to_string())),
+                );
+                return Err(error);
+            }
+        };
+        drop(inner);
+
+        let mut initialized = Vec::<RegisteredPlugin>::new();
+        let initialize_result = initialize_changed_plugins(
+            old_snapshot.as_ref(),
+            new_snapshot.as_ref(),
+            &changed_plugins,
+            deadline,
+            &mut initialized,
+        );
+        if let Err(error) = initialize_result {
+            for plugin in initialized.into_iter().rev() {
+                let _ = plugin.shutdown_with_deadline(Some(deadline));
+            }
+            let mut inner = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            finish_runtime_mutation(
+                &mut inner,
+                cvar,
+                "degraded",
+                Some(sanitize_plugin_error(&error.to_string())),
+            );
+            return Err(error);
+        }
+
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.snapshot = new_snapshot.clone();
+        inner.generation = inner.generation.saturating_add(1);
+        inner.blocked_plugins.clear();
+        let phase = if inner.degraded_plugins.is_empty() {
+            "ready"
+        } else {
+            "degraded"
+        };
+        let quarantine_error = (!inner.degraded_plugins.is_empty()).then(|| {
+            format!(
+                "quarantined {} plugin(s) during hot reload",
+                inner.degraded_plugins.len()
+            )
+        });
+        finish_runtime_mutation(&mut inner, cvar, phase, quarantine_error);
+        let status = PluginRuntimeStatus::from_inner(&inner);
+        drop(inner);
+
+        let shutdown_error =
+            shutdown_replaced_plugins(old_snapshot.as_ref(), &changed_plugins, Some(deadline));
+        if let Some(error) = shutdown_error {
+            let mut inner = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.phase = "degraded".to_string();
+            inner.last_error = Some(error);
+            return Ok(PluginRuntimeStatus::from_inner(&inner));
+        }
+        Ok(status)
+    }
+
+    pub fn hot_unload(&self, plugin_id: &str) -> Result<PluginRuntimeStatus, PluginError> {
+        self.hot_unload_with_timeout(
+            plugin_id,
+            Duration::from_millis(PLUGIN_HOT_RELOAD_DEADLINE_MS),
+        )
+    }
+
+    pub fn hot_unload_with_timeout(
+        &self,
+        plugin_id: &str,
+        timeout: Duration,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        let deadline = hot_reload_deadline(timeout)?;
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner = wait_for_runtime_mutation_slot(inner, cvar, deadline)?;
+        inner.mutating = true;
+        inner.phase = "unloading".to_string();
+        inner.last_operation = Some(format!("hot_unload:{plugin_id}"));
+        inner.last_error = None;
+        inner.degraded_plugins.clear();
+        let Some(plugin) = inner.snapshot.get(plugin_id).cloned() else {
+            finish_runtime_mutation(&mut inner, cvar, "ready", None);
+            return Ok(PluginRuntimeStatus::from_inner(&inner));
+        };
+        inner.blocked_plugins.insert(plugin_id.to_string());
+        if !plugin.capabilities().hot_reload {
+            let error = PluginError::CommandFailed(format!(
+                "plugin `{plugin_id}` does not declare capabilities.hotReload=true; online unload is refused"
+            ));
+            finish_runtime_mutation(
+                &mut inner,
+                cvar,
+                "degraded",
+                Some(sanitize_plugin_error(&error.to_string())),
+            );
+            return Err(error);
+        }
+        let dependents = runtime_dependents_of(inner.snapshot.as_ref(), plugin_id);
+        if !dependents.is_empty() {
+            let error = PluginError::CommandFailed(format!(
+                "plugin `{plugin_id}` cannot be hot-unloaded because enabled dependents remain: {}",
+                dependents.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+            finish_runtime_mutation(
+                &mut inner,
+                cvar,
+                "degraded",
+                Some(sanitize_plugin_error(&error.to_string())),
+            );
+            return Err(error);
+        }
+        let remaining_snapshot = inner.snapshot.without_plugin(plugin_id);
+        if let Err(error) = validate_runtime_snapshot(&remaining_snapshot) {
+            finish_runtime_mutation(
+                &mut inner,
+                cvar,
+                "degraded",
+                Some(sanitize_plugin_error(&error.to_string())),
+            );
+            return Err(error);
+        }
+        let mut ids = BTreeSet::new();
+        ids.insert(plugin_id.to_string());
+        inner = match wait_for_runtime_in_flight(inner, cvar, &ids, deadline) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let mut inner = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                finish_runtime_mutation(
+                    &mut inner,
+                    cvar,
+                    "degraded",
+                    Some(sanitize_plugin_error(&error.to_string())),
+                );
+                return Err(error);
+            }
+        };
+        drop(inner);
+
+        if let Err(error) = plugin.shutdown_with_deadline(Some(deadline)) {
+            let mut inner = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            finish_runtime_mutation(
+                &mut inner,
+                cvar,
+                "degraded",
+                Some(sanitize_plugin_error(&error.to_string())),
+            );
+            return Err(error);
+        }
+
+        let mut inner = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.snapshot = Arc::new(inner.snapshot.without_plugin(plugin_id));
+        inner.generation = inner.generation.saturating_add(1);
+        finish_runtime_mutation(&mut inner, cvar, "ready", None);
+        Ok(PluginRuntimeStatus::from_inner(&inner))
+    }
+}
+
+fn find_runtime_command(
+    registry: &PluginRegistry,
+    command_name: &str,
+) -> Result<(RegisteredPlugin, PluginCommandManifest), PluginError> {
+    for plugin_id in registry.dependency_order()? {
+        let plugin = registry.get(&plugin_id).ok_or_else(|| {
+            PluginError::InvalidManifest(format!(
+                "dependency order referenced missing plugin `{plugin_id}`"
+            ))
+        })?;
+        plugin.validate()?;
+        for command in plugin.commands() {
+            if command.name == command_name {
+                return Ok((plugin.clone(), command.clone()));
+            }
+        }
+    }
+    Err(PluginError::NotFound(format!(
+        "plugin command `{command_name}` not found"
+    )))
+}
+
+fn validate_plugin_command_args(args: &[String]) -> Result<(), PluginError> {
+    if args.len() > PLUGIN_COMMAND_MAX_ARGS {
+        return Err(PluginError::CommandFailed(format!(
+            "plugin command arguments exceed {PLUGIN_COMMAND_MAX_ARGS} item limit"
+        )));
+    }
+    let mut total = 0usize;
+    for arg in args {
+        total = total.saturating_add(arg.len());
+        if total > PLUGIN_COMMAND_MAX_ARG_BYTES {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin command arguments exceed {PLUGIN_COMMAND_MAX_ARG_BYTES} byte limit"
+            )));
+        }
+        if arg.is_empty() || contains_control_character(arg) {
+            return Err(PluginError::CommandFailed(
+                "plugin command arguments must be non-empty and contain no control characters"
+                    .to_string(),
+            ));
+        }
+        if arg.starts_with('-')
+            || arg.contains('/')
+            || arg.contains('\\')
+            || arg == "."
+            || arg == ".."
+            || arg.contains("..")
+        {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin command argument `{}` was rejected by the argv safety policy",
+                sanitize_plugin_error(arg)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn execute_registered_command(
+    plugin: &RegisteredPlugin,
+    command: &PluginCommandManifest,
+    command_args: &[String],
+) -> Result<String, PluginError> {
+    plugin.validate()?;
+    let metadata = plugin.metadata();
+    let command_path = metadata.root.as_ref().map_or_else(
+        || command.command.clone(),
+        |root| {
+            if Path::new(&command.command).is_absolute() {
+                command.command.clone()
+            } else {
+                root.join(&command.command).display().to_string()
+            }
+        },
+    );
+    let (runner, args) = if cfg!(windows) && !command_path.ends_with(".sh") {
+        let mut args = vec!["/C".to_string(), command_path.clone()];
+        args.extend(command_args.iter().cloned());
+        ("cmd".to_string(), args)
+    } else {
+        (command_path.clone(), command_args.to_vec())
+    };
+    let output = run_controlled_child(ControlledChildRequest {
+        command: runner,
+        args,
+        stdin: None,
+        cwd: metadata.root.clone(),
+        timeout: Duration::from_millis(PLUGIN_TOOL_TIMEOUT_MS),
+        permission: lifecycle_child_permission(plugin.definition.permissions()),
+        external_subprocess_allowed: metadata.kind != PluginKind::External
+            || plugin
+                .definition
+                .execution_policy()
+                .allow_external_subprocess,
+        os_sandbox_required: metadata.kind == PluginKind::External,
+        env: BTreeMap::from([
+            ("CLAWD_PLUGIN_ID".to_string(), metadata.id.clone()),
+            ("CLAWD_PLUGIN_NAME".to_string(), metadata.name.clone()),
+            ("CLAWD_COMMAND_NAME".to_string(), command.name.clone()),
+            (
+                "CLAWD_COMMAND_ARGV_JSON".to_string(),
+                serde_json::to_string(command_args).unwrap_or_else(|_| "[]".to_string()),
+            ),
+        ]),
+    })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(PluginError::CommandFailed(format!(
+            "plugin command `{}` from `{}` failed for `{}`{}: {}",
+            command.name,
+            metadata.id,
+            command.command,
+            truncated_suffix(output.stderr_truncated),
+            if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            }
+        )))
+    }
+}
+
+impl PluginRuntimeSupervisor for PluginRuntimeRegistry {
+    fn prepare_hot_replace_registry(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PreparedPluginRuntimeReplace, PluginError> {
+        PluginRuntimeRegistry::prepare_hot_replace(self, registry)
+    }
+
+    fn commit_prepared_hot_replace(
+        &self,
+        prepared: PreparedPluginRuntimeReplace,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        PluginRuntimeRegistry::commit_prepared_hot_replace(self, prepared)
+    }
+
+    fn hot_replace_registry(
+        &self,
+        registry: PluginRegistry,
+    ) -> Result<PluginRuntimeStatus, PluginError> {
+        self.hot_replace(registry)
+    }
+
+    fn hot_unload_plugin(&self, plugin_id: &str) -> Result<PluginRuntimeStatus, PluginError> {
+        self.hot_unload(plugin_id)
+    }
+}
+
+fn runtime_hook_count(registry: &PluginRegistry) -> usize {
+    registry
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .map(|plugin| {
+            plugin.hooks().pre_tool_use.len()
+                + plugin.hooks().post_tool_use.len()
+                + plugin.hooks().post_tool_use_failure.len()
+        })
+        .sum()
+}
+
+fn runtime_capability_counts(registry: &PluginRegistry) -> (usize, usize, usize, usize, usize) {
+    registry
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .fold(
+            (0, 0, 0, 0, 0),
+            |(tools, commands, resources, prompts, mcp), plugin| {
+                (
+                    tools + plugin.tools().len(),
+                    commands + plugin.commands().len(),
+                    resources + plugin.resources().len(),
+                    prompts + plugin.prompts().len(),
+                    mcp + plugin.mcp_servers().len(),
+                )
+            },
+        )
+}
+
+#[derive(Debug, Default)]
+struct RuntimeConflictSeen {
+    plugin_names: BTreeMap<String, String>,
+    tool_names: BTreeMap<String, String>,
+    command_names: BTreeMap<String, String>,
+    resource_uris: BTreeMap<String, String>,
+    prompt_names: BTreeMap<String, String>,
+}
+
+fn prepare_runtime_snapshot(
+    old: &PluginRegistry,
+    requested: &PluginRegistry,
+) -> (PluginRegistry, Vec<PluginRuntimeDegradation>) {
+    let old_by_id = old
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.metadata().id.clone(), plugin.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = RuntimeConflictSeen::default();
+    let mut accepted = Vec::new();
+    let mut degradations = Vec::new();
+    let mut processed = BTreeSet::<String>::new();
+
+    for plugin in &requested.plugins {
+        if old_by_id
+            .get(&plugin.metadata().id)
+            .is_none_or(|old_plugin| old_plugin != plugin)
+        {
+            continue;
+        }
+        if runtime_plugin_conflict_reason(plugin, &seen).is_none() {
+            record_runtime_plugin(plugin.clone(), &mut seen, &mut accepted);
+            processed.insert(plugin.metadata().id.clone());
+        }
+    }
+
+    for plugin in &requested.plugins {
+        if processed.contains(&plugin.metadata().id) {
+            continue;
+        }
+        match runtime_plugin_conflict_reason(plugin, &seen) {
+            None => record_runtime_plugin(plugin.clone(), &mut seen, &mut accepted),
+            Some(reason) => {
+                degradations.push(PluginRuntimeDegradation {
+                    plugin_id: plugin.metadata().id.clone(),
+                    reason: reason.clone(),
+                });
+                if let Some(old_plugin) = old_by_id.get(&plugin.metadata().id) {
+                    if runtime_plugin_conflict_reason(old_plugin, &seen).is_none() {
+                        record_runtime_plugin(old_plugin.clone(), &mut seen, &mut accepted);
+                    } else {
+                        degradations.push(PluginRuntimeDegradation {
+                            plugin_id: old_plugin.metadata().id.clone(),
+                            reason: format!(
+                                "old generation could not be retained after candidate quarantine: {reason}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    (PluginRegistry::new(accepted), degradations)
+}
+
+fn runtime_plugin_conflict_reason(
+    plugin: &RegisteredPlugin,
+    seen: &RuntimeConflictSeen,
+) -> Option<String> {
+    if let Some(existing) = seen.plugin_names.get(&plugin.metadata().name) {
+        return Some(format!(
+            "plugin name `{}` conflicts with `{existing}`",
+            plugin.metadata().name
+        ));
+    }
+    if !plugin.is_enabled() {
+        return None;
+    }
+    if let Err(error) = plugin.validate() {
+        return Some(sanitize_plugin_error(&error.to_string()));
+    }
+    if let Err(error) = validate_registered_capability_gate(plugin) {
+        return Some(sanitize_plugin_error(&error.to_string()));
+    }
+    for tool in plugin.tools() {
+        if let Some(existing) = seen.tool_names.get(&tool.definition().name) {
+            return Some(format!(
+                "tool `{}` conflicts with `{existing}`",
+                tool.definition().name
+            ));
+        }
+    }
+    for command in plugin.commands() {
+        if let Some(existing) = seen.command_names.get(&command.name) {
+            return Some(format!(
+                "command `{}` conflicts with `{existing}`",
+                command.name
+            ));
+        }
+    }
+    for resource in plugin.resources() {
+        if let Some(existing) = seen.resource_uris.get(&resource.uri) {
+            return Some(format!(
+                "resource `{}` conflicts with `{existing}`",
+                resource.uri
+            ));
+        }
+    }
+    for prompt in plugin.prompts() {
+        if let Some(existing) = seen.prompt_names.get(&prompt.name) {
+            return Some(format!(
+                "prompt `{}` conflicts with `{existing}`",
+                prompt.name
+            ));
+        }
+    }
+    None
+}
+
+fn record_runtime_plugin(
+    plugin: RegisteredPlugin,
+    seen: &mut RuntimeConflictSeen,
+    accepted: &mut Vec<RegisteredPlugin>,
+) {
+    seen.plugin_names
+        .insert(plugin.metadata().name.clone(), plugin.metadata().id.clone());
+    if plugin.is_enabled() {
+        for tool in plugin.tools() {
+            seen.tool_names
+                .insert(tool.definition().name.clone(), plugin.metadata().id.clone());
+        }
+        for command in plugin.commands() {
+            seen.command_names
+                .insert(command.name.clone(), plugin.metadata().id.clone());
+        }
+        for resource in plugin.resources() {
+            seen.resource_uris
+                .insert(resource.uri.clone(), plugin.metadata().id.clone());
+        }
+        for prompt in plugin.prompts() {
+            seen.prompt_names
+                .insert(prompt.name.clone(), plugin.metadata().id.clone());
+        }
+    }
+    accepted.push(plugin);
+}
+
+fn validate_runtime_snapshot(registry: &PluginRegistry) -> Result<(), PluginError> {
+    registry.validate_registration_conflicts()?;
+    let _ = registry.aggregated_hooks()?;
+    let _ = registry.aggregated_tools()?;
+    let _ = registry.aggregated_commands()?;
+    let _ = registry.aggregated_resources()?;
+    let _ = registry.aggregated_prompts()?;
+    let _ = registry.aggregated_mcp_servers()?;
+    Ok(())
+}
+
+fn hot_reload_deadline(timeout: Duration) -> Result<Instant, PluginError> {
+    if timeout.is_zero() {
+        return Err(PluginError::CommandFailed(
+            "plugin hot reload timeout must be greater than 0 ms".to_string(),
+        ));
+    }
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        PluginError::CommandFailed("plugin hot reload timeout is too large".to_string())
+    })
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, PluginError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            PluginError::CommandFailed(format!(
+                "plugin hot reload exceeded {} ms deadline",
+                PLUGIN_HOT_RELOAD_DEADLINE_MS
+            ))
+        })
+}
+
+fn wait_for_runtime_mutation_slot<'a>(
+    mut inner: std::sync::MutexGuard<'a, PluginRuntimeInner>,
+    cvar: &Condvar,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'a, PluginRuntimeInner>, PluginError> {
+    while inner.mutating {
+        let remaining = remaining_until(deadline)?;
+        let wait = remaining.min(Duration::from_millis(PLUGIN_LOCK_POLL_MS));
+        inner = cvar
+            .wait_timeout(inner, wait)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    Ok(inner)
+}
+
+fn wait_for_runtime_in_flight<'a>(
+    mut inner: std::sync::MutexGuard<'a, PluginRuntimeInner>,
+    cvar: &Condvar,
+    plugin_ids: &BTreeSet<String>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'a, PluginRuntimeInner>, PluginError> {
+    while plugin_ids
+        .iter()
+        .any(|plugin_id| inner.in_flight.get(plugin_id).copied().unwrap_or(0) > 0)
+    {
+        let remaining = remaining_until(deadline)?;
+        let wait = remaining.min(Duration::from_millis(PLUGIN_LOCK_POLL_MS));
+        inner = cvar
+            .wait_timeout(inner, wait)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    Ok(inner)
+}
+
+fn finish_runtime_mutation(
+    inner: &mut PluginRuntimeInner,
+    cvar: &Condvar,
+    phase: &str,
+    error: Option<String>,
+) {
+    inner.phase = phase.to_string();
+    inner.last_error = error;
+    inner.blocked_plugins.clear();
+    inner.mutating = false;
+    cvar.notify_all();
+}
+
+fn changed_enabled_plugins(old: &PluginRegistry, new: &PluginRegistry) -> BTreeSet<String> {
+    let old_plugins = old
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .map(|plugin| (plugin.metadata().id.clone(), plugin.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let new_plugins = new
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .map(|plugin| (plugin.metadata().id.clone(), plugin.clone()))
+        .collect::<BTreeMap<_, _>>();
+    old_plugins
+        .keys()
+        .chain(new_plugins.keys())
+        .filter(|plugin_id| old_plugins.get(*plugin_id) != new_plugins.get(*plugin_id))
+        .cloned()
+        .collect()
+}
+
+fn validate_hot_reload_allowed(
+    old: &PluginRegistry,
+    new: &PluginRegistry,
+    changed: &BTreeSet<String>,
+) -> Result<(), PluginError> {
+    for plugin_id in changed {
+        for registry in [old, new] {
+            let Some(plugin) = registry.get(plugin_id) else {
+                continue;
+            };
+            if !plugin.is_enabled() {
+                continue;
+            }
+            if !plugin.capabilities().hot_reload {
+                return Err(PluginError::CommandFailed(format!(
+                    "plugin `{plugin_id}` does not declare capabilities.hotReload=true; online plugin reload is refused"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_dependents_of(registry: &PluginRegistry, plugin_id: &str) -> BTreeSet<String> {
+    let Some(target) = registry.get(plugin_id) else {
+        return BTreeSet::new();
+    };
+    let target_name = &target.metadata().name;
+    registry
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled() && plugin.metadata().id != plugin_id)
+        .filter(|plugin| {
+            plugin.dependencies().iter().any(|dependency| {
+                dependency.name == plugin_id || dependency.name.as_str() == target_name
+            })
+        })
+        .map(|plugin| plugin.metadata().id.clone())
+        .collect()
+}
+
+fn initialize_changed_plugins(
+    old: &PluginRegistry,
+    new: &PluginRegistry,
+    changed: &BTreeSet<String>,
+    deadline: Instant,
+    initialized: &mut Vec<RegisteredPlugin>,
+) -> Result<(), PluginError> {
+    let old_plugins = old
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.metadata().id.clone(), plugin))
+        .collect::<BTreeMap<_, _>>();
+    for plugin_id in new.dependency_order()? {
+        if remaining_until(deadline).is_err() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin hot reload exceeded {} ms deadline before initializing `{plugin_id}`",
+                PLUGIN_HOT_RELOAD_DEADLINE_MS
+            )));
+        }
+        if !changed.contains(&plugin_id) {
+            continue;
+        }
+        let plugin = new.get(&plugin_id).ok_or_else(|| {
+            PluginError::InvalidManifest(format!(
+                "dependency order referenced missing plugin `{plugin_id}`"
+            ))
+        })?;
+        if old_plugins
+            .get(&plugin_id)
+            .is_some_and(|old| *old == plugin)
+        {
+            continue;
+        }
+        plugin.validate()?;
+        plugin.initialize_with_deadline(Some(deadline))?;
+        initialized.push(plugin.clone());
+    }
+    Ok(())
+}
+
+fn shutdown_replaced_plugins(
+    old: &PluginRegistry,
+    changed: &BTreeSet<String>,
+    deadline: Option<Instant>,
+) -> Option<String> {
+    let mut order = old.dependency_order().unwrap_or_default();
+    order.reverse();
+    let mut errors = Vec::new();
+    for plugin_id in order {
+        if !changed.contains(&plugin_id) {
+            continue;
+        }
+        let Some(plugin) = old.get(&plugin_id) else {
+            continue;
+        };
+        if let Err(error) = plugin.shutdown_with_deadline(deadline) {
+            errors.push(format!(
+                "{}: {}",
+                plugin_id,
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+    }
+    (!errors.is_empty()).then(|| {
+        format!(
+            "plugin shutdown failed for {} replaced plugin(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    })
+}
+
+fn hot_load_backup_root(install_root: &Path, timestamp_ms: u128, process_id: u32) -> PathBuf {
+    install_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".hot-load-backup-{process_id}-{timestamp_ms}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3128,6 +4378,31 @@ impl PluginManagerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManager {
     config: PluginManagerConfig,
+    mutation_locks_held: bool,
+}
+
+pub struct PreparedPluginHotReload<T> {
+    result: T,
+    candidate_registry: Option<PluginRegistry>,
+    registry_backup: InstalledPluginRegistry,
+    enabled_backup: BTreeMap<String, bool>,
+    install_root: PathBuf,
+    backup_root: PathBuf,
+    install_root_had_contents: bool,
+    _mutation_locks: PluginMutationLocks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginHotReloadFinish<T> {
+    pub result: T,
+    pub cleanup_warning: Option<String>,
+}
+
+impl<T> PreparedPluginHotReload<T> {
+    #[must_use]
+    pub fn candidate_registry(&self) -> Option<&PluginRegistry> {
+        self.candidate_registry.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3334,7 +4609,10 @@ impl From<serde_json::Error> for PluginError {
 impl PluginManager {
     #[must_use]
     pub fn new(config: PluginManagerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            mutation_locks_held: false,
+        }
     }
 
     /// Returns the default bundled plugins root directory.
@@ -3485,12 +4763,286 @@ impl PluginManager {
         self.install(source)
     }
 
+    pub fn hot_reload_transaction<S, T, F>(
+        &mut self,
+        supervisor: &S,
+        mutation: F,
+    ) -> Result<(T, Option<PluginRuntimeStatus>), PluginError>
+    where
+        S: PluginRuntimeSupervisor,
+        F: FnOnce(&mut Self) -> Result<(T, bool), PluginError>,
+    {
+        let prepared = self.prepare_hot_reload_transaction(mutation)?;
+        let Some(candidate_registry) = prepared.candidate_registry().cloned() else {
+            let finish = self.finish_prepared_hot_reload(prepared);
+            return Ok((finish.result, None));
+        };
+        let runtime_prepare = match supervisor.prepare_hot_replace_registry(candidate_registry) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-reload transaction rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        match supervisor.commit_prepared_hot_replace(runtime_prepare) {
+            Ok(status) => {
+                let finish = self.finish_prepared_hot_reload(prepared);
+                let status = runtime_status_with_cleanup_warning(status, finish.cleanup_warning);
+                Ok((finish.result, Some(status)))
+            }
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-reload transaction rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn prepare_hot_reload_transaction<T, F>(
+        &mut self,
+        mutation: F,
+    ) -> Result<PreparedPluginHotReload<T>, PluginError>
+    where
+        F: FnOnce(&mut Self) -> Result<(T, bool), PluginError>,
+    {
+        let mutation_locks = self.acquire_mutation_locks()?;
+        let previous_locks_held = self.mutation_locks_held;
+        self.mutation_locks_held = true;
+        let registry_backup = self.load_registry_under_exclusive_lock()?;
+        let enabled_backup = self.config.enabled_plugins.clone();
+        let install_root = self.install_root();
+        let backup_root = hot_load_backup_root(&install_root, unix_time_ms(), std::process::id());
+        let install_root_had_contents = install_root.exists();
+        let prepared = (|| {
+            if install_root_had_contents {
+                if backup_root.exists() {
+                    fs::remove_dir_all(&backup_root)?;
+                }
+                copy_dir_all(&install_root, &backup_root)?;
+            }
+
+            let (result, reload_runtime) = match mutation(self) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = self.restore_hot_load_backup(
+                        &registry_backup,
+                        &enabled_backup,
+                        &install_root,
+                        &backup_root,
+                        install_root_had_contents,
+                    );
+                    return Err(error);
+                }
+            };
+            if !reload_runtime {
+                return Ok(PreparedPluginHotReload {
+                    result,
+                    candidate_registry: None,
+                    registry_backup,
+                    enabled_backup,
+                    install_root,
+                    backup_root,
+                    install_root_had_contents,
+                    _mutation_locks: mutation_locks,
+                });
+            }
+
+            let registry = match self.plugin_registry() {
+                Ok(registry) => registry,
+                Err(error) => {
+                    let restore_error = self.restore_hot_load_backup(
+                        &registry_backup,
+                        &enabled_backup,
+                        &install_root,
+                        &backup_root,
+                        install_root_had_contents,
+                    );
+                    if let Err(restore_error) = restore_error {
+                        return Err(PluginError::CommandFailed(format!(
+                            "{}; hot-reload transaction rollback failed: {}",
+                            sanitize_plugin_error(&error.to_string()),
+                            sanitize_plugin_error(&restore_error.to_string())
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(PreparedPluginHotReload {
+                result,
+                candidate_registry: Some(registry),
+                registry_backup,
+                enabled_backup,
+                install_root,
+                backup_root,
+                install_root_had_contents,
+                _mutation_locks: mutation_locks,
+            })
+        })();
+        self.mutation_locks_held = previous_locks_held;
+        prepared
+    }
+
+    pub fn finish_prepared_hot_reload<T>(
+        &mut self,
+        prepared: PreparedPluginHotReload<T>,
+    ) -> PluginHotReloadFinish<T> {
+        let cleanup_warning = if prepared.backup_root.exists() {
+            fs::remove_dir_all(&prepared.backup_root)
+                .err()
+                .map(|error| {
+                    truncate_plugin_error(&format!(
+                        "hot-reload backup cleanup failed for `{}`: {}",
+                        prepared.backup_root.display(),
+                        sanitize_plugin_error(&error.to_string())
+                    ))
+                })
+        } else {
+            None
+        };
+        PluginHotReloadFinish {
+            result: prepared.result,
+            cleanup_warning,
+        }
+    }
+
+    pub fn rollback_prepared_hot_reload<T>(
+        &mut self,
+        prepared: PreparedPluginHotReload<T>,
+    ) -> Result<(), PluginError> {
+        let restore_error = self.restore_hot_load_backup(
+            &prepared.registry_backup,
+            &prepared.enabled_backup,
+            &prepared.install_root,
+            &prepared.backup_root,
+            prepared.install_root_had_contents,
+        );
+        drop(prepared);
+        restore_error
+    }
+
+    pub fn hot_load_with_supervisor<S: PluginRuntimeSupervisor>(
+        &mut self,
+        source: &str,
+        supervisor: &S,
+    ) -> Result<PluginHotLoadOutcome, PluginError> {
+        let prepared = self.prepare_hot_reload_transaction(|manager| {
+            let install = manager.install(source)?;
+            Ok((install, true))
+        })?;
+        let registry = prepared.candidate_registry().cloned().ok_or_else(|| {
+            PluginError::CommandFailed(
+                "hot-load transaction did not build a runtime candidate".to_string(),
+            )
+        })?;
+        let runtime_prepare = match supervisor.prepare_hot_replace_registry(registry) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-load rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        match supervisor.commit_prepared_hot_replace(runtime_prepare) {
+            Ok(runtime_status) => {
+                let finish = self.finish_prepared_hot_reload(prepared);
+                let install = finish.result;
+                let runtime_status =
+                    runtime_status_with_cleanup_warning(runtime_status, finish.cleanup_warning);
+                Ok(PluginHotLoadOutcome {
+                    plugin_id: install.plugin_id,
+                    version: install.version,
+                    install_path: install.install_path,
+                    runtime_status,
+                })
+            }
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-load rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn hot_unload(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         self.disable(plugin_id)
     }
 
+    pub fn hot_unload_with_supervisor<S: PluginRuntimeSupervisor>(
+        &mut self,
+        plugin_id: &str,
+        supervisor: &S,
+    ) -> Result<PluginHotUnloadOutcome, PluginError> {
+        let plugin_id = plugin_id.to_string();
+        let prepared = self.prepare_hot_reload_transaction(|manager| {
+            manager.ensure_known_plugin(&plugin_id)?;
+            manager.disable(&plugin_id)?;
+            Ok((plugin_id.clone(), true))
+        })?;
+        let registry = prepared.candidate_registry().cloned().ok_or_else(|| {
+            PluginError::CommandFailed(
+                "hot-unload transaction did not build a runtime candidate".to_string(),
+            )
+        })?;
+        let runtime_prepare = match supervisor.prepare_hot_replace_registry(registry) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-unload rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        match supervisor.commit_prepared_hot_replace(runtime_prepare) {
+            Ok(runtime_status) => {
+                let finish = self.finish_prepared_hot_reload(prepared);
+                let plugin_id = finish.result;
+                let runtime_status =
+                    runtime_status_with_cleanup_warning(runtime_status, finish.cleanup_warning);
+                Ok(PluginHotUnloadOutcome {
+                    plugin_id,
+                    runtime_status,
+                })
+            }
+            Err(error) => {
+                if let Err(restore_error) = self.rollback_prepared_hot_reload(prepared) {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{}; hot-unload rollback failed: {}",
+                        sanitize_plugin_error(&error.to_string()),
+                        sanitize_plugin_error(&restore_error.to_string())
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
-        let _mutation_locks = self.acquire_mutation_locks()?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let install_source = parse_install_source(source)?;
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&install_source, &temp_root)?;
@@ -3544,6 +5096,7 @@ impl PluginManager {
 
     pub fn enable(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         self.ensure_known_plugin(plugin_id)?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         self.write_enabled_state(plugin_id, Some(true))?;
         self.config
             .enabled_plugins
@@ -3553,6 +5106,7 @@ impl PluginManager {
 
     pub fn disable(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         self.ensure_known_plugin(plugin_id)?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         self.write_enabled_state(plugin_id, Some(false))?;
         self.config
             .enabled_plugins
@@ -3561,7 +5115,7 @@ impl PluginManager {
     }
 
     pub fn uninstall(&mut self, plugin_id: &str) -> Result<(), PluginError> {
-        let _mutation_locks = self.acquire_mutation_locks()?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
         let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
@@ -3589,7 +5143,7 @@ impl PluginManager {
     }
 
     pub fn update(&mut self, plugin_id: &str) -> Result<UpdateOutcome, PluginError> {
-        let _mutation_locks = self.acquire_mutation_locks()?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
@@ -3670,7 +5224,7 @@ impl PluginManager {
         plugin_id: &str,
         version: &str,
     ) -> Result<RollbackOutcome, PluginError> {
-        let _mutation_locks = self.acquire_mutation_locks()?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
         let active = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
@@ -4005,7 +5559,7 @@ impl PluginManager {
     }
 
     fn sync_bundled_plugins(&self) -> Result<PluginDiscovery, PluginError> {
-        let _mutation_locks = self.acquire_mutation_locks()?;
+        let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut discovery = PluginDiscovery::default();
         let bundled_root = self
             .config
@@ -4272,6 +5826,41 @@ impl PluginManager {
         })
     }
 
+    fn write_enabled_plugins(&self, enabled: &BTreeMap<String, bool>) -> Result<(), PluginError> {
+        update_settings_json(&self.settings_path(), |root| {
+            let enabled_plugins = ensure_object(root, "enabledPlugins");
+            enabled_plugins.clear();
+            enabled_plugins.extend(
+                enabled
+                    .iter()
+                    .map(|(plugin_id, value)| (plugin_id.clone(), Value::Bool(*value))),
+            );
+        })
+    }
+
+    fn restore_hot_load_backup(
+        &mut self,
+        registry_backup: &InstalledPluginRegistry,
+        enabled_backup: &BTreeMap<String, bool>,
+        install_root: &Path,
+        backup_root: &Path,
+        install_root_had_contents: bool,
+    ) -> Result<(), PluginError> {
+        if install_root.exists() {
+            fs::remove_dir_all(install_root)?;
+        }
+        if install_root_had_contents {
+            copy_dir_all(backup_root, install_root)?;
+            if backup_root.exists() {
+                fs::remove_dir_all(backup_root)?;
+            }
+        }
+        self.store_registry_under_registry_lock(registry_backup)?;
+        self.write_enabled_plugins(enabled_backup)?;
+        self.config.enabled_plugins = enabled_backup.clone();
+        Ok(())
+    }
+
     fn acquire_registry_lock(&self) -> Result<PluginFileLock, PluginError> {
         acquire_plugin_file_lock_at(
             &registry_lock_path(&self.registry_path()),
@@ -4303,6 +5892,14 @@ impl PluginManager {
             _registry: registry,
             _install: install,
         })
+    }
+
+    fn acquire_mutation_locks_if_needed(&self) -> Result<Option<PluginMutationLocks>, PluginError> {
+        if self.mutation_locks_held {
+            Ok(None)
+        } else {
+            self.acquire_mutation_locks().map(Some)
+        }
     }
 
     fn installed_plugin_registry(&self) -> Result<PluginRegistry, PluginError> {
@@ -4578,6 +6175,7 @@ fn builtin_plugin_from_manifest(manifest: PluginManifest) -> PluginDefinition {
         permissions: manifest.permissions,
         permission_declarations: manifest.permission_declarations,
         tools,
+        commands: manifest.commands,
         resources: manifest.resources,
         prompts: manifest.prompts,
         capabilities: manifest.capabilities,
@@ -4629,6 +6227,7 @@ fn load_plugin_definition(
             permissions: manifest.permissions,
             permission_declarations: manifest.permission_declarations,
             tools,
+            commands: manifest.commands,
             resources: manifest.resources,
             prompts: manifest.prompts,
             capabilities: manifest.capabilities,
@@ -4646,6 +6245,7 @@ fn load_plugin_definition(
             permissions: manifest.permissions,
             permission_declarations: manifest.permission_declarations,
             tools,
+            commands: manifest.commands,
             resources: manifest.resources,
             prompts: manifest.prompts,
             capabilities: manifest.capabilities,
@@ -4663,6 +6263,7 @@ fn load_plugin_definition(
             permissions: manifest.permissions,
             permission_declarations: manifest.permission_declarations,
             tools,
+            commands: manifest.commands,
             resources: manifest.resources,
             prompts: manifest.prompts,
             capabilities: manifest.capabilities,
@@ -5253,6 +6854,7 @@ fn build_plugin_manifest(
     validate_ops_permissions(&raw.ops_permissions, &raw.rollback, &mut errors);
     let actual_surfaces = actual_surfaces_from_manifest_parts(
         tools.len(),
+        commands.len(),
         resources.len(),
         prompts.len(),
         &mcp_servers,
@@ -6028,6 +7630,7 @@ fn build_manifest_mcp_servers(
 fn actual_surfaces_for_plugin(plugin: &PluginDefinition) -> PluginActualSurfaces {
     actual_surfaces_from_manifest_parts(
         plugin.tools().len(),
+        plugin.commands().len(),
         plugin.resources().len(),
         plugin.prompts().len(),
         plugin.mcp_servers(),
@@ -6037,6 +7640,7 @@ fn actual_surfaces_for_plugin(plugin: &PluginDefinition) -> PluginActualSurfaces
 
 fn actual_surfaces_from_manifest_parts(
     tools: usize,
+    commands: usize,
     resources: usize,
     prompts: usize,
     mcp_servers: &BTreeMap<String, PluginMcpServerManifest>,
@@ -6044,6 +7648,7 @@ fn actual_surfaces_from_manifest_parts(
 ) -> PluginActualSurfaces {
     PluginActualSurfaces {
         tools,
+        commands,
         resources,
         prompts,
         mcp_servers: mcp_servers.len(),
@@ -6525,6 +8130,19 @@ fn validate_lifecycle_paths(
     Ok(())
 }
 
+fn validate_command_manifest_paths(
+    root: Option<&Path>,
+    commands: &[PluginCommandManifest],
+) -> Result<(), PluginError> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    for command in commands {
+        validate_command_path(root, &command.command, "command")?;
+    }
+    Ok(())
+}
+
 fn validate_tool_paths(root: Option<&Path>, tools: &[PluginTool]) -> Result<(), PluginError> {
     let Some(root) = root else {
         return Ok(());
@@ -6591,12 +8209,14 @@ fn run_lifecycle_commands(
     permissions: &[PluginPermission],
     phase: &str,
     commands: &[String],
+    deadline: Option<Instant>,
 ) -> Result<(), PluginError> {
     if lifecycle.is_empty() || commands.is_empty() {
         return Ok(());
     }
 
     for command in commands {
+        let timeout = lifecycle_command_timeout(deadline, &metadata.id, phase)?;
         let (runner, args) = if cfg!(windows) {
             if command.ends_with(".sh") {
                 (command.clone(), Vec::new())
@@ -6611,7 +8231,7 @@ fn run_lifecycle_commands(
             args,
             stdin: None,
             cwd: metadata.root.clone(),
-            timeout: Duration::from_millis(PLUGIN_LIFECYCLE_TIMEOUT_MS),
+            timeout,
             permission: lifecycle_child_permission(permissions),
             external_subprocess_allowed: metadata.kind != PluginKind::External
                 || execution_policy.allow_external_subprocess,
@@ -6641,6 +8261,32 @@ fn run_lifecycle_commands(
     }
 
     Ok(())
+}
+
+fn lifecycle_command_timeout(
+    deadline: Option<Instant>,
+    plugin_id: &str,
+    phase: &str,
+) -> Result<Duration, PluginError> {
+    let lifecycle_timeout = Duration::from_millis(PLUGIN_LIFECYCLE_TIMEOUT_MS);
+    let Some(deadline) = deadline else {
+        return Ok(lifecycle_timeout);
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            PluginError::CommandFailed(format!(
+            "plugin hot reload exceeded {} ms deadline before {phase} lifecycle for `{plugin_id}`",
+            PLUGIN_HOT_RELOAD_DEADLINE_MS
+        ))
+        })?;
+    if remaining.is_zero() {
+        return Err(PluginError::CommandFailed(format!(
+            "plugin hot reload exceeded {} ms deadline before {phase} lifecycle for `{plugin_id}`",
+            PLUGIN_HOT_RELOAD_DEADLINE_MS
+        )));
+    }
+    Ok(remaining.min(lifecycle_timeout))
 }
 
 fn resolve_local_source(source: &str) -> Result<PathBuf, PluginError> {
@@ -8406,7 +10052,12 @@ fn registry_lock_path(registry_path: &Path) -> PathBuf {
 }
 
 fn install_tree_lock_path(install_root: &Path) -> PathBuf {
-    install_root.join(".plugin.lock")
+    let parent = install_root.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = install_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugins");
+    parent.join(format!(".{file_name}.install.lock"))
 }
 
 fn same_lock_path(left: &Path, right: &Path) -> bool {
@@ -8576,6 +10227,221 @@ mod tests {
             )
             .as_str(),
         );
+    }
+
+    fn write_hot_reload_external_plugin(root: &Path, name: &str, version: &str) {
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"test plugin\",\n  \"capabilities\": {{\"hotReload\": true}}\n}}"
+            )
+            .as_str(),
+        );
+    }
+
+    fn write_lifecycle_script(root: &Path, name: &str, body: &str) -> String {
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let path = root.join("lifecycle").join(format!("{name}.{extension}"));
+        write_file(&path, body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("chmod");
+        }
+        path.display().to_string()
+    }
+
+    fn lifecycle_append_command(root: &Path, path: &Path, label: &str) -> String {
+        if cfg!(windows) {
+            write_lifecycle_script(
+                root,
+                &format!("append-{label}"),
+                &format!("@echo off\r\necho {label}>>\"{}\"\r\n", path.display()),
+            )
+        } else {
+            write_lifecycle_script(
+                root,
+                &format!("append-{label}"),
+                &format!("#!/bin/sh\nprintf '{label}\\n' >> '{}'\n", path.display()),
+            )
+        }
+    }
+
+    fn lifecycle_fail_command(root: &Path, label: &str) -> String {
+        if cfg!(windows) {
+            write_lifecycle_script(root, &format!("fail-{label}"), "@echo off\r\nexit /B 7\r\n")
+        } else {
+            write_lifecycle_script(root, &format!("fail-{label}"), "#!/bin/sh\nexit 7\n")
+        }
+    }
+
+    fn lifecycle_sleep_command(root: &Path, label: &str, millis: u64) -> String {
+        if cfg!(windows) {
+            write_lifecycle_script(
+                root,
+                &format!("sleep-{label}"),
+                &format!(
+                    "@echo off\r\npowershell -NoProfile -Command \"Start-Sleep -Milliseconds {millis}\"\r\n"
+                ),
+            )
+        } else {
+            write_lifecycle_script(
+                root,
+                &format!("sleep-{label}"),
+                &format!("#!/bin/sh\nsleep {}\n", millis as f64 / 1000.0),
+            )
+        }
+    }
+
+    fn test_metadata(
+        id: &str,
+        name: &str,
+        kind: PluginKind,
+        root: Option<PathBuf>,
+    ) -> PluginMetadata {
+        PluginMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: "runtime test plugin".to_string(),
+            kind,
+            source: "test".to_string(),
+            default_enabled: true,
+            root,
+            manifest: PluginManifestMetadata::builtin(),
+        }
+    }
+
+    fn runtime_tool(plugin_id: &str, name: &str, sleep_ms: u64) -> PluginTool {
+        let (command, args) = if cfg!(windows) {
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!("Start-Sleep -Milliseconds {sleep_ms}; $input | Write-Output"),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!("sleep {}; cat", sleep_ms as f64 / 1000.0),
+                ],
+            )
+        };
+        PluginTool::new(
+            plugin_id,
+            plugin_id.split('@').next().unwrap_or(plugin_id),
+            PluginToolDefinition {
+                name: name.to_string(),
+                description: Some("runtime test tool".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+            },
+            command,
+            args,
+            PluginToolPermission::ReadOnly,
+            None,
+        )
+    }
+
+    fn runtime_command(name: &str) -> PluginCommandManifest {
+        PluginCommandManifest {
+            name: name.to_string(),
+            description: "runtime test command".to_string(),
+            command: "./commands/test.sh".to_string(),
+        }
+    }
+
+    fn runtime_plugin(id: &str, name: &str, tools: Vec<PluginTool>) -> RegisteredPlugin {
+        runtime_plugin_with_commands(id, name, tools, Vec::new())
+    }
+
+    fn runtime_plugin_with_commands(
+        id: &str,
+        name: &str,
+        tools: Vec<PluginTool>,
+        commands: Vec<PluginCommandManifest>,
+    ) -> RegisteredPlugin {
+        runtime_plugin_with_options(id, name, tools, commands, true, Vec::new())
+    }
+
+    fn runtime_plugin_with_options(
+        id: &str,
+        name: &str,
+        tools: Vec<PluginTool>,
+        commands: Vec<PluginCommandManifest>,
+        hot_reload: bool,
+        dependencies: Vec<PluginDependency>,
+    ) -> RegisteredPlugin {
+        let capabilities = PluginCapabilities {
+            tools: !tools.is_empty(),
+            resources: false,
+            prompts: false,
+            workflows: false,
+            hot_reload,
+        };
+        RegisteredPlugin::new(
+            PluginDefinition::Builtin(BuiltinPlugin {
+                metadata: test_metadata(id, name, PluginKind::Builtin, None),
+                hooks: PluginHooks::default(),
+                lifecycle: PluginLifecycle::default(),
+                execution_policy: PluginExecutionPolicy::default(),
+                permissions: Vec::new(),
+                permission_declarations: Vec::new(),
+                tools,
+                commands,
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                capabilities,
+                mcp_servers: BTreeMap::new(),
+                dependencies,
+                rollback: PluginRollbackPlan::default(),
+                version_policy: PluginVersionPolicy::default(),
+                ops_permissions: Vec::new(),
+            }),
+            true,
+        )
+    }
+
+    fn lifecycle_plugin(
+        id: &str,
+        name: &str,
+        root: &Path,
+        init: Vec<String>,
+        shutdown: Vec<String>,
+    ) -> RegisteredPlugin {
+        RegisteredPlugin::new(
+            PluginDefinition::Bundled(BundledPlugin {
+                metadata: test_metadata(id, name, PluginKind::Bundled, Some(root.to_path_buf())),
+                hooks: PluginHooks::default(),
+                lifecycle: PluginLifecycle { init, shutdown },
+                execution_policy: PluginExecutionPolicy::default(),
+                permissions: vec![PluginPermission::Write],
+                permission_declarations: vec![PluginPermissionDeclaration::Legacy {
+                    permission: PluginPermission::Write,
+                }],
+                tools: Vec::new(),
+                commands: Vec::new(),
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                capabilities: PluginCapabilities {
+                    hot_reload: true,
+                    ..PluginCapabilities::default()
+                },
+                mcp_servers: BTreeMap::new(),
+                dependencies: Vec::new(),
+                rollback: PluginRollbackPlan::default(),
+                version_policy: PluginVersionPolicy::default(),
+                ops_permissions: Vec::new(),
+            }),
+            true,
+        )
     }
 
     fn write_broken_plugin(root: &Path, name: &str) {
@@ -10717,6 +12583,693 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(external_root);
+    }
+
+    #[test]
+    fn plugin_registry_initialize_rolls_back_partially_initialized_plugins() {
+        let root = temp_dir("hot-init-rollback");
+        fs::create_dir_all(&root).expect("root");
+        let log = root.join("lifecycle.log");
+        let first = lifecycle_plugin(
+            "first@bundled",
+            "first",
+            &root,
+            vec![lifecycle_append_command(&root, &log, "first-init")],
+            vec![lifecycle_append_command(&root, &log, "first-shutdown")],
+        );
+        let second = lifecycle_plugin(
+            "second@bundled",
+            "second",
+            &root,
+            vec![lifecycle_fail_command(&root, "second-init")],
+            vec![lifecycle_append_command(&root, &log, "second-shutdown")],
+        );
+        let registry = PluginRegistry::new(vec![first, second]);
+
+        let _error = registry
+            .initialize()
+            .expect_err("second init should fail and roll back first");
+        let log = fs::read_to_string(&log).expect("rollback log");
+        assert!(log.contains("first-init"));
+        assert!(log.contains("first-shutdown"));
+        assert!(!log.contains("second-shutdown"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_registry_initialize_rolls_back_when_later_validate_fails() {
+        let root = temp_dir("hot-validate-rollback");
+        fs::create_dir_all(&root).expect("root");
+        let log = root.join("lifecycle.log");
+        let first = lifecycle_plugin(
+            "first@bundled",
+            "first",
+            &root,
+            vec![lifecycle_append_command(&root, &log, "first-init")],
+            vec![lifecycle_append_command(&root, &log, "first-shutdown")],
+        );
+        let second = lifecycle_plugin(
+            "second@bundled",
+            "second",
+            &root,
+            vec![root.join("missing-init.cmd").display().to_string()],
+            Vec::new(),
+        );
+        let registry = PluginRegistry::new(vec![first, second]);
+
+        let error = registry
+            .initialize()
+            .expect_err("second validate should fail and roll back first");
+        assert!(error.to_string().contains("does not exist"));
+        let log = fs::read_to_string(&log).expect("rollback log");
+        assert!(log.contains("first-init"));
+        assert!(log.contains("first-shutdown"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_registry_shutdown_is_best_effort_and_aggregates_errors() {
+        let root = temp_dir("hot-shutdown-best-effort");
+        fs::create_dir_all(&root).expect("root");
+        let first = lifecycle_plugin(
+            "first@bundled",
+            "first",
+            &root,
+            Vec::new(),
+            vec![lifecycle_fail_command(&root, "first-shutdown")],
+        );
+        let second = lifecycle_plugin(
+            "second@bundled",
+            "second",
+            &root,
+            Vec::new(),
+            vec![lifecycle_fail_command(&root, "second-shutdown")],
+        );
+        let registry = PluginRegistry::new(vec![first, second]);
+
+        let error = registry
+            .shutdown()
+            .expect_err("shutdown should report aggregate failures");
+        let error = error.to_string();
+        assert!(error.contains("first@bundled"), "{error}");
+        assert!(error.contains("second@bundled"), "{error}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_runtime_hot_replace_failure_keeps_old_snapshot_and_rolls_back_init() {
+        let root = temp_dir("hot-replace-rollback");
+        fs::create_dir_all(&root).expect("root");
+        let log = root.join("runtime.log");
+        let old = runtime_plugin(
+            "old@builtin",
+            "old",
+            vec![runtime_tool("old@builtin", "old_echo", 0)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+        let good_new = lifecycle_plugin(
+            "a-good@bundled",
+            "good",
+            &root,
+            vec![lifecycle_append_command(&root, &log, "good-init")],
+            vec![lifecycle_append_command(&root, &log, "good-shutdown")],
+        );
+        let bad_new = lifecycle_plugin(
+            "b-bad@bundled",
+            "bad",
+            &root,
+            vec![lifecycle_fail_command(&root, "bad-init")],
+            Vec::new(),
+        );
+
+        let error = runtime
+            .hot_replace(PluginRegistry::new(vec![old, good_new, bad_new]))
+            .expect_err("bad init should reject hot replace");
+        assert!(error.to_string().contains("failed") || error.to_string().contains("exit"));
+        assert!(runtime.snapshot().contains("old@builtin"));
+        assert!(!runtime.snapshot().contains("a-good@bundled"));
+        assert!(runtime
+            .execute_tool("old_echo", &serde_json::json!({"ok": true}))
+            .expect("old tool should remain callable")
+            .contains("ok"));
+        let log = fs::read_to_string(&log).expect("runtime log");
+        assert!(log.contains("good-init"));
+        assert!(log.contains("good-shutdown"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_runtime_lifecycle_child_timeout_is_cut_by_total_hot_reload_deadline() {
+        let root = temp_dir("hot-replace-deadline");
+        fs::create_dir_all(&root).expect("root");
+        let old = runtime_plugin(
+            "old@builtin",
+            "old",
+            vec![runtime_tool("old@builtin", "old_echo", 0)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+        let slow = lifecycle_plugin(
+            "slow@bundled",
+            "slow",
+            &root,
+            vec![lifecycle_sleep_command(&root, "slow-init", 5_000)],
+            Vec::new(),
+        );
+
+        let started = Instant::now();
+        let error = runtime
+            .hot_replace_with_timeout(
+                PluginRegistry::new(vec![old, slow]),
+                Duration::from_millis(75),
+            )
+            .expect_err("slow lifecycle should be cut off by total deadline");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "deadline should cut lifecycle before standalone 5s sleep"
+        );
+        assert!(runtime.snapshot().contains("old@builtin"));
+        assert!(!runtime.snapshot().contains("slow@bundled"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_runtime_hot_reload_false_refuses_online_replace() {
+        let old = runtime_plugin(
+            "old@builtin",
+            "old",
+            vec![runtime_tool("old@builtin", "old_echo", 0)],
+        );
+        let cold = runtime_plugin_with_options(
+            "cold@builtin",
+            "cold",
+            vec![runtime_tool("cold@builtin", "cold_echo", 0)],
+            Vec::new(),
+            false,
+            Vec::new(),
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+
+        let error = runtime
+            .hot_replace(PluginRegistry::new(vec![old, cold]))
+            .expect_err("hotReload=false plugin should not be online-loaded");
+        assert!(error.to_string().contains("hotReload=true"), "{error}");
+        assert!(!runtime.snapshot().contains("cold@builtin"));
+    }
+
+    #[test]
+    fn plugin_runtime_prepared_token_quarantines_and_rejects_stale_generation() {
+        let old = runtime_plugin(
+            "old@builtin",
+            "old",
+            vec![runtime_tool("old@builtin", "shared_tool", 0)],
+        );
+        let healthy = runtime_plugin(
+            "healthy@builtin",
+            "healthy",
+            vec![runtime_tool("healthy@builtin", "fresh_tool", 0)],
+        );
+        let conflict = runtime_plugin(
+            "conflict@builtin",
+            "conflict",
+            vec![runtime_tool("conflict@builtin", "shared_tool", 0)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+
+        let prepared = runtime
+            .prepare_hot_replace(PluginRegistry::new(vec![
+                old.clone(),
+                healthy.clone(),
+                conflict,
+            ]))
+            .expect("prepare should quarantine conflicts without side effects");
+
+        assert_eq!(prepared.base_generation(), 0);
+        assert!(prepared.accepted_registry().contains("old@builtin"));
+        assert!(prepared.accepted_registry().contains("healthy@builtin"));
+        assert!(!prepared.accepted_registry().contains("conflict@builtin"));
+        assert!(!runtime.snapshot().contains("healthy@builtin"));
+
+        runtime
+            .hot_replace(PluginRegistry::new(vec![old, healthy]))
+            .expect("independent commit should advance the generation");
+        let error = runtime
+            .commit_prepared_hot_replace(prepared)
+            .expect_err("prepared token from an old generation must not commit");
+        assert!(error.to_string().contains("generation mismatch"), "{error}");
+        assert!(runtime.snapshot().contains("healthy@builtin"));
+        assert!(!runtime.snapshot().contains("conflict@builtin"));
+    }
+
+    #[test]
+    fn plugin_runtime_quarantines_conflicting_plugin_and_keeps_healthy_tools() {
+        let old = runtime_plugin(
+            "old@builtin",
+            "old",
+            vec![runtime_tool("old@builtin", "shared_tool", 0)],
+        );
+        let healthy = runtime_plugin(
+            "healthy@builtin",
+            "healthy",
+            vec![runtime_tool("healthy@builtin", "fresh_tool", 0)],
+        );
+        let conflict = runtime_plugin(
+            "conflict@builtin",
+            "conflict",
+            vec![runtime_tool("conflict@builtin", "shared_tool", 0)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+
+        let status = runtime
+            .hot_replace(PluginRegistry::new(vec![old, healthy, conflict]))
+            .expect("conflict should be quarantined, not fatal");
+        assert_eq!(status.phase, "degraded");
+        assert_eq!(status.degraded_plugins[0].plugin_id, "conflict@builtin");
+        assert!(runtime.snapshot().contains("old@builtin"));
+        assert!(runtime.snapshot().contains("healthy@builtin"));
+        assert!(!runtime.snapshot().contains("conflict@builtin"));
+        assert!(runtime
+            .execute_tool("shared_tool", &serde_json::json!({"old": true}))
+            .expect("old tool should be retained")
+            .contains("old"));
+        assert!(runtime
+            .execute_tool("fresh_tool", &serde_json::json!({"fresh": true}))
+            .expect("healthy new tool should be available")
+            .contains("fresh"));
+    }
+
+    #[test]
+    fn plugin_runtime_snapshot_syncs_command_surface_and_quarantines_conflicts() {
+        let old = runtime_plugin_with_commands(
+            "old@builtin",
+            "old",
+            Vec::new(),
+            vec![runtime_command("sync")],
+        );
+        let healthy = runtime_plugin_with_commands(
+            "healthy@builtin",
+            "healthy",
+            Vec::new(),
+            vec![runtime_command("build")],
+        );
+        let conflict = runtime_plugin_with_commands(
+            "conflict@builtin",
+            "conflict",
+            Vec::new(),
+            vec![runtime_command("sync")],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![old.clone()]));
+
+        let status = runtime
+            .hot_replace(PluginRegistry::new(vec![old, healthy, conflict]))
+            .expect("command conflict should be quarantined");
+        assert_eq!(status.phase, "degraded");
+        assert_eq!(status.command_count, 2);
+        assert_eq!(status.degraded_plugins[0].plugin_id, "conflict@builtin");
+        assert!(status.degraded_plugins[0].reason.contains("command `sync`"));
+        assert!(runtime.snapshot().contains("old@builtin"));
+        assert!(runtime.snapshot().contains("healthy@builtin"));
+        assert!(!runtime.snapshot().contains("conflict@builtin"));
+        let commands = runtime
+            .snapshot()
+            .aggregated_commands()
+            .expect("commands should aggregate from active generation");
+        let command_names = commands
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            command_names,
+            BTreeSet::from(["build".to_string(), "sync".to_string()])
+        );
+    }
+
+    #[test]
+    fn plugin_runtime_executes_command_through_controlled_supervisor() {
+        let root = temp_dir("runtime-command-exec");
+        fs::create_dir_all(&root).expect("root");
+        let command_path = if cfg!(windows) {
+            write_lifecycle_script(
+                &root,
+                "say-command",
+                "@echo off\r\necho plugin-command-ok:%1:%2\r\n",
+            )
+        } else {
+            write_lifecycle_script(
+                &root,
+                "say-command",
+                "#!/bin/sh\nprintf 'plugin-command-ok:%s:%s\\n' \"$1\" \"$2\"\n",
+            )
+        };
+        let plugin = RegisteredPlugin::new(
+            PluginDefinition::Bundled(BundledPlugin {
+                metadata: test_metadata(
+                    "command@bundled",
+                    "command",
+                    PluginKind::Bundled,
+                    Some(root.clone()),
+                ),
+                hooks: PluginHooks::default(),
+                lifecycle: PluginLifecycle::default(),
+                execution_policy: PluginExecutionPolicy::default(),
+                permissions: vec![PluginPermission::Read],
+                permission_declarations: vec![PluginPermissionDeclaration::Legacy {
+                    permission: PluginPermission::Read,
+                }],
+                tools: Vec::new(),
+                commands: vec![PluginCommandManifest {
+                    name: "say-command".to_string(),
+                    description: "Say command".to_string(),
+                    command: command_path,
+                }],
+                resources: Vec::new(),
+                prompts: Vec::new(),
+                capabilities: PluginCapabilities {
+                    hot_reload: true,
+                    ..PluginCapabilities::default()
+                },
+                mcp_servers: BTreeMap::new(),
+                dependencies: Vec::new(),
+                rollback: PluginRollbackPlan::default(),
+                version_policy: PluginVersionPolicy::default(),
+                ops_permissions: Vec::new(),
+            }),
+            true,
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![plugin]));
+
+        let specs = runtime.command_specs().expect("command specs");
+        assert_eq!(specs[0].name, "say-command");
+        assert_eq!(
+            runtime
+                .execute_command("say-command", &["alpha".to_string(), "beta".to_string()])
+                .expect("command should execute"),
+            "plugin-command-ok:alpha:beta"
+        );
+        let error = runtime
+            .execute_command("say-command", &["--inject".to_string()])
+            .expect_err("option-like args should be rejected");
+        assert!(error.to_string().contains("argv safety policy"), "{error}");
+        let oversized_args = (0..=PLUGIN_COMMAND_MAX_ARGS)
+            .map(|index| format!("arg{index}"))
+            .collect::<Vec<_>>();
+        let error = runtime
+            .execute_command("say-command", &oversized_args)
+            .expect_err("too many args should be rejected");
+        assert!(error.to_string().contains("item limit"), "{error}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_runtime_unload_blocks_new_calls_and_waits_for_in_flight() {
+        let slow = runtime_plugin(
+            "slow@builtin",
+            "slow",
+            vec![runtime_tool("slow@builtin", "slow_tool", 250)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![slow]));
+        let running = runtime.clone();
+        let call = thread::spawn(move || {
+            running
+                .execute_tool("slow_tool", &serde_json::json!({"slow": true}))
+                .expect("slow call")
+        });
+        while runtime.status().in_flight.get("slow@builtin").copied() != Some(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let unloading = runtime.clone();
+        let unload = thread::spawn(move || unloading.hot_unload("slow@builtin"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime
+            .status()
+            .blocked_plugins
+            .iter()
+            .any(|plugin| plugin == "slow@builtin")
+        {
+            assert!(Instant::now() < deadline, "unload did not block plugin");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let error = runtime
+            .execute_tool("slow_tool", &serde_json::json!({}))
+            .expect_err("new calls should be blocked while unloading");
+        assert!(error.to_string().contains("unloading"));
+        assert!(call.join().expect("call thread").contains("slow"));
+        let status = unload.join().expect("unload thread").expect("unload ok");
+        assert_eq!(status.generation, 1);
+        assert!(!runtime.snapshot().contains("slow@builtin"));
+    }
+
+    #[test]
+    fn plugin_runtime_unload_timeout_preserves_old_snapshot() {
+        let slow = runtime_plugin(
+            "slow@builtin",
+            "slow",
+            vec![runtime_tool("slow@builtin", "slow_tool", 200)],
+        );
+        let runtime = PluginRuntimeRegistry::new(PluginRegistry::new(vec![slow]));
+        let running = runtime.clone();
+        let call = thread::spawn(move || {
+            running
+                .execute_tool("slow_tool", &serde_json::json!({"slow": true}))
+                .expect("slow call")
+        });
+        while runtime.status().in_flight.get("slow@builtin").copied() != Some(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let error = runtime
+            .hot_unload_with_timeout("slow@builtin", Duration::from_millis(20))
+            .expect_err("unload should time out");
+        assert!(error.to_string().contains("deadline"));
+        assert!(runtime.snapshot().contains("slow@builtin"));
+        assert!(call.join().expect("call thread").contains("slow"));
+        assert!(runtime
+            .execute_tool("slow_tool", &serde_json::json!({"again": true}))
+            .expect("tool should remain after timeout")
+            .contains("again"));
+    }
+
+    #[test]
+    fn plugin_runtime_hot_unload_rejects_enabled_dependents() {
+        let base = runtime_plugin(
+            "base@builtin",
+            "base",
+            vec![runtime_tool("base@builtin", "base_tool", 0)],
+        );
+        let dependent = runtime_plugin_with_options(
+            "dependent@builtin",
+            "dependent",
+            vec![runtime_tool("dependent@builtin", "dependent_tool", 0)],
+            Vec::new(),
+            true,
+            vec![PluginDependency {
+                name: "base@builtin".to_string(),
+                version_requirement: None,
+                optional: false,
+            }],
+        );
+        let runtime =
+            PluginRuntimeRegistry::new(PluginRegistry::new(vec![base.clone(), dependent.clone()]));
+
+        let error = runtime
+            .hot_unload("base@builtin")
+            .expect_err("dependent should block unload");
+        assert!(error.to_string().contains("dependent@builtin"), "{error}");
+        assert!(runtime.snapshot().contains("base@builtin"));
+        assert!(runtime.snapshot().contains("dependent@builtin"));
+    }
+
+    struct FailingSupervisor;
+
+    impl PluginRuntimeSupervisor for FailingSupervisor {
+        fn prepare_hot_replace_registry(
+            &self,
+            _registry: PluginRegistry,
+        ) -> Result<PreparedPluginRuntimeReplace, PluginError> {
+            Err(PluginError::CommandFailed(
+                "injected supervisor failure".to_string(),
+            ))
+        }
+
+        fn commit_prepared_hot_replace(
+            &self,
+            _prepared: PreparedPluginRuntimeReplace,
+        ) -> Result<PluginRuntimeStatus, PluginError> {
+            Err(PluginError::CommandFailed(
+                "injected supervisor failure".to_string(),
+            ))
+        }
+
+        fn hot_replace_registry(
+            &self,
+            _registry: PluginRegistry,
+        ) -> Result<PluginRuntimeStatus, PluginError> {
+            Err(PluginError::CommandFailed(
+                "injected supervisor failure".to_string(),
+            ))
+        }
+
+        fn hot_unload_plugin(&self, _plugin_id: &str) -> Result<PluginRuntimeStatus, PluginError> {
+            Err(PluginError::CommandFailed(
+                "injected supervisor failure".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn plugin_manager_hot_load_updates_runtime_supervisor_snapshot() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hot-load-supervisor-home");
+        let source_root = temp_dir("hot-load-supervisor-source");
+        write_hot_reload_external_plugin(&source_root, "hot-load-demo", "1.0.0");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let supervisor = PluginRuntimeRegistry::new(PluginRegistry::new(Vec::new()));
+
+        let outcome = manager
+            .hot_load_with_supervisor(source_root.to_str().expect("source path"), &supervisor)
+            .expect("hot load should install and replace runtime snapshot");
+
+        assert_eq!(outcome.plugin_id, "hot-load-demo@external");
+        assert!(outcome.runtime_status.generation >= 1);
+        assert!(supervisor.snapshot().contains("hot-load-demo@external"));
+        let plugin = manager
+            .list_installed_plugins()
+            .expect("installed plugins")
+            .into_iter()
+            .find(|plugin| plugin.metadata.id == "hot-load-demo@external")
+            .expect("plugin installed");
+        assert!(plugin.enabled);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn plugin_manager_hot_load_supervisor_failure_restores_install_state() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hot-load-restore-home");
+        let source_root = temp_dir("hot-load-restore-source");
+        write_hot_reload_external_plugin(&source_root, "hot-restore", "1.0.0");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+
+        let error = manager
+            .hot_load_with_supervisor(
+                source_root.to_str().expect("source path"),
+                &FailingSupervisor,
+            )
+            .expect_err("supervisor failure should roll back install");
+        assert!(error.to_string().contains("supervisor failure"));
+        assert!(!manager
+            .list_installed_plugins()
+            .expect("installed plugins")
+            .iter()
+            .any(|plugin| plugin.metadata.id == "hot-restore@external"));
+        assert!(!manager
+            .install_root()
+            .join(sanitize_plugin_id("hot-restore@external"))
+            .exists());
+        assert!(
+            !load_enabled_plugins(&manager.settings_path()).contains_key("hot-restore@external")
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn plugin_manager_hot_load_with_supervisor_respects_mutation_lock_contention() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hot-load-lock-contention-home");
+        let source_root = temp_dir("hot-load-lock-contention-source");
+        write_hot_reload_external_plugin(&source_root, "hot-contention", "1.0.0");
+        let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let _locks = manager
+            .acquire_mutation_locks()
+            .expect("first manager should hold mutation locks");
+        let mut blocked_manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let supervisor = PluginRuntimeRegistry::new(PluginRegistry::new(Vec::new()));
+
+        let error = blocked_manager
+            .hot_load_with_supervisor(source_root.to_str().expect("source path"), &supervisor)
+            .expect_err("hot load should fail while mutation locks are held");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(!supervisor.snapshot().contains("hot-contention@external"));
+
+        drop(_locks);
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn plugin_manager_prepared_hot_reload_holds_locks_and_rolls_back_mutation() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hot-reload-lock-home");
+        let source_root = temp_dir("hot-reload-lock-source");
+        write_external_plugin(&source_root, "hot-lock", "1.0.0");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+
+        let prepared = manager
+            .prepare_hot_reload_transaction(|manager| {
+                let outcome = manager.install(source_root.to_str().expect("source path"))?;
+                Ok((outcome.plugin_id, true))
+            })
+            .expect("nested mutation should reuse outer hot-reload locks");
+        assert_eq!(prepared.result, "hot-lock@external");
+        assert!(
+            prepared
+                .candidate_registry()
+                .expect("candidate registry")
+                .contains("hot-lock@external"),
+            "candidate should include the installed plugin before commit"
+        );
+
+        manager
+            .rollback_prepared_hot_reload(prepared)
+            .expect("rollback should restore registry and install tree");
+        assert!(!manager
+            .list_installed_plugins()
+            .expect("installed plugins")
+            .iter()
+            .any(|plugin| plugin.metadata.id == "hot-lock@external"));
+        assert!(!manager
+            .install_root()
+            .join(sanitize_plugin_id("hot-lock@external"))
+            .exists());
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn plugin_manager_hot_unload_reverts_disable_when_runtime_supervisor_fails() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hot-unload-revert-home");
+        let source_root = temp_dir("hot-unload-revert-source");
+        write_external_plugin(&source_root, "hot-revert", "1.0.0");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("source path"))
+            .expect("install plugin");
+
+        let error = manager
+            .hot_unload_with_supervisor("hot-revert@external", &FailingSupervisor)
+            .expect_err("runtime supervisor failure should fail hot unload");
+        assert!(error.to_string().contains("supervisor failure"));
+        let plugin = manager
+            .list_installed_plugins()
+            .expect("installed plugins")
+            .into_iter()
+            .find(|plugin| plugin.metadata.id == "hot-revert@external")
+            .expect("plugin remains installed");
+        assert!(plugin.enabled, "disable should be reverted");
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]

@@ -52,8 +52,9 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{
-    PluginHooks, PluginManager, PluginManagerConfig, PluginMcpServerManifest, PluginMcpTransport,
-    PluginRegistry,
+    sanitize_plugin_error, PluginHooks, PluginManager, PluginManagerConfig,
+    PluginMcpServerManifest, PluginMcpTransport, PluginRegistry, PluginRuntimeRegistry,
+    PluginRuntimeStatus, PluginTool, PreparedPluginHotReload,
 };
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::permission_enforcer::PermissionEnforcer;
@@ -496,6 +497,7 @@ fn plugin_command_json(
         "status": plugin_json_status(failures, report.scan_report()),
         "message": result.message,
         "reload_runtime": result.reload_runtime,
+        "hot_reload": plugin_hot_reload_json(result.reload_runtime),
         "plugins": report.summaries().iter().map(plugin_summary_json).collect::<Vec<_>>(),
         "load_failures": failures.iter().map(plugin_load_failure_json).collect::<Vec<_>>(),
         "scan": plugin_scan_report_json(report.scan_report()),
@@ -515,6 +517,28 @@ fn plugin_json_status(
     } else {
         "degraded"
     }
+}
+
+fn plugin_action_may_mutate(action: Option<&str>) -> bool {
+    matches!(
+        action,
+        Some("install" | "enable" | "disable" | "remove" | "uninstall" | "update" | "rollback")
+    )
+}
+
+fn plugin_hot_reload_json(required: bool) -> Value {
+    json!({
+        "required": required,
+        "strategy": "in_process_runtime_swap",
+        "deadline_ms": plugins::PLUGIN_HOT_RELOAD_DEADLINE_MS,
+        "restart_required": false,
+        "surfaces": {
+            "tools": "synced",
+            "hooks": "synced",
+            "mcp": "synced",
+            "commands": "synced"
+        },
+    })
 }
 
 fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
@@ -1799,7 +1823,9 @@ fn parse_direct_slash_cli_action(
                 }),
             }
         }
-        Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
+        Ok(Some(SlashCommand::Unknown { name, .. })) => {
+            Err(format_unknown_direct_slash_command(&name))
+        }
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
@@ -4867,7 +4893,7 @@ fn run_resume_command(
                 })),
             })
         }
-        SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
+        SlashCommand::Unknown { name, .. } => Err(format_unknown_slash_command(name).into()),
         // /session list/exists/delete can be served from the managed sessions directory
         // in resume mode without starting an interactive REPL. Mutating delete remains
         // opt-in through /session delete <id> --force so JSON callers never hang on a prompt.
@@ -5150,6 +5176,73 @@ struct RuntimePluginState {
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
+struct RuntimePluginStatePlan {
+    feature_config: runtime::RuntimeFeatureConfig,
+    plugin_registry: PluginRegistry,
+    plugin_tools: Vec<PluginTool>,
+    mcp_servers: BTreeMap<String, runtime::ScopedMcpServerConfig>,
+}
+
+impl RuntimePluginStatePlan {
+    fn activate(self) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+        let (mcp_state, runtime_tools) = activate_runtime_mcp_state(&self.mcp_servers)?;
+        let mcp_guard = RuntimeMcpActivationGuard::new(mcp_state);
+        let tool_registry = match GlobalToolRegistry::with_plugin_tools(self.plugin_tools)
+            .and_then(|registry| registry.with_runtime_tools(runtime_tools))
+        {
+            Ok(tool_registry) => tool_registry,
+            Err(error) => return Err(mcp_guard.shutdown_with_error(error)),
+        };
+        let mcp_state = mcp_guard.disarm();
+        Ok(RuntimePluginState {
+            feature_config: self.feature_config,
+            tool_registry,
+            plugin_registry: self.plugin_registry,
+            mcp_state,
+        })
+    }
+}
+
+struct RuntimeMcpActivationGuard {
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+}
+
+impl RuntimeMcpActivationGuard {
+    fn new(mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>) -> Self {
+        Self { mcp_state }
+    }
+
+    fn disarm(mut self) -> Option<Arc<Mutex<RuntimeMcpState>>> {
+        self.mcp_state.take()
+    }
+
+    fn shutdown_with_error(mut self, error: String) -> Box<dyn std::error::Error> {
+        let mut message = sanitize_plugin_error(&error);
+        if let Some(mcp_state) = self.mcp_state.take() {
+            if let Err(shutdown_error) = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+            {
+                message.push_str("; candidate MCP shutdown degraded: ");
+                message.push_str(&sanitize_plugin_error(&shutdown_error.to_string()));
+            }
+        }
+        message.into()
+    }
+}
+
+impl Drop for RuntimeMcpActivationGuard {
+    fn drop(&mut self) {
+        if let Some(mcp_state) = self.mcp_state.take() {
+            let _ = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown();
+        }
+    }
+}
+
 struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
@@ -5166,7 +5259,8 @@ const MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 3_600_000;
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
-    plugins_active: bool,
+    plugin_supervisor: PluginRuntimeRegistry,
+    owns_plugins: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
 }
@@ -5175,12 +5269,14 @@ impl BuiltRuntime {
     fn new(
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
+        plugin_supervisor: PluginRuntimeRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
             plugin_registry,
-            plugins_active: true,
+            plugin_supervisor,
+            owns_plugins: true,
             mcp_state,
             mcp_active: true,
         }
@@ -5196,9 +5292,9 @@ impl BuiltRuntime {
     }
 
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.plugins_active {
+        if self.owns_plugins {
             self.plugin_registry.shutdown()?;
-            self.plugins_active = false;
+            self.owns_plugins = false;
         }
         Ok(())
     }
@@ -5214,6 +5310,14 @@ impl BuiltRuntime {
             self.mcp_active = false;
         }
         Ok(())
+    }
+
+    fn plugin_supervisor(&self) -> &PluginRuntimeRegistry {
+        &self.plugin_supervisor
+    }
+
+    fn set_plugin_owner(&mut self, owns_plugins: bool) {
+        self.owns_plugins = owns_plugins;
     }
 }
 
@@ -5982,7 +6086,13 @@ fn build_runtime_mcp_state(
     plugin_servers: BTreeMap<String, PluginMcpServerManifest>,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
     let servers = merged_runtime_mcp_servers(runtime_config, plugin_servers)?;
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(&servers)? else {
+    activate_runtime_mcp_state(&servers)
+}
+
+fn activate_runtime_mcp_state(
+    servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
+) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new(servers)? else {
         return Ok((None, Vec::new()));
     };
 
@@ -6402,14 +6512,20 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
+        let mut completions = slash_command_completion_candidates_with_sessions(
             &self.model,
             Some(&self.session.id),
             list_managed_sessions()?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
-        ))
+        );
+        completions.extend(plugin_slash_completion_candidates(
+            self.runtime.plugin_supervisor(),
+        ));
+        completions.sort();
+        completions.dedup();
+        Ok(completions)
     }
 
     fn prepare_turn_runtime(
@@ -6417,7 +6533,8 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let runtime_plugin_state = build_runtime_plugin_state()?;
+        let mut runtime = build_runtime_with_plugin_state_inner(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -6427,17 +6544,63 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            runtime_plugin_state,
+            false,
+            Some(self.runtime.plugin_supervisor.clone()),
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        runtime.set_plugin_owner(false);
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.shutdown_plugins()?;
-        self.runtime = runtime;
-        Ok(())
+        self.replace_runtime_with_cleanup(runtime, true)
+    }
+
+    fn replace_runtime_after_turn(
+        &mut self,
+        mut runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        runtime.set_plugin_owner(self.runtime.owns_plugins);
+        self.replace_runtime_with_cleanup(runtime, false)
+    }
+
+    fn replace_runtime_after_plugin_hot_swap(
+        &mut self,
+        mut runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        runtime.plugin_supervisor = self.runtime.plugin_supervisor.clone();
+        self.replace_runtime_with_cleanup(runtime, false)
+    }
+
+    fn replace_runtime_with_cleanup(
+        &mut self,
+        runtime: BuiltRuntime,
+        shutdown_old_plugins: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut old_runtime = std::mem::replace(&mut self.runtime, runtime);
+        let mut errors = Vec::new();
+        if let Err(error) = old_runtime.shutdown_mcp() {
+            errors.push(format!("mcp shutdown failed: {error}"));
+        }
+        if shutdown_old_plugins {
+            if let Err(error) = old_runtime.shutdown_plugins() {
+                errors.push(format!("plugin shutdown failed: {error}"));
+            }
+        } else {
+            old_runtime.set_plugin_owner(false);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "runtime replacement committed; cleanup degraded: {}",
+                errors.join("; ")
+            )
+            .into())
+        }
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -6454,7 +6617,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
-                self.replace_runtime(runtime)?;
+                self.replace_runtime_after_turn(runtime)?;
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
@@ -6567,7 +6730,7 @@ impl LiveCli {
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
-                                self.replace_runtime(new_runtime)?;
+                                self.replace_runtime_after_turn(new_runtime)?;
                                 spinner.finish(
                                     if round == 0 {
                                         "✨ Done (after auto-compact)"
@@ -6635,7 +6798,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
-        self.replace_runtime(runtime)?;
+        self.replace_runtime_after_turn(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
@@ -6648,7 +6811,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
-        self.replace_runtime(runtime)?;
+        self.replace_runtime_after_turn(runtime)?;
         self.persist_session()?;
         println!(
             "{}",
@@ -6673,7 +6836,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
-        self.replace_runtime(runtime)?;
+        self.replace_runtime_after_turn(runtime)?;
         self.persist_session()?;
         println!(
             "{}",
@@ -6712,7 +6875,7 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                println!("{}", self.render_repl_help());
                 false
             }
             SlashCommand::Status => {
@@ -6881,11 +7044,59 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
-            SlashCommand::Unknown(name) => {
-                eprintln!("{}", format_unknown_slash_command(&name));
+            SlashCommand::Unknown { name, args, .. } => {
+                if !self.handle_plugin_slash_command(&name, &args)? {
+                    eprintln!("{}", format_unknown_slash_command(&name));
+                }
                 false
             }
         })
+    }
+
+    fn render_repl_help(&self) -> String {
+        let mut help = render_repl_help();
+        let commands = self
+            .runtime
+            .plugin_supervisor()
+            .command_specs()
+            .unwrap_or_default();
+        if !commands.is_empty() {
+            help.push_str("\n\nPlugin commands");
+            for command in commands {
+                help.push_str(&format!(
+                    "\n  /{:<18} {}",
+                    command.name,
+                    command.description.trim()
+                ));
+            }
+        }
+        help
+    }
+
+    fn handle_plugin_slash_command(
+        &self,
+        name: &str,
+        args: &[String],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let command_name = name.trim();
+        if command_name.is_empty() {
+            return Ok(false);
+        }
+        let commands = self.runtime.plugin_supervisor().command_specs()?;
+        if !commands
+            .iter()
+            .any(|command| command.name.as_str() == command_name)
+        {
+            return Ok(false);
+        }
+        let output = self
+            .runtime
+            .plugin_supervisor()
+            .execute_command(command_name, args)?;
+        if !output.is_empty() {
+            println!("{output}");
+        }
+        Ok(true)
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -7405,6 +7616,7 @@ impl LiveCli {
                     "plugins": filtered_plugins,
                     "load_failures": payload.load_failures,
                     "scan": payload.scan,
+                    "hot_reload": plugin_hot_reload_json(payload.reload_runtime),
                 });
                 // Only include operation-result fields for mutating actions (not list/show)
                 if action_str != "list" && !is_show_action {
@@ -7594,6 +7806,146 @@ impl LiveCli {
         action: Option<&str>,
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        if plugin_action_may_mutate(action) {
+            let cwd = env::current_dir()?;
+            let loader = ConfigLoader::default_for(&cwd);
+            let runtime_config = loader.load()?;
+            let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+            let prepared = manager.prepare_hot_reload_transaction(|manager| {
+                let result = handle_plugins_slash_command(action, target, manager)?;
+                let reload_runtime = result.reload_runtime;
+                Ok((result, reload_runtime))
+            })?;
+            let Some(candidate_registry) = prepared.candidate_registry().cloned() else {
+                let finish = manager.finish_prepared_hot_reload(prepared);
+                emit_plugin_cleanup_warning(finish.cleanup_warning);
+                let payload = finish.result;
+                println!("{}", payload.message);
+                return Ok(false);
+            };
+            let old_runtime_config = runtime_config.clone();
+            let old_plugin_registry = self.runtime.plugin_registry.clone();
+            let runtime_prepare = match self
+                .runtime
+                .plugin_supervisor()
+                .prepare_hot_replace(candidate_registry)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Err(self.rollback_plugin_hot_swap_before_mcp_shutdown(
+                        &mut manager,
+                        prepared,
+                        error,
+                    ));
+                }
+            };
+            let accepted_registry = runtime_prepare.accepted_registry().clone();
+            let candidate_plan = match build_runtime_plugin_state_plan_from_registry(
+                &runtime_config,
+                accepted_registry,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return Err(self.rollback_plugin_hot_swap_before_mcp_shutdown(
+                        &mut manager,
+                        prepared,
+                        error,
+                    ));
+                }
+            };
+            if let Err(error) = self.runtime.shutdown_mcp() {
+                return Err(self.rollback_and_restore_after_plugin_hot_swap_failure(
+                    &mut manager,
+                    prepared,
+                    &old_runtime_config,
+                    old_plugin_registry,
+                    error,
+                ));
+            }
+            let runtime_plugin_state = match candidate_plan.activate() {
+                Ok(state) => state,
+                Err(error) => {
+                    return Err(self.rollback_and_restore_after_plugin_hot_swap_failure(
+                        &mut manager,
+                        prepared,
+                        &old_runtime_config,
+                        old_plugin_registry,
+                        error,
+                    ));
+                }
+            };
+            let candidate_mcp_state = runtime_plugin_state.mcp_state.clone();
+            let mut runtime = match build_runtime_with_plugin_state_inner(
+                self.runtime.session().clone(),
+                &self.session.id,
+                self.model.clone(),
+                self.system_prompt.clone(),
+                true,
+                true,
+                self.allowed_tools.clone(),
+                self.permission_mode,
+                None,
+                runtime_plugin_state,
+                false,
+                Some(self.runtime.plugin_supervisor.clone()),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let mut primary_error = sanitize_plugin_error(&error.to_string());
+                    if let Some(shutdown_error) = shutdown_candidate_mcp_state(candidate_mcp_state)
+                    {
+                        primary_error.push_str("; candidate MCP shutdown degraded: ");
+                        primary_error.push_str(&shutdown_error);
+                    }
+                    return Err(self.rollback_and_restore_after_plugin_hot_swap_failure(
+                        &mut manager,
+                        prepared,
+                        &old_runtime_config,
+                        old_plugin_registry,
+                        primary_error,
+                    ));
+                }
+            };
+            let hot_status = match self
+                .runtime
+                .plugin_supervisor()
+                .commit_prepared_hot_replace(runtime_prepare)
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    let mut primary_error = sanitize_plugin_error(&error.to_string());
+                    if let Err(shutdown_error) = runtime.shutdown_mcp() {
+                        primary_error.push_str("; candidate MCP shutdown degraded: ");
+                        primary_error.push_str(&sanitize_plugin_error(&shutdown_error.to_string()));
+                    }
+                    return Err(self.rollback_and_restore_after_plugin_hot_swap_failure(
+                        &mut manager,
+                        prepared,
+                        &old_runtime_config,
+                        old_plugin_registry,
+                        primary_error,
+                    ));
+                }
+            };
+            let finish = manager.finish_prepared_hot_reload(prepared);
+            let payload = finish.result;
+            let hot_status =
+                runtime_status_with_cleanup_warning(hot_status, finish.cleanup_warning);
+            self.replace_runtime_after_plugin_hot_swap(runtime)?;
+            println!("{}", payload.message);
+            if payload.reload_runtime {
+                if hot_status.phase == "degraded" {
+                    eprintln!(
+                        "plugin hot reload degraded: {}",
+                        hot_status
+                            .last_error
+                            .unwrap_or_else(|| "runtime snapshot degraded".to_string())
+                    );
+                }
+            }
+            return Ok(false);
+        }
+
         let cwd = env::current_dir()?;
         let payload =
             plugins_command_payload_for(&cwd, action, target, ConfigWarningMode::EmitStderr)?;
@@ -7618,6 +7970,105 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
+    }
+
+    fn reload_runtime_features_after_plugin_hot_swap(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime.shutdown_mcp()?;
+        let runtime_plugin_state = build_runtime_plugin_state()?;
+        let runtime = build_runtime_with_plugin_state_inner(
+            self.runtime.session().clone(),
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+            runtime_plugin_state,
+            false,
+            Some(self.runtime.plugin_supervisor.clone()),
+        )?;
+        self.replace_runtime_after_plugin_hot_swap(runtime)?;
+        self.persist_session()
+    }
+
+    fn rollback_plugin_hot_swap_before_mcp_shutdown<T>(
+        &mut self,
+        manager: &mut PluginManager,
+        prepared: PreparedPluginHotReload<T>,
+        primary_error: impl std::fmt::Display,
+    ) -> Box<dyn std::error::Error> {
+        let mut details = vec![format!(
+            "primary failure: {}",
+            sanitize_plugin_error(&primary_error.to_string())
+        )];
+        if let Err(error) = manager.rollback_prepared_hot_reload(prepared) {
+            details.push(format!(
+                "rollback degraded: {}",
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+        format!(
+            "plugin hot reload failed before MCP shutdown; {}",
+            details.join("; ")
+        )
+        .into()
+    }
+
+    fn rollback_and_restore_after_plugin_hot_swap_failure<T>(
+        &mut self,
+        manager: &mut PluginManager,
+        prepared: PreparedPluginHotReload<T>,
+        old_runtime_config: &runtime::RuntimeConfig,
+        old_plugin_registry: PluginRegistry,
+        primary_error: impl std::fmt::Display,
+    ) -> Box<dyn std::error::Error> {
+        let mut details = vec![format!(
+            "primary failure: {}",
+            sanitize_plugin_error(&primary_error.to_string())
+        )];
+        if let Err(error) = manager.rollback_prepared_hot_reload(prepared) {
+            details.push(format!(
+                "rollback degraded: {}",
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+        if let Err(error) = self
+            .reconnect_runtime_after_failed_plugin_hot_swap(old_runtime_config, old_plugin_registry)
+        {
+            details.push(format!(
+                "old MCP/runtime restore degraded: {}",
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+        format!("plugin hot reload failed; {}", details.join("; ")).into()
+    }
+
+    fn reconnect_runtime_after_failed_plugin_hot_swap(
+        &mut self,
+        runtime_config: &runtime::RuntimeConfig,
+        plugin_registry: PluginRegistry,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime_plugin_state =
+            build_runtime_plugin_state_from_registry(runtime_config, plugin_registry)?;
+        let runtime = build_runtime_with_plugin_state_inner(
+            self.runtime.session().clone(),
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+            runtime_plugin_state,
+            false,
+            Some(self.runtime.plugin_supervisor.clone()),
+        )?;
+        self.replace_runtime_after_plugin_hot_swap(runtime)
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -7649,7 +8100,8 @@ impl LiveCli {
         progress: Option<InternalPromptProgressReporter>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let session = self.runtime.session().clone();
-        let mut runtime = build_runtime(
+        let runtime_plugin_state = build_runtime_plugin_state()?;
+        let mut runtime = build_runtime_with_plugin_state_inner(
             session,
             &self.session.id,
             self.model.clone(),
@@ -7659,7 +8111,11 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            runtime_plugin_state,
+            false,
+            Some(self.runtime.plugin_supervisor.clone()),
         )?;
+        runtime.set_plugin_owner(false);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
@@ -10093,22 +10549,34 @@ fn build_runtime_plugin_state_with_loader(
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_report = plugin_manager.plugin_registry_report()?;
-    let plugin_registry = plugin_report.healthy_registry();
+    build_runtime_plugin_state_from_registry(runtime_config, plugin_report.healthy_registry())
+}
+
+fn build_runtime_plugin_state_from_registry(
+    runtime_config: &runtime::RuntimeConfig,
+    plugin_registry: PluginRegistry,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_plan_from_registry(runtime_config, plugin_registry)?.activate()
+}
+
+fn build_runtime_plugin_state_plan_from_registry(
+    runtime_config: &runtime::RuntimeConfig,
+    plugin_registry: PluginRegistry,
+) -> Result<RuntimePluginStatePlan, Box<dyn std::error::Error>> {
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
     let feature_config = runtime_config
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) =
-        build_runtime_mcp_state(runtime_config, plugin_registry.aggregated_mcp_servers()?)?;
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
-        .with_runtime_tools(runtime_tools)?;
-    Ok(RuntimePluginState {
+    let plugin_tools = plugin_registry.aggregated_tools()?;
+    let mcp_servers =
+        merged_runtime_mcp_servers(runtime_config, plugin_registry.aggregated_mcp_servers()?)?;
+    Ok(RuntimePluginStatePlan {
         feature_config,
-        tool_registry,
         plugin_registry,
-        mcp_state,
+        plugin_tools,
+        mcp_servers,
     })
 }
 
@@ -10136,6 +10604,39 @@ fn build_plugin_manager(
         .bundled_root()
         .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
     PluginManager::new(plugin_config)
+}
+
+fn runtime_status_with_cleanup_warning(
+    mut status: PluginRuntimeStatus,
+    cleanup_warning: Option<String>,
+) -> PluginRuntimeStatus {
+    if let Some(warning) = cleanup_warning {
+        status.phase = "degraded".to_string();
+        status.last_error = Some(match status.last_error.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {warning}"),
+            _ => warning,
+        });
+    }
+    status
+}
+
+fn emit_plugin_cleanup_warning(cleanup_warning: Option<String>) {
+    if let Some(warning) = cleanup_warning {
+        eprintln!("plugin hot reload cleanup degraded: {warning}");
+    }
+}
+
+fn shutdown_candidate_mcp_state(
+    candidate_mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+) -> Option<String> {
+    candidate_mcp_state.and_then(|mcp_state| {
+        mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown()
+            .err()
+            .map(|error| sanitize_plugin_error(&error.to_string()))
+    })
 }
 
 fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
@@ -10516,6 +11017,36 @@ fn build_runtime(
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    runtime_plugin_state: RuntimePluginState,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    build_runtime_with_plugin_state_inner(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        runtime_plugin_state,
+        true,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_plugin_state_inner(
     mut session: Session,
     session_id: &str,
     model: String,
@@ -10526,6 +11057,8 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    initialize_plugins: bool,
+    plugin_supervisor: Option<PluginRuntimeRegistry>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -10537,7 +11070,11 @@ fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
-    plugin_registry.initialize()?;
+    if initialize_plugins {
+        plugin_registry.initialize()?;
+    }
+    let plugin_supervisor =
+        plugin_supervisor.unwrap_or_else(|| PluginRuntimeRegistry::new(plugin_registry.clone()));
     start_os_sense_scheduler().map_err(std::io::Error::other)?;
     let os_sense_prompt_provider =
         os_sense_system_prompt_provider().map_err(std::io::Error::other)?;
@@ -10563,7 +11100,8 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             mcp_state.clone(),
             Some(log_summary_generator),
-        ),
+        )
+        .with_plugin_supervisor(plugin_supervisor.clone()),
         policy,
         system_prompt,
         &feature_config,
@@ -10572,7 +11110,12 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        plugin_supervisor,
+        mcp_state,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -11449,6 +11992,18 @@ fn slash_command_completion_candidates_with_sessions(
     completions.into_iter().collect()
 }
 
+fn plugin_slash_completion_candidates(supervisor: &PluginRuntimeRegistry) -> Vec<String> {
+    supervisor.command_specs().map_or_else(
+        |_| Vec::new(),
+        |commands| {
+            commands
+                .into_iter()
+                .map(|command| format!("/{}", command.name))
+                .collect()
+        },
+    )
+}
+
 fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
@@ -12001,6 +12556,7 @@ struct CliToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
+    plugin_supervisor: Option<PluginRuntimeRegistry>,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     log_summary_generator: Option<Arc<dyn LogSummaryGenerator>>,
 }
@@ -12018,9 +12574,15 @@ impl CliToolExecutor {
             emit_output,
             allowed_tools,
             tool_registry,
+            plugin_supervisor: None,
             mcp_state,
             log_summary_generator,
         }
+    }
+
+    fn with_plugin_supervisor(mut self, plugin_supervisor: PluginRuntimeRegistry) -> Self {
+        self.plugin_supervisor = Some(plugin_supervisor);
+        self
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -12131,6 +12693,19 @@ impl ToolExecutor for CliToolExecutor {
                         .expect("generator checked above"),
                 )
                 .map_err(ToolError::new)
+        } else if let Some(output) = self
+            .tool_registry
+            .execute_plugin_tool_with(tool_name, &value, || {
+                let Some(supervisor) = &self.plugin_supervisor else {
+                    return self.tool_registry.execute(tool_name, &value);
+                };
+                supervisor
+                    .execute_tool(tool_name, &value)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(ToolError::new)?
+        {
+            Ok(output)
         } else {
             self.tool_registry
                 .execute(tool_name, &value)
@@ -12403,8 +12978,10 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        acp_status_json, activate_runtime_mcp_state, build_runtime_plugin_state_plan_from_registry,
+        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
+        build_runtime_with_plugin_state_inner, classify_error_kind,
+        classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
@@ -12422,13 +12999,14 @@ mod tests {
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, AnthropicRuntimeClient, CliAction,
-        CliLogSummaryGenerator, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
-        StatusUsage, TmuxPaneSnapshot, CLI_LOG_SUMMARY_MAX_TOKENS, DEFAULT_MODEL,
+        shutdown_candidate_mcp_state, slash_command_completion_candidates_with_sessions,
+        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
+        AnthropicRuntimeClient, CliAction, CliLogSummaryGenerator, CliOutputFormat,
+        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
+        RuntimeMcpActivationGuard, SessionHandle, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, CLI_LOG_SUMMARY_MAX_TOKENS, DEFAULT_MODEL,
         LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{
@@ -12444,8 +13022,8 @@ mod tests {
     use plugins::{
         PluginActualSurfaces, PluginCapabilities, PluginError, PluginKind, PluginLifecycle,
         PluginLoadFailure, PluginManager, PluginManagerConfig, PluginManifestMetadata,
-        PluginMcpServerManifest, PluginMetadata, PluginSummary, PluginTool, PluginToolDefinition,
-        PluginToolPermission,
+        PluginMcpServerManifest, PluginMetadata, PluginRegistry, PluginRuntimeRegistry,
+        PluginSummary, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
@@ -13033,6 +13611,106 @@ mod tests {
             serde_json::to_string_pretty(&manifest).expect("serialize plugin manifest"),
         )
         .expect("write plugin MCP manifest");
+    }
+
+    fn write_plugin_tool_fixture(root: &Path, name: &str, tool_name: &str, sleep_ms: u64) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("tools")).expect("tools dir");
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let command_path = root.join("tools").join(format!("run.{extension}"));
+        if cfg!(windows) {
+            fs::write(
+                &command_path,
+                format!(
+                    "@echo off\r\npowershell -NoProfile -Command \"Start-Sleep -Milliseconds {sleep_ms}\"\r\necho plugin-tool-ok\r\n"
+                ),
+            )
+            .expect("write command");
+        } else {
+            fs::write(
+                &command_path,
+                format!(
+                    "#!/bin/sh\nsleep {}\nprintf 'plugin-tool-ok\\n'\n",
+                    sleep_ms as f64 / 1000.0
+                ),
+            )
+            .expect("write command");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut permissions = fs::metadata(&command_path)
+                    .expect("command metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&command_path, permissions).expect("chmod command");
+            }
+        }
+        let manifest = json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": "runtime plugin tool fixture",
+            "permissions": ["read"],
+            "capabilities": {
+                "tools": true,
+                "hotReload": true
+            },
+            "tools": [{
+                "name": tool_name,
+                "description": "Slow supervised test tool",
+                "inputSchema": {"type": "object"},
+                "command": format!("./tools/run.{extension}"),
+                "requiredPermission": "read-only"
+            }]
+        });
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize plugin manifest"),
+        )
+        .expect("write plugin tool manifest");
+    }
+
+    fn write_plugin_command_fixture(root: &Path, name: &str, command_name: &str) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("commands")).expect("commands dir");
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let command_path = root.join("commands").join(format!("run.{extension}"));
+        if cfg!(windows) {
+            fs::write(&command_path, "@echo off\r\necho plugin-command-ok\r\n")
+                .expect("write command");
+        } else {
+            fs::write(&command_path, "#!/bin/sh\nprintf 'plugin-command-ok\\n'\n")
+                .expect("write command");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut permissions = fs::metadata(&command_path)
+                    .expect("command metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&command_path, permissions).expect("chmod command");
+            }
+        }
+        let manifest = json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": "runtime plugin command fixture",
+            "permissions": ["read"],
+            "capabilities": {
+                "hotReload": true
+            },
+            "commands": [{
+                "name": command_name,
+                "description": "Test plugin command",
+                "command": format!("./commands/run.{extension}")
+            }]
+        });
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize plugin manifest"),
+        )
+        .expect("write plugin command manifest");
     }
 
     #[test]
@@ -15530,6 +16208,172 @@ mod tests {
     }
 
     #[test]
+    fn cli_tool_executor_plugin_calls_use_supervisor_in_flight_gate() {
+        let config_home = temp_dir();
+        let bundled_root = temp_dir();
+        let plugin_root = bundled_root.join("supervised-tool");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&plugin_root).expect("plugin root");
+        write_plugin_tool_fixture(&plugin_root, "supervised-tool", "supervised_tool", 300);
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config
+            .enabled_plugins
+            .insert("supervised-tool@bundled".to_string(), true);
+        let manager = PluginManager::new(config);
+        let registry = manager.plugin_registry().expect("plugin registry");
+        let tool_registry =
+            GlobalToolRegistry::with_plugin_tools(registry.aggregated_tools().expect("tools"))
+                .expect("tool registry");
+        let supervisor = PluginRuntimeRegistry::new(registry);
+        let mut executor = CliToolExecutor::new(None, false, tool_registry.clone(), None, None)
+            .with_plugin_supervisor(supervisor.clone());
+
+        let call = thread::spawn(move || {
+            executor
+                .execute("supervised_tool", "{}")
+                .expect("plugin tool should run")
+        });
+        let deadline = SystemTime::now() + Duration::from_secs(2);
+        while supervisor
+            .status()
+            .in_flight
+            .get("supervised-tool@bundled")
+            .copied()
+            != Some(1)
+        {
+            assert!(SystemTime::now() < deadline, "tool did not enter in-flight");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let unloading = supervisor.clone();
+        let unload = thread::spawn(move || {
+            unloading.hot_unload_with_timeout("supervised-tool@bundled", Duration::from_secs(2))
+        });
+        let deadline = SystemTime::now() + Duration::from_secs(2);
+        while !supervisor
+            .status()
+            .blocked_plugins
+            .iter()
+            .any(|plugin| plugin == "supervised-tool@bundled")
+        {
+            assert!(SystemTime::now() < deadline, "unload did not block plugin");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut blocked_executor = CliToolExecutor::new(None, false, tool_registry, None, None)
+            .with_plugin_supervisor(supervisor.clone());
+        let error = blocked_executor
+            .execute("supervised_tool", "{}")
+            .expect_err("new plugin tool calls should be blocked during unload");
+        assert!(error.to_string().contains("unloading"), "{error}");
+        assert_eq!(
+            call.join().expect("call thread"),
+            "plugin-tool-ok",
+            "in-flight call should finish before unload commits"
+        );
+        let status = unload
+            .join()
+            .expect("unload thread")
+            .expect("unload should succeed");
+        assert_eq!(status.generation, 1);
+        assert!(!supervisor.snapshot().contains("supervised-tool@bundled"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn runtime_plan_uses_supervisor_accepted_registry_without_quarantined_surface() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let bundled_root = temp_dir();
+        let first_root = bundled_root.join("first-plugin");
+        let second_root = bundled_root.join("second-plugin");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&first_root).expect("first plugin root");
+        fs::create_dir_all(&second_root).expect("second plugin root");
+        write_plugin_tool_fixture(&first_root, "first-plugin", "shared_tool", 0);
+        write_plugin_tool_fixture(&second_root, "second-plugin", "shared_tool", 0);
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config
+            .enabled_plugins
+            .insert("first-plugin@bundled".to_string(), true);
+        config
+            .enabled_plugins
+            .insert("second-plugin@bundled".to_string(), true);
+        let manager = PluginManager::new(config);
+        let requested_registry = manager.plugin_registry().expect("requested registry");
+        let supervisor = PluginRuntimeRegistry::new(PluginRegistry::new(Vec::new()));
+        let prepared = supervisor
+            .prepare_hot_replace(requested_registry)
+            .expect("prepare should quarantine conflicting plugin surfaces");
+        let accepted = prepared.accepted_registry().clone();
+        assert_ne!(
+            accepted.contains("first-plugin@bundled"),
+            accepted.contains("second-plugin@bundled"),
+            "only one of the conflicting test plugins should remain accepted"
+        );
+
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config");
+        let state = build_runtime_plugin_state_plan_from_registry(&runtime_config, accepted)
+            .expect("plan from accepted registry")
+            .activate()
+            .expect("activate accepted registry");
+        let active_ids = state
+            .plugin_registry
+            .plugins()
+            .iter()
+            .map(|plugin| plugin.metadata().id.clone())
+            .collect::<Vec<_>>();
+        assert!(active_ids
+            .iter()
+            .any(|id| id == "first-plugin@bundled" || id == "second-plugin@bundled"));
+        assert_ne!(
+            active_ids.iter().any(|id| id == "first-plugin@bundled"),
+            active_ids.iter().any(|id| id == "second-plugin@bundled"),
+            "the quarantined plugin must not enter the activated runtime"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn plugin_slash_completion_and_execution_use_supervisor_snapshot() {
+        let config_home = temp_dir();
+        let bundled_root = temp_dir();
+        let plugin_root = bundled_root.join("command-plugin");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&plugin_root).expect("plugin root");
+        write_plugin_command_fixture(&plugin_root, "command-plugin", "plugin-hello");
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config
+            .enabled_plugins
+            .insert("command-plugin@bundled".to_string(), true);
+        let manager = PluginManager::new(config);
+        let registry = manager.plugin_registry().expect("plugin registry");
+        let supervisor = PluginRuntimeRegistry::new(registry);
+
+        let completions = super::plugin_slash_completion_candidates(&supervisor);
+        assert!(completions.contains(&"/plugin-hello".to_string()));
+        assert_eq!(
+            supervisor
+                .execute_command("plugin-hello", &[])
+                .expect("plugin command should execute"),
+            "plugin-command-ok"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
     fn shared_help_uses_resume_annotation_copy() {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
@@ -17561,6 +18405,322 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn mcp_candidate_preflight_failure_keeps_existing_mcp_active() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        let script_arg =
+            serde_json::to_string(&script_path.to_string_lossy()).expect("script path JSON");
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{
+                  "mcpServers": {{
+                    "alpha": {{
+                      "command": "python3",
+                      "args": [{}]
+                    }}
+                  }}
+                }}"#,
+                script_arg
+            ),
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+            None,
+        );
+        let first = executor
+            .execute("mcp__alpha__echo", r#"{"text":"before"}"#)
+            .expect("old mcp should execute before candidate preflight");
+        let first_json: serde_json::Value =
+            serde_json::from_str(&first).expect("first output should be json");
+        assert_eq!(first_json["structuredContent"]["echoed"], "before");
+
+        let invalid_manifest: PluginMcpServerManifest = serde_json::from_value(json!({
+            "transport": "stdio",
+            "requiredPermission": "read-only"
+        }))
+        .expect("invalid candidate manifest shape should deserialize");
+        let error = merged_runtime_mcp_servers(
+            &runtime_config,
+            BTreeMap::from([("candidate@bundled::broken".to_string(), invalid_manifest)]),
+        )
+        .expect_err("candidate preflight should fail before MCP shutdown");
+        assert!(
+            error.to_string().contains("missing stdio command"),
+            "{error}"
+        );
+
+        let second = executor
+            .execute("mcp__alpha__echo", r#"{"text":"after"}"#)
+            .expect("old mcp should remain active after candidate preflight failure");
+        let second_json: serde_json::Value =
+            serde_json::from_str(&second).expect("second output should be json");
+        assert_eq!(second_json["structuredContent"]["echoed"], "after");
+
+        if let Some(mcp_state) = state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("mcp shutdown should succeed");
+        }
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn hot_reload_false_plugin_mcp_is_rejected_before_activation() {
+        let config_home = temp_dir();
+        let bundled_root = temp_dir();
+        let plugin_root = bundled_root.join("cold-mcp-plugin");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&plugin_root).expect("plugin root");
+        let marker_path = bundled_root.join("started.marker");
+        let script_path = plugin_root.join("cold-mcp.py");
+        fs::write(
+            &script_path,
+            format!(
+                "import pathlib, time\npathlib.Path({}).write_text('started')\ntime.sleep(30)\n",
+                serde_json::to_string(&marker_path.to_string_lossy()).expect("marker path json")
+            ),
+        )
+        .expect("write marker mcp script");
+        write_plugin_mcp_fixture(&plugin_root, "cold-mcp-plugin", Path::new("./cold-mcp.py"));
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config
+            .enabled_plugins
+            .insert("cold-mcp-plugin@bundled".to_string(), true);
+        let manager = PluginManager::new(config);
+        let requested_registry = manager.plugin_registry().expect("requested registry");
+        let supervisor = PluginRuntimeRegistry::new(PluginRegistry::new(Vec::new()));
+
+        let error = supervisor
+            .prepare_hot_replace(requested_registry)
+            .expect_err("hotReload=false plugin should be rejected during dry-run prepare");
+        assert!(error.to_string().contains("hotReload=true"), "{error}");
+        assert!(
+            !marker_path.exists(),
+            "prepare must not activate MCP for rejected plugins"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn candidate_mcp_shutdown_after_runtime_build_failure_clears_candidate_state() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let bundled_root = temp_dir();
+        let plugin_root = bundled_root.join("candidate-mcp-plugin");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&plugin_root).expect("plugin root");
+        let script_path = plugin_root.join("candidate-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        write_plugin_mcp_fixture(
+            &plugin_root,
+            "candidate-mcp-plugin",
+            Path::new("./candidate-mcp.py"),
+        );
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config
+            .enabled_plugins
+            .insert("candidate-mcp-plugin@bundled".to_string(), true);
+        let manager = PluginManager::new(config);
+        let requested_registry = manager.plugin_registry().expect("requested registry");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config");
+        let state =
+            build_runtime_plugin_state_plan_from_registry(&runtime_config, requested_registry)
+                .expect("candidate plan")
+                .activate()
+                .expect("candidate MCP should activate");
+        let mcp_state = state.mcp_state.clone().expect("candidate MCP state");
+
+        let negotiated_before = {
+            let state = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.manager.server_catalogs()[0]
+                .negotiated_protocol_version
+                .clone()
+        };
+        assert!(negotiated_before.is_some());
+
+        let shutdown_error = shutdown_candidate_mcp_state(state.mcp_state.clone());
+        assert_eq!(shutdown_error, None);
+        let negotiated_after = {
+            let state = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.manager.server_catalogs()[0]
+                .negotiated_protocol_version
+                .clone()
+        };
+        assert_eq!(
+            negotiated_after, None,
+            "candidate MCP state must be cleared before rollback restores the old runtime"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn candidate_mcp_guard_closes_started_mcp_on_runtime_tool_conflict_and_old_mcp_restores() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let old_script = workspace.join("old-mcp.py");
+        let candidate_script = workspace.join("candidate-mcp.py");
+        write_mcp_server_fixture(&old_script);
+        write_mcp_server_fixture(&candidate_script);
+        let old_script_arg =
+            serde_json::to_string(&old_script.to_string_lossy()).expect("old path JSON");
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{
+                  "mcpServers": {{
+                    "alpha": {{
+                      "command": "python3",
+                      "args": [{}]
+                    }}
+                  }}
+                }}"#,
+                old_script_arg
+            ),
+        )
+        .expect("write old mcp settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let old_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("old MCP state should load");
+        let mut old_executor = CliToolExecutor::new(
+            None,
+            false,
+            old_state.tool_registry.clone(),
+            old_state.mcp_state.clone(),
+            None,
+        );
+        old_executor
+            .execute("mcp__alpha__echo", r#"{"text":"before"}"#)
+            .expect("old MCP should execute before candidate");
+        if let Some(mcp_state) = old_state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("old MCP shutdown before candidate");
+        }
+
+        let candidate_manifest: PluginMcpServerManifest = serde_json::from_value(json!({
+            "transport": "stdio",
+            "command": "python3",
+            "args": [candidate_script.to_string_lossy()]
+        }))
+        .expect("candidate manifest");
+        let candidate_servers = merged_runtime_mcp_servers(
+            &runtime_config,
+            BTreeMap::from([(
+                "candidate@bundled::embedded".to_string(),
+                candidate_manifest,
+            )]),
+        )
+        .expect("candidate MCP merge");
+        let (candidate_mcp_state, runtime_tools) =
+            activate_runtime_mcp_state(&candidate_servers).expect("candidate MCP should start");
+        let candidate_mcp_state = candidate_mcp_state.expect("candidate MCP state");
+        let conflicting_name = runtime::mcp_tool_name("candidate@bundled::embedded", "echo");
+        assert!(
+            runtime_tools
+                .iter()
+                .any(|tool| tool.name == conflicting_name),
+            "candidate MCP startup should expose the conflicting runtime tool"
+        );
+        let conflicting_plugin_tool = PluginTool::new(
+            "conflict@bundled",
+            "conflict",
+            PluginToolDefinition {
+                name: conflicting_name.clone(),
+                description: Some("conflicting test tool".to_string()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+            },
+            "echo".to_string(),
+            Vec::new(),
+            PluginToolPermission::ReadOnly,
+            None,
+        );
+        let guard = RuntimeMcpActivationGuard::new(Some(candidate_mcp_state.clone()));
+        let conflict = GlobalToolRegistry::with_plugin_tools(vec![conflicting_plugin_tool])
+            .and_then(|registry| registry.with_runtime_tools(runtime_tools))
+            .expect_err("plugin tool should conflict with candidate MCP runtime tool");
+        let error = guard.shutdown_with_error(conflict);
+        assert!(error.to_string().contains("conflicts"), "{error}");
+        let catalogs = candidate_mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .manager
+            .server_catalogs();
+        assert!(
+            catalogs
+                .iter()
+                .all(|catalog| catalog.negotiated_protocol_version.is_none()),
+            "candidate MCP shutdown should clear candidate protocol state"
+        );
+
+        let restored_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("old MCP should rebuild after candidate failure");
+        let mut restored_executor = CliToolExecutor::new(
+            None,
+            false,
+            restored_state.tool_registry.clone(),
+            restored_state.mcp_state.clone(),
+            None,
+        );
+        let restored = restored_executor
+            .execute("mcp__alpha__echo", r#"{"text":"after"}"#)
+            .expect("old MCP should execute after restore");
+        let restored_json: serde_json::Value =
+            serde_json::from_str(&restored).expect("restored output should be json");
+        assert_eq!(restored_json["structuredContent"]["echoed"], "after");
+        if let Some(mcp_state) = restored_state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("restored MCP shutdown");
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn cli_multi_server_resources_json_truncates_with_valid_byte_budget() {
         let mut queried = Vec::new();
         let output = super::bounded_multi_server_mcp_list_json(
@@ -17897,6 +19057,233 @@ UU conflicted.rs",
 
         assert_eq!(
             fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            "init\nshutdown\n"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(bundled_root);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn hot_swap_runtime_rebuild_reuses_supervisor_without_reinitializing_plugins() {
+        let _guard = env_lock();
+        let config_home = temp_dir();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-hot-swap");
+        let workspace = temp_dir();
+        let bundled_root = temp_dir();
+        let bundled_plugin = bundled_root.join("hot-swap-runtime-demo");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&bundled_plugin).expect("bundled plugin root");
+        write_plugin_fixture(&bundled_plugin, "hot-swap-runtime-demo", false, true);
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "plugins": {
+                    "bundledRoot": bundled_root.to_string_lossy(),
+                    "enabled": {
+                        "hot-swap-runtime-demo@bundled": true
+                    }
+                }
+            }))
+            .expect("serialize plugin settings"),
+        )
+        .expect("write plugin settings");
+        let log_path = config_home
+            .join("plugins")
+            .join("installed")
+            .join("hot-swap-runtime-demo-bundled")
+            .join("lifecycle.log");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let runtime_plugin_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("plugin state should load");
+        let mut runtime = build_runtime_with_plugin_state(
+            Session::new(),
+            "runtime-plugin-hot-swap",
+            DEFAULT_MODEL.to_string(),
+            vec!["test system prompt".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            runtime_plugin_state,
+        )
+        .expect("runtime should build");
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("init log should exist"),
+            "init\n"
+        );
+
+        let refreshed_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("refreshed plugin state should load");
+        runtime
+            .plugin_supervisor
+            .hot_replace(refreshed_state.plugin_registry.clone())
+            .expect("current supervisor should accept refreshed snapshot");
+        let mut rebuilt = build_runtime_with_plugin_state_inner(
+            runtime.session().clone(),
+            "runtime-plugin-hot-swap",
+            DEFAULT_MODEL.to_string(),
+            vec!["test system prompt".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            refreshed_state,
+            false,
+            Some(runtime.plugin_supervisor.clone()),
+        )
+        .expect("runtime should rebuild after hot swap");
+        runtime.set_plugin_owner(false);
+
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("hot rebuild should not re-init"),
+            "init\n"
+        );
+        rebuilt
+            .shutdown_plugins()
+            .expect("rebuilt runtime shutdown should succeed");
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            "init\nshutdown\n"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(bundled_root);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn ordinary_turn_runtime_transfers_plugin_owner_without_shutdown() {
+        let _guard = env_lock();
+        let config_home = temp_dir();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-turn-owner");
+        let workspace = temp_dir();
+        let bundled_root = temp_dir();
+        let bundled_plugin = bundled_root.join("turn-owner-demo");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&bundled_plugin).expect("bundled plugin root");
+        write_plugin_fixture(&bundled_plugin, "turn-owner-demo", false, true);
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "plugins": {
+                    "bundledRoot": bundled_root.to_string_lossy(),
+                    "enabled": {
+                        "turn-owner-demo@bundled": true
+                    }
+                }
+            }))
+            .expect("serialize plugin settings"),
+        )
+        .expect("write plugin settings");
+        let log_path = config_home
+            .join("plugins")
+            .join("installed")
+            .join("turn-owner-demo-bundled")
+            .join("lifecycle.log");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let runtime_plugin_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("plugin state should load");
+        let runtime = build_runtime_with_plugin_state(
+            Session::new(),
+            "runtime-plugin-turn-owner",
+            DEFAULT_MODEL.to_string(),
+            vec!["test system prompt".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            runtime_plugin_state,
+        )
+        .expect("runtime should build");
+        let mut cli = LiveCli {
+            model: DEFAULT_MODEL.to_string(),
+            allowed_tools: None,
+            permission_mode: PermissionMode::DangerFullAccess,
+            system_prompt: vec!["test system prompt".to_string()],
+            runtime,
+            session: SessionHandle {
+                id: "runtime-plugin-turn-owner".to_string(),
+                path: workspace.join("session.jsonl"),
+            },
+            prompt_history: Vec::new(),
+        };
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("init log should exist"),
+            "init\n"
+        );
+
+        let turn_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("turn state should load");
+        let mut turn_runtime = build_runtime_with_plugin_state_inner(
+            cli.runtime.session().clone(),
+            "runtime-plugin-turn-owner",
+            DEFAULT_MODEL.to_string(),
+            vec!["test system prompt".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            turn_state,
+            false,
+            Some(cli.runtime.plugin_supervisor.clone()),
+        )
+        .expect("turn runtime should build");
+        turn_runtime.set_plugin_owner(false);
+        cli.replace_runtime_after_turn(turn_runtime)
+            .expect("turn runtime should replace");
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("turn replace must not shutdown"),
+            "init\n"
+        );
+
+        let failure_turn_state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+                .expect("failure turn state should load");
+        let mut failure_turn_runtime = build_runtime_with_plugin_state_inner(
+            cli.runtime.session().clone(),
+            "runtime-plugin-turn-owner",
+            DEFAULT_MODEL.to_string(),
+            vec!["test system prompt".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            failure_turn_state,
+            false,
+            Some(cli.runtime.plugin_supervisor.clone()),
+        )
+        .expect("failure turn runtime should build");
+        failure_turn_runtime.set_plugin_owner(false);
+        failure_turn_runtime
+            .shutdown_plugins()
+            .expect("failure turn cleanup should not own plugin shutdown");
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("failure cleanup must not shutdown"),
+            "init\n"
+        );
+
+        cli.runtime
+            .shutdown_plugins()
+            .expect("final shutdown should succeed once");
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("final shutdown log"),
             "init\nshutdown\n"
         );
 

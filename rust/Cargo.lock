@@ -549,6 +549,7 @@ dependencies = [
  "plugins",
  "runtime",
  "serde_json",
+ "shlex",
 ]
 
 [[package]]

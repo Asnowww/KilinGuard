@@ -447,6 +447,32 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    pub fn execute_plugin_tool_with<F>(
+        &self,
+        name: &str,
+        input: &Value,
+        execute: F,
+    ) -> Result<Option<String>, String>
+    where
+        F: FnOnce() -> Result<String, String>,
+    {
+        let Some(tool) = self
+            .plugin_tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+        else {
+            return Ok(None);
+        };
+        let required_mode = permission_mode_from_plugin(tool.required_permission())?;
+        maybe_enforce_permission_check_with_mode(
+            self.enforcer.as_ref(),
+            name,
+            input,
+            required_mode,
+        )?;
+        execute().map(Some)
+    }
+
     #[must_use]
     pub fn search(
         &self,

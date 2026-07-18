@@ -1179,7 +1179,11 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
-    Unknown(String),
+    Unknown {
+        name: String,
+        args: Vec<String>,
+        remainder: Option<String>,
+    },
     Team {
         action: Option<String>,
     },
@@ -1495,9 +1499,30 @@ pub fn validate_slash_command_input(
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
-        other => SlashCommand::Unknown(other.to_string()),
+        other => SlashCommand::Unknown {
+            name: other.to_string(),
+            args: parse_unknown_slash_command_args(command, remainder.as_deref())?,
+            remainder,
+        },
     }))
 }
+
+fn parse_unknown_slash_command_args(
+    command: &str,
+    remainder: Option<&str>,
+) -> Result<Vec<String>, SlashCommandParseError> {
+    let Some(remainder) = remainder else {
+        return Ok(Vec::new());
+    };
+    shlex::split(remainder).ok_or_else(|| {
+        command_error(
+            "Invalid quoting in slash command arguments.",
+            command,
+            &format!("/{command} [args]"),
+        )
+    })
+}
+
 fn validate_no_args(command: &str, args: &[&str]) -> Result<(), SlashCommandParseError> {
     if args.is_empty() {
         return Ok(());
@@ -4761,7 +4786,7 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
-        | SlashCommand::Unknown(_) => None,
+        | SlashCommand::Unknown { .. } => None,
     }
 }
 
@@ -5116,6 +5141,25 @@ mod tests {
                 target: Some("incident-review".to_string())
             }))
         );
+        assert_eq!(
+            SlashCommand::parse("/plugin-hello alpha beta"),
+            Ok(Some(SlashCommand::Unknown {
+                name: "plugin-hello".to_string(),
+                args: vec!["alpha".to_string(), "beta".to_string()],
+                remainder: Some("alpha beta".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse(r#"/plugin-hello  "alpha beta" gamma\ delta"#),
+            Ok(Some(SlashCommand::Unknown {
+                name: "plugin-hello".to_string(),
+                args: vec!["alpha beta".to_string(), "gamma delta".to_string()],
+                remainder: Some(r#""alpha beta" gamma\ delta"#.to_string())
+            }))
+        );
+        let err = SlashCommand::parse(r#"/plugin-hello "unterminated"#)
+            .expect_err("unterminated quote should fail structurally");
+        assert!(err.to_string().contains("Invalid quoting"));
     }
 
     #[test]
