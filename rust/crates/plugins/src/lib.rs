@@ -5,7 +5,7 @@ pub mod test_isolation;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(test)]
@@ -16,8 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 pub use hooks::{HookEvent, HookRunResult, HookRunner};
 
@@ -26,6 +28,7 @@ const BUILTIN_MARKETPLACE: &str = "builtin";
 const BUNDLED_MARKETPLACE: &str = "bundled";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
+const PLUGIN_VERSIONS_DIR_NAME: &str = ".versions";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 const BUILTIN_OPS_PLACEHOLDER_COMMAND: &str = "__claw_builtin_ops_placeholder__";
@@ -1967,20 +1970,57 @@ pub struct InstalledPluginRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledPluginVersionRecord {
+    #[serde(rename = "archiveId", default)]
+    pub archive_id: String,
     pub version: String,
     pub description: String,
     pub install_path: PathBuf,
+    #[serde(default)]
+    pub source: String,
+    #[serde(rename = "contentHash", default)]
+    pub content_hash: String,
     pub archived_at_unix_ms: u128,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+const INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION: u32 = 2;
+const LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION: u32 = 0;
+
+fn legacy_installed_plugin_registry_schema_version() -> u32 {
+    LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION
+}
+
+fn is_legacy_installed_plugin_registry_schema_version(value: &u32) -> bool {
+    *value == LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledPluginRegistry {
+    #[serde(
+        rename = "schemaVersion",
+        default = "legacy_installed_plugin_registry_schema_version",
+        skip_serializing_if = "is_legacy_installed_plugin_registry_schema_version"
+    )]
+    pub schema_version: u32,
     #[serde(default)]
     pub plugins: BTreeMap<String, InstalledPluginRecord>,
     #[serde(default)]
     pub versions: BTreeMap<String, Vec<InstalledPluginVersionRecord>>,
     #[serde(skip)]
     pub migration_warnings: Vec<String>,
+    #[serde(skip)]
+    migration_blocked_plugin_ids: BTreeSet<String>,
+}
+
+impl Default for InstalledPluginRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION,
+            plugins: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            migration_warnings: Vec::new(),
+            migration_blocked_plugin_ids: BTreeSet::new(),
+        }
+    }
 }
 
 fn default_plugin_kind() -> PluginKind {
@@ -2558,15 +2598,27 @@ impl Plugin for PluginDefinition {
 pub struct RegisteredPlugin {
     definition: PluginDefinition,
     enabled: bool,
+    available_versions: BTreeSet<String>,
 }
 
 impl RegisteredPlugin {
     #[must_use]
     pub fn new(definition: PluginDefinition, enabled: bool) -> Self {
+        let mut available_versions = BTreeSet::new();
+        available_versions.insert(definition.metadata().version.clone());
         Self {
             definition,
             enabled,
+            available_versions,
         }
+    }
+
+    #[must_use]
+    pub fn with_available_versions(mut self, available_versions: BTreeSet<String>) -> Self {
+        if !available_versions.is_empty() {
+            self.available_versions = available_versions;
+        }
+        self
     }
 
     #[must_use]
@@ -2869,6 +2921,7 @@ pub struct PluginRegistryReport {
     registry: PluginRegistry,
     failures: Vec<PluginLoadFailure>,
     scan_report: PluginScanReport,
+    blocked_plugin_ids: BTreeSet<String>,
 }
 
 impl PluginRegistryReport {
@@ -2878,6 +2931,7 @@ impl PluginRegistryReport {
             registry,
             failures,
             scan_report: PluginScanReport::default(),
+            blocked_plugin_ids: BTreeSet::new(),
         }
     }
 
@@ -2891,7 +2945,14 @@ impl PluginRegistryReport {
             registry,
             failures,
             scan_report,
+            blocked_plugin_ids: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_blocked_plugins(mut self, blocked_plugin_ids: BTreeSet<String>) -> Self {
+        self.blocked_plugin_ids = blocked_plugin_ids;
+        self
     }
 
     #[must_use]
@@ -2901,7 +2962,7 @@ impl PluginRegistryReport {
 
     #[must_use]
     pub fn healthy_registry(&self) -> PluginRegistry {
-        self.registry.clone()
+        self.registry.without_plugins(&self.blocked_plugin_ids)
     }
 
     #[must_use]
@@ -2947,6 +3008,7 @@ struct PluginDiscovery {
     plugins: Vec<PluginDefinition>,
     failures: Vec<PluginLoadFailure>,
     scan_report: PluginScanReport,
+    blocked_plugin_ids: BTreeSet<String>,
 }
 
 impl PluginDiscovery {
@@ -2961,6 +3023,7 @@ impl PluginDiscovery {
     fn extend(&mut self, other: Self) {
         self.plugins.extend(other.plugins);
         self.failures.extend(other.failures);
+        self.blocked_plugin_ids.extend(other.blocked_plugin_ids);
         self.scan_report.roots.extend(other.scan_report.roots);
         self.scan_report.plugin_count += other.scan_report.plugin_count;
         self.scan_report.failure_count += other.scan_report.failure_count;
@@ -3244,6 +3307,19 @@ impl PluginRegistry {
             self.plugins
                 .iter()
                 .filter(|plugin| plugin.metadata().id != plugin_id)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn without_plugins(&self, plugin_ids: &BTreeSet<String>) -> Self {
+        if plugin_ids.is_empty() {
+            return self.clone();
+        }
+        Self::new(
+            self.plugins
+                .iter()
+                .filter(|plugin| !plugin_ids.contains(&plugin.metadata().id))
                 .cloned()
                 .collect(),
         )
@@ -3720,7 +3796,7 @@ impl PluginRuntimeRegistry {
             );
             return Err(error);
         }
-        let dependents = runtime_dependents_of(inner.snapshot.as_ref(), plugin_id);
+        let dependents = transitive_runtime_dependents_of(inner.snapshot.as_ref(), plugin_id);
         if !dependents.is_empty() {
             let error = PluginError::CommandFailed(format!(
                 "plugin `{plugin_id}` cannot be hot-unloaded because enabled dependents remain: {}",
@@ -4032,7 +4108,71 @@ fn prepare_runtime_snapshot(
         }
     }
 
+    propagate_runtime_dependency_quarantine(&mut accepted, &mut degradations);
+
     (PluginRegistry::new(accepted), degradations)
+}
+
+fn propagate_runtime_dependency_quarantine(
+    accepted: &mut Vec<RegisteredPlugin>,
+    degradations: &mut Vec<PluginRuntimeDegradation>,
+) {
+    loop {
+        let mut rejected = Vec::<(String, String)>::new();
+        for plugin in accepted.iter().filter(|plugin| plugin.is_enabled()) {
+            for dependency in plugin.dependencies() {
+                let Some(dependency_plugin) = resolve_dependency_plugin(accepted, dependency)
+                else {
+                    if dependency.optional {
+                        continue;
+                    }
+                    rejected.push((
+                        plugin.metadata().id.clone(),
+                        format!("required dependency `{}` is not available", dependency.name),
+                    ));
+                    break;
+                };
+                if let Some(requirement) = dependency.version_requirement.as_deref() {
+                    match semver_requirement_matches(
+                        requirement,
+                        &dependency_plugin.metadata().version,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            rejected.push((
+                                plugin.metadata().id.clone(),
+                                format_dependency_conflict_reason(
+                                    plugin,
+                                    dependency,
+                                    dependency_plugin,
+                                    requirement,
+                                ),
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            rejected.push((
+                                plugin.metadata().id.clone(),
+                                sanitize_plugin_error(&error.to_string()),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if rejected.is_empty() {
+            break;
+        }
+        let rejected_ids = rejected
+            .iter()
+            .map(|(plugin_id, _)| plugin_id.clone())
+            .collect::<BTreeSet<_>>();
+        accepted.retain(|plugin| !rejected_ids.contains(&plugin.metadata().id));
+        for (plugin_id, reason) in rejected {
+            degradations.push(PluginRuntimeDegradation { plugin_id, reason });
+        }
+    }
 }
 
 fn runtime_plugin_conflict_reason(
@@ -4119,6 +4259,7 @@ fn record_runtime_plugin(
 
 fn validate_runtime_snapshot(registry: &PluginRegistry) -> Result<(), PluginError> {
     registry.validate_registration_conflicts()?;
+    let _ = registry.dependency_order()?;
     let _ = registry.aggregated_hooks()?;
     let _ = registry.aggregated_tools()?;
     let _ = registry.aggregated_commands()?;
@@ -4212,12 +4353,29 @@ fn changed_enabled_plugins(old: &PluginRegistry, new: &PluginRegistry) -> BTreeS
         .filter(|plugin| plugin.is_enabled())
         .map(|plugin| (plugin.metadata().id.clone(), plugin.clone()))
         .collect::<BTreeMap<_, _>>();
-    old_plugins
+    let mut changed = old_plugins
         .keys()
         .chain(new_plugins.keys())
         .filter(|plugin_id| old_plugins.get(*plugin_id) != new_plugins.get(*plugin_id))
         .cloned()
-        .collect()
+        .collect::<BTreeSet<_>>();
+    expand_changed_with_dependents(old, &mut changed);
+    expand_changed_with_dependents(new, &mut changed);
+    changed
+}
+
+fn expand_changed_with_dependents(registry: &PluginRegistry, changed: &mut BTreeSet<String>) {
+    loop {
+        let mut additions = BTreeSet::new();
+        for plugin_id in changed.iter() {
+            additions.extend(runtime_dependents_of(registry, plugin_id));
+        }
+        let before = changed.len();
+        changed.extend(additions);
+        if changed.len() == before {
+            break;
+        }
+    }
 }
 
 fn validate_hot_reload_allowed(
@@ -4259,6 +4417,27 @@ fn runtime_dependents_of(registry: &PluginRegistry, plugin_id: &str) -> BTreeSet
         })
         .map(|plugin| plugin.metadata().id.clone())
         .collect()
+}
+
+fn transitive_runtime_dependents_of(
+    registry: &PluginRegistry,
+    plugin_id: &str,
+) -> BTreeSet<String> {
+    let mut dependents = BTreeSet::new();
+    let mut frontier = BTreeSet::from([plugin_id.to_string()]);
+    loop {
+        let mut next = BTreeSet::new();
+        for blocked in &frontier {
+            next.extend(runtime_dependents_of(registry, blocked));
+        }
+        next.retain(|id| !dependents.contains(id));
+        if next.is_empty() {
+            break;
+        }
+        dependents.extend(next.iter().cloned());
+        frontier = next;
+    }
+    dependents
 }
 
 fn initialize_changed_plugins(
@@ -4379,6 +4558,7 @@ impl PluginManagerConfig {
 pub struct PluginManager {
     config: PluginManagerConfig,
     mutation_locks_held: bool,
+    cleanup_warning: Option<String>,
 }
 
 pub struct PreparedPluginHotReload<T> {
@@ -4612,7 +4792,16 @@ impl PluginManager {
         Self {
             config,
             mutation_locks_held: false,
+            cleanup_warning: None,
         }
+    }
+
+    pub fn take_cleanup_warning(&mut self) -> Option<String> {
+        self.cleanup_warning.take()
+    }
+
+    fn push_cleanup_warning(&mut self, warning: impl Into<String>) {
+        append_cleanup_warning(&mut self.cleanup_warning, warning.into());
     }
 
     /// Returns the default bundled plugins root directory.
@@ -4718,7 +4907,7 @@ impl PluginManager {
     }
 
     pub fn list_installed_plugins(&self) -> Result<Vec<PluginSummary>, PluginError> {
-        Ok(self.installed_plugin_registry()?.summaries())
+        Ok(self.installed_plugin_registry_report()?.summaries())
     }
 
     pub fn discover_plugins(&self) -> Result<Vec<PluginDefinition>, PluginError> {
@@ -4835,13 +5024,19 @@ impl PluginManager {
             let (result, reload_runtime) = match mutation(self) {
                 Ok(result) => result,
                 Err(error) => {
-                    let _ = self.restore_hot_load_backup(
+                    if let Err(restore_error) = self.restore_hot_load_backup(
                         &registry_backup,
                         &enabled_backup,
                         &install_root,
                         &backup_root,
                         install_root_had_contents,
-                    );
+                    ) {
+                        return Err(PluginError::CommandFailed(format!(
+                            "{}; hot-reload transaction rollback failed: {}",
+                            sanitize_plugin_error(&error.to_string()),
+                            sanitize_plugin_error(&restore_error.to_string())
+                        )));
+                    }
                     return Err(error);
                 }
             };
@@ -4897,7 +5092,8 @@ impl PluginManager {
         &mut self,
         prepared: PreparedPluginHotReload<T>,
     ) -> PluginHotReloadFinish<T> {
-        let cleanup_warning = if prepared.backup_root.exists() {
+        let mut cleanup_warning = self.take_cleanup_warning();
+        if prepared.backup_root.exists() {
             fs::remove_dir_all(&prepared.backup_root)
                 .err()
                 .map(|error| {
@@ -4907,8 +5103,8 @@ impl PluginManager {
                         sanitize_plugin_error(&error.to_string())
                     ))
                 })
-        } else {
-            None
+                .into_iter()
+                .for_each(|warning| append_cleanup_warning(&mut cleanup_warning, warning));
         };
         PluginHotReloadFinish {
             result: prepared.result,
@@ -5051,45 +5247,82 @@ impl PluginManager {
         validate_plugin_registration_policy(PluginKind::External, &manifest)?;
 
         let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
-        let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
+        let install_path = self.versioned_plugin_install_path(&plugin_id, &manifest.version)?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
-        if let Some(existing_record) = registry.plugins.get(&plugin_id).cloned() {
-            self.archive_installed_version(
-                &mut registry,
-                &existing_record,
-                manifest.version_policy.keep_versions,
-            )?;
-        }
+        self.validate_installed_version_records(&registry)?;
+        let registry_backup = registry.clone();
+        let enabled_backup = self.config.enabled_plugins.clone();
         if install_path.exists() {
-            fs::remove_dir_all(&install_path)?;
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin `{plugin_id}` version `{}` is already installed at immutable version slot `{}`",
+                manifest.version,
+                install_path.display()
+            )));
         }
-        copy_dir_all(&staged_source, &install_path)?;
+        copy_dir_all_atomic(&staged_source, &install_path)?;
         if cleanup_source {
             let _ = fs::remove_dir_all(&staged_source);
         }
 
         let now = unix_time_ms();
+        let record_name = manifest.name.clone();
+        let record_version = manifest.version.clone();
+        let record_description = manifest.description.clone();
+        let record_policy = manifest.version_policy.clone();
         let record = InstalledPluginRecord {
             kind: PluginKind::External,
             id: plugin_id.clone(),
-            name: manifest.name,
-            version: manifest.version.clone(),
-            description: manifest.description,
+            name: record_name,
+            version: record_version.clone(),
+            description: record_description,
             install_path: install_path.clone(),
-            source: install_source,
-            version_policy: manifest.version_policy,
+            source: install_source.clone(),
+            version_policy: record_policy,
             installed_at_unix_ms: now,
             updated_at_unix_ms: now,
         };
 
+        if let Some(existing_record) = registry.plugins.get(&plugin_id).cloned() {
+            self.archive_installed_version(
+                &mut registry,
+                &existing_record,
+                manifest.version_policy.keep_versions,
+                &[manifest.version.as_str(), existing_record.version.as_str()],
+            )?;
+        }
+        self.upsert_installed_version_record(
+            &mut registry,
+            &plugin_id,
+            &manifest,
+            &install_path,
+            &install_source,
+            now,
+            &[manifest.version.as_str()],
+        )?;
         registry.plugins.insert(plugin_id.clone(), record);
-        self.store_registry_under_registry_lock(&registry)?;
-        self.write_enabled_state(&plugin_id, Some(true))?;
+        let mut enabled_overrides = BTreeMap::new();
+        enabled_overrides.insert(plugin_id.clone(), true);
+        if let Err(error) =
+            self.validate_installed_registry_candidate(&registry, &enabled_overrides)
+        {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
+        if let Err(error) = self.store_registry_under_registry_lock(&registry) {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
+        if let Err(error) = self.write_enabled_state(&plugin_id, Some(true)) {
+            let _ = self.store_registry_under_registry_lock(&registry_backup);
+            let _ = self.write_enabled_plugins(&enabled_backup);
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
         self.config.enabled_plugins.insert(plugin_id.clone(), true);
 
         Ok(InstallOutcome {
             plugin_id,
-            version: manifest.version,
+            version: record_version,
             install_path,
         })
     }
@@ -5097,6 +5330,11 @@ impl PluginManager {
     pub fn enable(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         self.ensure_known_plugin(plugin_id)?;
         let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
+        let registry = self.load_registry_under_exclusive_lock()?;
+        self.validate_installed_version_records(&registry)?;
+        let mut enabled_overrides = BTreeMap::new();
+        enabled_overrides.insert(plugin_id.to_string(), true);
+        self.validate_installed_registry_candidate(&registry, &enabled_overrides)?;
         self.write_enabled_state(plugin_id, Some(true))?;
         self.config
             .enabled_plugins
@@ -5107,6 +5345,15 @@ impl PluginManager {
     pub fn disable(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         self.ensure_known_plugin(plugin_id)?;
         let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
+        let registry = self.load_registry_under_exclusive_lock()?;
+        self.validate_installed_version_records(&registry)?;
+        let dependents = self.enabled_dependents_for_candidate(&registry, plugin_id)?;
+        if !dependents.is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "cannot disable plugin `{plugin_id}` while enabled plugin(s) depend on it: {}",
+                dependents.join(", ")
+            )));
+        }
         self.write_enabled_state(plugin_id, Some(false))?;
         self.config
             .enabled_plugins
@@ -5117,6 +5364,16 @@ impl PluginManager {
     pub fn uninstall(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
+        self.validate_installed_version_records(&registry)?;
+        let dependents = self.enabled_dependents_for_candidate(&registry, plugin_id)?;
+        if !dependents.is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "cannot uninstall plugin `{plugin_id}` while enabled plugin(s) depend on it: {}",
+                dependents.join(", ")
+            )));
+        }
+        let registry_backup = registry.clone();
+        let enabled_backup = self.config.enabled_plugins.clone();
         let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -5126,25 +5383,51 @@ impl PluginManager {
                 "plugin `{plugin_id}` is bundled and managed automatically; disable it instead"
             )));
         }
+        let mut remove_paths = BTreeSet::new();
         if record.install_path.exists() {
-            fs::remove_dir_all(&record.install_path)?;
+            remove_paths.insert(record.install_path.clone());
         }
         if let Some(versions) = registry.versions.remove(plugin_id) {
             for version in versions {
                 if version.install_path.exists() {
-                    fs::remove_dir_all(version.install_path)?;
+                    remove_paths.insert(version.install_path);
                 }
             }
         }
-        self.store_registry_under_registry_lock(&registry)?;
-        self.write_enabled_state(plugin_id, None)?;
+        let trash = move_plugin_paths_to_uninstall_trash(&remove_paths, &self.install_root())?;
+        if let Err(error) = self.store_registry_under_registry_lock(&registry) {
+            return Err(self.restore_failed_uninstall(
+                error,
+                &registry_backup,
+                &enabled_backup,
+                trash,
+            ));
+        }
+        if let Err(error) = self.write_enabled_state(plugin_id, None) {
+            return Err(self.restore_failed_uninstall(
+                error,
+                &registry_backup,
+                &enabled_backup,
+                trash,
+            ));
+        }
         self.config.enabled_plugins.remove(plugin_id);
+        if let Some(trash) = trash {
+            if let Err(error) = cleanup_uninstall_trash(&trash.trash_root) {
+                self.push_cleanup_warning(format!(
+                    "plugin uninstall trash cleanup failed for `{}`: {}",
+                    trash.trash_root.display(),
+                    sanitize_plugin_error(&error.to_string())
+                ));
+            }
+        }
         Ok(())
     }
 
     pub fn update(&mut self, plugin_id: &str) -> Result<UpdateOutcome, PluginError> {
         let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
+        self.validate_installed_version_records(&registry)?;
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -5154,69 +5437,103 @@ impl PluginManager {
         let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
         let manifest = load_plugin_from_directory(&staged_source)?;
         validate_plugin_registration_policy(record.kind, &manifest)?;
+        let expected_plugin_id = plugin_package_id(&manifest.name, record.kind.marketplace());
+        if expected_plugin_id != plugin_id {
+            return Err(PluginError::InvalidManifest(format!(
+                "updated plugin source declares `{expected_plugin_id}` but `{plugin_id}` was requested"
+            )));
+        }
+        let install_path = self.versioned_plugin_install_path(plugin_id, &manifest.version)?;
+        if install_path.exists() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin `{plugin_id}` version `{}` is already installed at immutable version slot `{}`",
+                manifest.version,
+                install_path.display()
+            )));
+        }
 
-        let archived_record = self.archive_installed_version(
+        self.archive_installed_version(
             &mut registry,
             &record,
             manifest.version_policy.keep_versions,
+            &[record.version.as_str(), manifest.version.as_str()],
         )?;
         let replace_result = (|| -> Result<(), PluginError> {
-            if record.install_path.exists() {
-                fs::remove_dir_all(&record.install_path)?;
-            }
-            copy_dir_all(&staged_source, &record.install_path)?;
+            copy_dir_all_atomic(&staged_source, &install_path)?;
             Ok(())
         })();
         if let Err(error) = replace_result {
-            if manifest.version_policy.rollback_on_failure {
-                if let Some(archived_record) = archived_record {
-                    self.restore_archived_version(&record, &archived_record)?;
-                }
-            }
             return Err(error);
         }
         if cleanup_source {
             let _ = fs::remove_dir_all(&staged_source);
         }
 
+        let updated_at_unix_ms = unix_time_ms();
+        let new_version = manifest.version.clone();
         let updated_record = InstalledPluginRecord {
-            version: manifest.version.clone(),
-            description: manifest.description,
-            version_policy: manifest.version_policy,
-            updated_at_unix_ms: unix_time_ms(),
+            version: new_version.clone(),
+            description: manifest.description.clone(),
+            install_path: install_path.clone(),
+            version_policy: manifest.version_policy.clone(),
+            updated_at_unix_ms,
             ..record.clone()
         };
+        self.upsert_installed_version_record(
+            &mut registry,
+            plugin_id,
+            &manifest,
+            &install_path,
+            &record.source,
+            updated_at_unix_ms,
+            &[manifest.version.as_str()],
+        )?;
         registry
             .plugins
             .insert(plugin_id.to_string(), updated_record);
-        self.store_registry_under_registry_lock(&registry)?;
+        if let Err(error) = self.validate_installed_registry_candidate(&registry, &BTreeMap::new())
+        {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
+        if let Err(error) = self.store_registry_under_registry_lock(&registry) {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
 
         Ok(UpdateOutcome {
             plugin_id: plugin_id.to_string(),
             old_version: record.version,
-            new_version: manifest.version,
-            install_path: record.install_path,
+            new_version,
+            install_path,
         })
     }
 
     pub fn list_versions(&self, plugin_id: &str) -> Result<Vec<String>, PluginError> {
         let registry = self.load_registry()?;
-        let mut versions = registry
+        self.validate_installed_version_records(&registry)?;
+        let versions = registry
             .versions
             .get(plugin_id)
             .into_iter()
             .flatten()
             .map(|record| record.version.clone())
             .collect::<BTreeSet<_>>();
+        let mut versions = versions.into_iter().collect::<Vec<_>>();
         if let Some(record) = registry.plugins.get(plugin_id) {
-            versions.insert(record.version.clone());
+            versions.push(record.version.clone());
         }
         if versions.is_empty() {
             return Err(PluginError::NotFound(format!(
                 "plugin `{plugin_id}` is not installed"
             )));
         }
-        Ok(versions.into_iter().collect())
+        versions.sort_by(|left, right| compare_semver_strings(left, right));
+        versions.dedup();
+        for version in &versions {
+            let _ = parse_semver(version)?;
+        }
+        Ok(versions)
     }
 
     pub fn rollback(
@@ -5224,8 +5541,10 @@ impl PluginManager {
         plugin_id: &str,
         version: &str,
     ) -> Result<RollbackOutcome, PluginError> {
+        let _ = parse_semver(version)?;
         let _mutation_locks = self.acquire_mutation_locks_if_needed()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
+        self.validate_installed_version_records(&registry)?;
         let active = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -5244,33 +5563,47 @@ impl PluginManager {
             &mut registry,
             &active,
             active.version_policy.keep_versions,
+            &[active.version.as_str(), archived.version.as_str()],
         )?;
-        if active.install_path.exists() {
-            fs::remove_dir_all(&active.install_path)?;
+        let manifest = load_plugin_from_directory(&archived.install_path)?;
+        validate_plugin_registration_policy(active.kind, &manifest)?;
+        let expected_plugin_id = plugin_package_id(&manifest.name, active.kind.marketplace());
+        if expected_plugin_id != plugin_id || manifest.version != archived.version {
+            return Err(PluginError::InvalidManifest(format!(
+                "archived plugin `{plugin_id}` version `{}` does not match requested rollback version `{version}`",
+                archived.version
+            )));
         }
-        copy_dir_all(&archived.install_path, &active.install_path)?;
-        let manifest = load_plugin_from_directory(&active.install_path)?;
+        let active_version = manifest.version.clone();
         let rolled_back = InstalledPluginRecord {
-            version: manifest.version.clone(),
-            description: manifest.description,
-            version_policy: manifest.version_policy,
+            version: active_version.clone(),
+            description: manifest.description.clone(),
+            install_path: archived.install_path.clone(),
+            version_policy: manifest.version_policy.clone(),
             updated_at_unix_ms: unix_time_ms(),
             ..active.clone()
         };
         registry.plugins.insert(plugin_id.to_string(), rolled_back);
+        self.validate_installed_registry_candidate(&registry, &BTreeMap::new())?;
         self.store_registry_under_registry_lock(&registry)?;
 
         Ok(RollbackOutcome {
             plugin_id: plugin_id.to_string(),
             previous_version: active.version,
-            active_version: manifest.version,
-            install_path: active.install_path,
+            active_version,
+            install_path: archived.install_path,
         })
     }
 
     fn discover_installed_plugins_with_failures(&self) -> Result<PluginDiscovery, PluginError> {
-        let registry = self.load_registry()?;
+        let mut registry = self.load_registry()?;
+        if !stale_installed_registry_ids(&registry).is_empty() {
+            self.cleanup_stale_registry_entries()?;
+            registry = self.load_registry()?;
+        }
+        self.validate_installed_version_records(&registry)?;
         let mut discovery = PluginDiscovery::default();
+        record_uncommitted_registry_migration(&registry, &mut discovery);
         let mut seen_ids = BTreeSet::<String>::new();
         let mut seen_paths = BTreeSet::<PathBuf>::new();
         let mut stale_registry_ids = Vec::new();
@@ -5572,7 +5905,6 @@ impl PluginManager {
         add_scan_root_report(&mut discovery.scan_report, root_report);
         let mut registry = self.load_registry_under_exclusive_lock()?;
         let mut changed = false;
-        let install_root = self.install_root();
         let mut active_bundled_ids = BTreeSet::new();
 
         for source_root in bundled_plugins {
@@ -5590,7 +5922,7 @@ impl PluginManager {
             };
             let plugin_id = plugin_id(&manifest.name, BUNDLED_MARKETPLACE);
             active_bundled_ids.insert(plugin_id.clone());
-            let install_path = install_root.join(sanitize_plugin_id(&plugin_id));
+            let install_path = self.versioned_plugin_install_path(&plugin_id, &manifest.version)?;
             let now = unix_time_ms();
             let existing_record = registry.plugins.get(&plugin_id);
             let installed_copy_is_valid =
@@ -5609,21 +5941,42 @@ impl PluginManager {
                 continue;
             }
 
-            if install_path.exists() {
-                fs::remove_dir_all(&install_path)?;
-            }
-            if let Err(error) = copy_dir_all(&source_root, &install_path) {
+            if !install_path.exists() {
+                if let Err(error) = copy_dir_all_atomic(&source_root, &install_path) {
+                    discovery.push_failure(PluginLoadFailure::new(
+                        source_root.clone(),
+                        PluginKind::Bundled,
+                        source_root.display().to_string(),
+                        error,
+                    ));
+                    continue;
+                }
+            } else if !installed_copy_is_valid {
                 discovery.push_failure(PluginLoadFailure::new(
                     source_root.clone(),
                     PluginKind::Bundled,
                     source_root.display().to_string(),
-                    error,
+                    PluginError::InvalidManifest(format!(
+                        "bundled plugin immutable version slot `{}` is invalid",
+                        install_path.display()
+                    )),
                 ));
                 continue;
             }
 
             let installed_at_unix_ms =
                 existing_record.map_or(now, |record| record.installed_at_unix_ms);
+            self.upsert_installed_version_record(
+                &mut registry,
+                &plugin_id,
+                &manifest,
+                &install_path,
+                &PluginInstallSource::LocalPath {
+                    path: source_root.clone(),
+                },
+                now,
+                &[manifest.version.as_str()],
+            )?;
             registry.plugins.insert(
                 plugin_id.clone(),
                 InstalledPluginRecord {
@@ -5657,6 +6010,13 @@ impl PluginManager {
             if let Some(record) = registry.plugins.remove(&plugin_id) {
                 if record.install_path.exists() {
                     fs::remove_dir_all(&record.install_path)?;
+                }
+                if let Some(versions) = registry.versions.remove(&plugin_id) {
+                    for version in versions {
+                        if version.install_path.exists() {
+                            fs::remove_dir_all(version.install_path)?;
+                        }
+                    }
                 }
                 changed = true;
             }
@@ -5705,14 +6065,17 @@ impl PluginManager {
         let path = self.registry_path();
         match read_registry_at_path(&path) {
             Ok(registry) => {
-                let sanitized = sanitize_registry_for_storage(&registry);
-                if sanitized == registry {
+                let original = registry.clone();
+                let migrated = self.migrate_legacy_installed_registry(registry)?;
+                let sanitized = sanitize_registry_for_storage(&migrated);
+                if sanitized == original {
                     return Ok(sanitized);
                 }
                 if acquire_migration_lock {
                     let _migration_guard = self.acquire_registry_lock()?;
                     let fresh_registry = read_registry_at_path(&path)?;
-                    let fresh_sanitized = sanitize_registry_for_storage(&fresh_registry);
+                    let fresh_migrated = self.migrate_legacy_installed_registry(fresh_registry)?;
+                    let fresh_sanitized = sanitize_registry_for_storage(&fresh_migrated);
                     return migrate_registry_source_metadata_under_lock(&path, fresh_sanitized);
                 }
                 migrate_registry_source_metadata_under_lock(&path, sanitized)
@@ -5743,25 +6106,127 @@ impl PluginManager {
         Ok(())
     }
 
+    fn migrate_legacy_installed_registry(
+        &self,
+        mut registry: InstalledPluginRegistry,
+    ) -> Result<InstalledPluginRegistry, PluginError> {
+        match registry.schema_version {
+            INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION => return Ok(registry),
+            LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION => {}
+            other => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "unsupported plugin registry schemaVersion `{other}`"
+                )));
+            }
+        }
+
+        if !registry.versions.is_empty() {
+            return Err(PluginError::InvalidManifest(
+                "legacy plugin registry cannot contain immutable version records; refusing schema downgrade migration"
+                    .to_string(),
+            ));
+        }
+
+        for (plugin_id, active) in &registry.plugins {
+            let expected_slot = self.versioned_plugin_install_path(plugin_id, &active.version)?;
+            if canonical_seen_path(&active.install_path) == canonical_seen_path(&expected_slot) {
+                return Err(PluginError::InvalidManifest(format!(
+                    "legacy plugin registry active plugin `{plugin_id}` already uses current immutable version slot layout; refusing schema downgrade migration"
+                )));
+            }
+        }
+
+        registry.schema_version = INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION;
+        let plugin_ids = registry.plugins.keys().cloned().collect::<Vec<_>>();
+        for plugin_id in plugin_ids {
+            let Some(active) = registry.plugins.get(&plugin_id).cloned() else {
+                continue;
+            };
+            if !active.install_path.exists() || plugin_manifest_path(&active.install_path).is_err()
+            {
+                continue;
+            }
+            let manifest = load_plugin_from_directory(&active.install_path)?;
+            validate_plugin_registration_policy(active.kind, &manifest)?;
+            let expected_plugin_id = plugin_package_id(&manifest.name, active.kind.marketplace());
+            if expected_plugin_id != plugin_id || manifest.version != active.version {
+                return Err(PluginError::InvalidManifest(format!(
+                    "legacy registry active plugin `{plugin_id}` does not match manifest at `{}`",
+                    sanitize_plugin_error(&active.install_path.display().to_string())
+                )));
+            }
+            let version_records = registry.versions.entry(plugin_id.clone()).or_default();
+            version_records.retain(|record| record.version != active.version);
+            version_records.push(InstalledPluginVersionRecord {
+                archive_id: installed_archive_id(&plugin_id, &active.version),
+                version: active.version.clone(),
+                description: manifest.description,
+                install_path: active.install_path.clone(),
+                source: describe_install_source(&active.source),
+                content_hash: plugin_tree_hash(&active.install_path)?,
+                archived_at_unix_ms: active.updated_at_unix_ms,
+            });
+        }
+        Ok(registry)
+    }
+
     fn cleanup_stale_registry_entries(&self) -> Result<(), PluginError> {
         let _registry_guard = self.acquire_registry_lock()?;
         let mut registry = self.load_registry_under_exclusive_lock()?;
-        let stale_ids = registry
-            .plugins
-            .values()
-            .filter_map(|record| {
-                (!record.install_path.exists()
-                    || plugin_manifest_path(&record.install_path).is_err())
-                .then_some(record.id.clone())
-            })
-            .collect::<Vec<_>>();
+        let stale_ids = stale_installed_registry_ids(&registry);
         if stale_ids.is_empty() {
             return Ok(());
         }
         for plugin_id in stale_ids {
             registry.plugins.remove(&plugin_id);
+            registry.versions.remove(&plugin_id);
         }
         self.store_registry_under_registry_lock(&registry)
+    }
+
+    fn versioned_plugin_install_path(
+        &self,
+        plugin_id: &str,
+        version: &str,
+    ) -> Result<PathBuf, PluginError> {
+        let _ = parse_semver(version)?;
+        Ok(self
+            .install_root()
+            .join(PLUGIN_VERSIONS_DIR_NAME)
+            .join(sanitize_plugin_id(plugin_id))
+            .join(version))
+    }
+
+    fn upsert_installed_version_record(
+        &self,
+        registry: &mut InstalledPluginRegistry,
+        plugin_id: &str,
+        manifest: &PluginManifest,
+        install_path: &Path,
+        source: &PluginInstallSource,
+        archived_at_unix_ms: u128,
+        protected_versions: &[&str],
+    ) -> Result<InstalledPluginVersionRecord, PluginError> {
+        let _ = parse_semver(&manifest.version)?;
+        let content_hash = plugin_tree_hash(install_path)?;
+        let archived_record = InstalledPluginVersionRecord {
+            archive_id: installed_archive_id(plugin_id, &manifest.version),
+            version: manifest.version.clone(),
+            description: manifest.description.clone(),
+            install_path: install_path.to_path_buf(),
+            source: describe_install_source(source),
+            content_hash,
+            archived_at_unix_ms,
+        };
+        let versions = registry.versions.entry(plugin_id.to_string()).or_default();
+        versions.retain(|existing| existing.version != archived_record.version);
+        versions.push(archived_record.clone());
+        prune_archived_versions(
+            versions,
+            manifest.version_policy.keep_versions,
+            protected_versions,
+        );
+        Ok(archived_record)
     }
 
     fn archive_installed_version(
@@ -5769,43 +6234,57 @@ impl PluginManager {
         registry: &mut InstalledPluginRegistry,
         record: &InstalledPluginRecord,
         keep_versions: usize,
+        protected_versions: &[&str],
     ) -> Result<Option<InstalledPluginVersionRecord>, PluginError> {
         if !record.install_path.exists() {
             return Ok(None);
         }
 
-        let archive_path = self
-            .install_root()
-            .join(".versions")
-            .join(sanitize_plugin_id(&record.id))
-            .join(sanitize_plugin_id(&record.version));
-        if archive_path.exists() {
-            fs::remove_dir_all(&archive_path)?;
+        let archive_path = self.versioned_plugin_install_path(&record.id, &record.version)?;
+        let source_seen = canonical_seen_path(&record.install_path);
+        let archive_seen = canonical_seen_path(&archive_path);
+        if source_seen != archive_seen {
+            if archive_path.exists() {
+                let archived_manifest = load_plugin_from_directory(&archive_path)?;
+                let expected_plugin_id =
+                    plugin_id(&archived_manifest.name, record.kind.marketplace());
+                if expected_plugin_id != record.id || archived_manifest.version != record.version {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "immutable version slot `{}` does not match plugin `{}` version `{}`",
+                        archive_path.display(),
+                        record.id,
+                        record.version
+                    )));
+                }
+            } else {
+                copy_dir_all_atomic(&record.install_path, &archive_path)?;
+            }
         }
-        copy_dir_all(&record.install_path, &archive_path)?;
 
-        let versions = registry.versions.entry(record.id.clone()).or_default();
-        versions.retain(|archived| archived.version != record.version);
+        let manifest = load_plugin_from_directory(&archive_path)?;
+        validate_plugin_registration_policy(record.kind, &manifest)?;
+        let expected_plugin_id = plugin_id(&manifest.name, record.kind.marketplace());
+        if expected_plugin_id != record.id || manifest.version != record.version {
+            return Err(PluginError::InvalidManifest(format!(
+                "archived plugin `{}` version `{}` does not match source record",
+                record.id, record.version
+            )));
+        }
+        let content_hash = plugin_tree_hash(&archive_path)?;
         let archived_record = InstalledPluginVersionRecord {
+            archive_id: installed_archive_id(&record.id, &record.version),
             version: record.version.clone(),
-            description: record.description.clone(),
+            description: manifest.description,
             install_path: archive_path,
+            source: describe_install_source(&record.source),
+            content_hash,
             archived_at_unix_ms: unix_time_ms(),
         };
+        let versions = registry.versions.entry(record.id.clone()).or_default();
+        versions.retain(|archived| archived.version != record.version);
         versions.push(archived_record.clone());
-        prune_archived_versions(versions, keep_versions);
+        prune_archived_versions(versions, keep_versions, protected_versions);
         Ok(Some(archived_record))
-    }
-
-    fn restore_archived_version(
-        &self,
-        record: &InstalledPluginRecord,
-        archived: &InstalledPluginVersionRecord,
-    ) -> Result<(), PluginError> {
-        if record.install_path.exists() {
-            fs::remove_dir_all(&record.install_path)?;
-        }
-        copy_dir_all(&archived.install_path, &record.install_path)
     }
 
     fn write_enabled_state(
@@ -5861,6 +6340,46 @@ impl PluginManager {
         Ok(())
     }
 
+    fn restore_failed_uninstall(
+        &mut self,
+        original_error: PluginError,
+        registry_backup: &InstalledPluginRegistry,
+        enabled_backup: &BTreeMap<String, bool>,
+        trash: Option<UninstallTrash>,
+    ) -> PluginError {
+        let mut restore_errors = Vec::new();
+        if let Err(error) = self.store_registry_under_registry_lock(registry_backup) {
+            restore_errors.push(format!(
+                "registry: {}",
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+        if let Err(error) = self.write_enabled_plugins(enabled_backup) {
+            restore_errors.push(format!(
+                "settings: {}",
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+        self.config.enabled_plugins = enabled_backup.clone();
+        if let Some(trash) = trash {
+            if let Err(error) = restore_uninstall_trash(&trash) {
+                restore_errors.push(format!(
+                    "install tree: {}",
+                    sanitize_plugin_error(&error.to_string())
+                ));
+            }
+        }
+        if restore_errors.is_empty() {
+            original_error
+        } else {
+            PluginError::CommandFailed(truncate_plugin_error(&format!(
+                "{}; uninstall rollback failed: {}",
+                sanitize_plugin_error(&original_error.to_string()),
+                restore_errors.join("; ")
+            )))
+        }
+    }
+
     fn acquire_registry_lock(&self) -> Result<PluginFileLock, PluginError> {
         acquire_plugin_file_lock_at(
             &registry_lock_path(&self.registry_path()),
@@ -5902,11 +6421,175 @@ impl PluginManager {
         }
     }
 
-    fn installed_plugin_registry(&self) -> Result<PluginRegistry, PluginError> {
-        self.installed_plugin_registry_report()?.into_registry()
+    fn validate_installed_registry_candidate(
+        &self,
+        registry: &InstalledPluginRegistry,
+        enabled_overrides: &BTreeMap<String, bool>,
+    ) -> Result<(), PluginError> {
+        self.validate_installed_version_records(registry)?;
+        let candidate = self.installed_registry_from_records(registry, enabled_overrides)?;
+        validate_runtime_snapshot(&candidate)
+    }
+
+    fn installed_registry_from_records(
+        &self,
+        registry: &InstalledPluginRegistry,
+        enabled_overrides: &BTreeMap<String, bool>,
+    ) -> Result<PluginRegistry, PluginError> {
+        let available_versions = installed_available_versions_by_id(registry);
+        let mut plugins = Vec::new();
+        for record in registry.plugins.values() {
+            let plugin = load_plugin_definition(
+                &record.install_path,
+                record.kind,
+                describe_install_source(&record.source),
+                record.kind.marketplace(),
+            )?;
+            validate_installed_record_identity(record, &plugin)?;
+            let enabled = enabled_overrides
+                .get(&record.id)
+                .copied()
+                .unwrap_or_else(|| self.is_enabled(plugin.metadata()));
+            let versions = available_versions
+                .get(&record.id)
+                .cloned()
+                .unwrap_or_else(|| BTreeSet::from([record.version.clone()]));
+            plugins.push(RegisteredPlugin::new(plugin, enabled).with_available_versions(versions));
+        }
+        Ok(PluginRegistry::new(plugins))
+    }
+
+    fn validate_installed_version_records(
+        &self,
+        registry: &InstalledPluginRegistry,
+    ) -> Result<(), PluginError> {
+        if registry.schema_version != INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION {
+            return Err(PluginError::InvalidManifest(format!(
+                "unsupported plugin registry schemaVersion `{}`",
+                registry.schema_version
+            )));
+        }
+        for (plugin_id, active) in &registry.plugins {
+            let _ = parse_semver(&active.version)?;
+            let records = registry.versions.get(plugin_id).ok_or_else(|| {
+                PluginError::InvalidManifest(format!(
+                    "active plugin `{plugin_id}` version `{}` is missing its immutable version slot record",
+                    sanitize_plugin_error(&active.version)
+                ))
+            })?;
+            let matching = records
+                .iter()
+                .filter(|record| record.version == active.version)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "active plugin `{plugin_id}` version `{}` is missing its immutable version slot record",
+                    sanitize_plugin_error(&active.version)
+                )));
+            }
+            if matching.len() > 1 {
+                return Err(PluginError::InvalidManifest(format!(
+                    "active plugin `{plugin_id}` version `{}` has duplicate immutable version slot records",
+                    sanitize_plugin_error(&active.version)
+                )));
+            }
+            let active_path = canonical_seen_path(&active.install_path);
+            let version_path = canonical_seen_path(&matching[0].install_path);
+            if version_path != active_path {
+                return Err(PluginError::InvalidManifest(format!(
+                    "active plugin `{plugin_id}` version `{}` has immutable version slot path mismatch",
+                    sanitize_plugin_error(&active.version)
+                )));
+            }
+        }
+        for (plugin_id, records) in &registry.versions {
+            let Some(active) = registry.plugins.get(plugin_id) else {
+                return Err(PluginError::InvalidManifest(format!(
+                    "archived versions exist for unknown plugin `{plugin_id}`"
+                )));
+            };
+            for record in records {
+                let _ = parse_semver(&record.version)?;
+                let expected_archive_id = installed_archive_id(plugin_id, &record.version);
+                if record.archive_id != expected_archive_id {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "version slot `{}` for plugin `{plugin_id}` has archiveId `{}` but expected `{expected_archive_id}`",
+                        record.version,
+                        sanitize_plugin_error(&record.archive_id)
+                    )));
+                }
+                let manifest = load_plugin_from_directory(&record.install_path)?;
+                validate_plugin_registration_policy(active.kind, &manifest)?;
+                let expected_plugin_id =
+                    plugin_package_id(&manifest.name, active.kind.marketplace());
+                if expected_plugin_id != *plugin_id || manifest.version != record.version {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "version slot `{}` does not match plugin `{plugin_id}` version `{}`",
+                        sanitize_plugin_error(&record.install_path.display().to_string()),
+                        record.version
+                    )));
+                }
+                let actual_hash = plugin_tree_hash(&record.install_path)?;
+                if record.content_hash.is_empty() {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "version slot `{}` for plugin `{plugin_id}` is missing contentHash",
+                        record.version
+                    )));
+                }
+                if record.content_hash != actual_hash {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "version slot `{}` for plugin `{plugin_id}` contentHash mismatch: expected `{}` actual `{actual_hash}`",
+                        record.version,
+                        sanitize_plugin_error(&record.content_hash)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enabled_dependents_for_candidate(
+        &self,
+        registry: &InstalledPluginRegistry,
+        plugin_id: &str,
+    ) -> Result<Vec<String>, PluginError> {
+        let candidate = self.installed_registry_from_records(registry, &BTreeMap::new())?;
+        let mut blocked = BTreeSet::from([plugin_id.to_string()]);
+        let mut dependents = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for plugin in candidate
+                .plugins()
+                .iter()
+                .filter(|plugin| plugin.is_enabled())
+            {
+                if blocked.contains(&plugin.metadata().id) {
+                    continue;
+                }
+                if plugin.dependencies().iter().any(|dependency| {
+                    blocked.iter().any(|blocked_id| {
+                        candidate.get(blocked_id).is_some_and(|blocked_plugin| {
+                            dependency_refers_to_plugin(dependency, blocked_plugin)
+                        })
+                    })
+                }) {
+                    blocked.insert(plugin.metadata().id.clone());
+                    dependents.insert(plugin.metadata().id.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(dependents.into_iter().collect())
     }
 
     fn build_registry_report(&self, discovery: PluginDiscovery) -> PluginRegistryReport {
+        let available_versions = self
+            .load_registry()
+            .map(|registry| installed_available_versions_by_id(&registry))
+            .unwrap_or_default();
         PluginRegistryReport::with_scan_report(
             PluginRegistry::new(
                 discovery
@@ -5914,13 +6597,18 @@ impl PluginManager {
                     .into_iter()
                     .map(|plugin| {
                         let enabled = self.is_enabled(plugin.metadata());
-                        RegisteredPlugin::new(plugin, enabled)
+                        let versions = available_versions
+                            .get(&plugin.metadata().id)
+                            .cloned()
+                            .unwrap_or_else(|| BTreeSet::from([plugin.metadata().version.clone()]));
+                        RegisteredPlugin::new(plugin, enabled).with_available_versions(versions)
                     })
                     .collect(),
             ),
             discovery.failures,
             discovery.scan_report,
         )
+        .with_blocked_plugins(discovery.blocked_plugin_ids)
     }
 }
 
@@ -7856,7 +8544,29 @@ fn build_manifest_dependencies(
             });
             continue;
         }
-        validated.push(PluginDependency { name, ..dependency });
+        let version_requirement = dependency.version_requirement.map(|requirement| {
+            let trimmed = requirement.trim().to_string();
+            if trimmed.is_empty() {
+                errors.push(PluginManifestValidationError::EmptyEntryField {
+                    kind: "dependency",
+                    field: "versionRequirement",
+                    name: Some(name.clone()),
+                });
+            } else if VersionReq::parse(&trimmed).is_err() {
+                errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                    detail: format!(
+                        "plugin dependency `{name}` versionRequirement `{}` must be a valid semver requirement",
+                        sanitize_plugin_error(&trimmed)
+                    ),
+                });
+            }
+            trimmed
+        });
+        validated.push(PluginDependency {
+            name,
+            version_requirement,
+            ..dependency
+        });
     }
 
     validated
@@ -9100,6 +9810,61 @@ fn lifecycle_child_permission(permissions: &[PluginPermission]) -> PluginToolPer
     }
 }
 
+fn validate_installed_record_identity(
+    record: &InstalledPluginRecord,
+    plugin: &PluginDefinition,
+) -> Result<(), PluginError> {
+    if plugin.metadata().id != record.id
+        || plugin.metadata().name != record.name
+        || plugin.metadata().version != record.version
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "installed plugin record `{}` does not match manifest `{}` version `{}` at `{}`",
+            record.id,
+            plugin.metadata().id,
+            plugin.metadata().version,
+            record.install_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn dependency_refers_to_plugin(dependency: &PluginDependency, plugin: &RegisteredPlugin) -> bool {
+    dependency.name == plugin.metadata().id || dependency.name == plugin.metadata().name
+}
+
+fn format_dependency_conflict_reason(
+    plugin: &RegisteredPlugin,
+    dependency: &PluginDependency,
+    dependency_plugin: &RegisteredPlugin,
+    requirement: &str,
+) -> String {
+    format!(
+        "plugin `{}` depends on `{}` version `{}` but single active runtime version is `{}`; available installed slots are `{}`; rollback `{}` to a compatible active version or update dependent constraints",
+        plugin.metadata().id,
+        dependency.name,
+        requirement,
+        dependency_plugin.metadata().version,
+        dependency_plugin
+            .available_versions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+        dependency_plugin.metadata().id
+    )
+}
+
+fn resolve_dependency_plugin<'a>(
+    plugins: &'a [RegisteredPlugin],
+    dependency: &PluginDependency,
+) -> Option<&'a RegisteredPlugin> {
+    plugins
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .find(|plugin| dependency_refers_to_plugin(dependency, plugin))
+}
+
 fn dependency_order_for_plugins(plugins: &[RegisteredPlugin]) -> Result<Vec<String>, PluginError> {
     let enabled_plugins = plugins
         .iter()
@@ -9162,11 +9927,13 @@ fn dependency_order_for_plugins(plugins: &[RegisteredPlugin]) -> Result<Vec<Stri
                 if !semver_requirement_matches(requirement, &dependency_plugin.metadata().version)?
                 {
                     return Err(PluginError::InvalidManifest(format!(
-                        "plugin `{}` depends on `{}` version `{}` but active version is `{}`",
-                        plugin.metadata().id,
-                        dependency.name,
-                        requirement,
-                        dependency_plugin.metadata().version
+                        "{}",
+                        format_dependency_conflict_reason(
+                            plugin,
+                            dependency,
+                            dependency_plugin,
+                            requirement
+                        )
                     )));
                 }
             }
@@ -9215,83 +9982,61 @@ fn dependency_order_for_plugins(plugins: &[RegisteredPlugin]) -> Result<Vec<Stri
     Ok(ordered)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Semver {
-    major: u64,
-    minor: u64,
-    patch: u64,
-}
-
 fn semver_requirement_matches(requirement: &str, version: &str) -> Result<bool, PluginError> {
     let requirement = requirement.trim();
-    if requirement.is_empty() || requirement == "*" {
+    if requirement.is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "invalid semver requirement: empty versionRequirement".to_string(),
+        ));
+    }
+    if requirement == "*" {
         return Ok(true);
     }
 
     let version = parse_semver(version)?;
-    for clause in requirement
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let matches = if let Some(expected) = clause.strip_prefix(">=") {
-            version >= parse_semver(expected.trim())?
-        } else if let Some(expected) = clause.strip_prefix("<=") {
-            version <= parse_semver(expected.trim())?
-        } else if let Some(expected) = clause.strip_prefix('>') {
-            version > parse_semver(expected.trim())?
-        } else if let Some(expected) = clause.strip_prefix('<') {
-            version < parse_semver(expected.trim())?
-        } else if let Some(expected) = clause.strip_prefix('=') {
-            version == parse_semver(expected.trim())?
-        } else if let Some(expected) = clause.strip_prefix('^') {
-            let expected = parse_semver(expected.trim())?;
-            version >= expected
-                && version
-                    < (Semver {
-                        major: expected.major + 1,
-                        minor: 0,
-                        patch: 0,
-                    })
-        } else {
-            version == parse_semver(clause)?
-        };
-        if !matches {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
+    let requirement = VersionReq::parse(requirement).map_err(|_| {
+        PluginError::InvalidManifest(format!("invalid semver requirement `{requirement}`"))
+    })?;
+    Ok(requirement.matches(&version))
 }
 
-fn parse_semver(value: &str) -> Result<Semver, PluginError> {
-    let trimmed = value.trim().trim_start_matches('v');
-    let core = trimmed.split_once('-').map_or(trimmed, |(core, _)| core);
-    let core = core.split_once('+').map_or(core, |(core, _)| core);
-    let mut parts = core.split('.');
-    let major = parse_semver_part(parts.next(), value)?;
-    let minor = parse_semver_part(parts.next(), value)?;
-    let patch = parse_semver_part(parts.next(), value)?;
-    if parts.next().is_some() {
+fn parse_semver(value: &str) -> Result<Version, PluginError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.len() > PLUGIN_MANIFEST_VERSION_MAX_CHARS
+        || contains_control_character(value)
+        || value.contains(['/', '\\', ':'])
+    {
         return Err(PluginError::InvalidManifest(format!(
-            "invalid semver version `{value}`"
+            "invalid semver version `{}`",
+            sanitize_plugin_error(value)
         )));
     }
-    Ok(Semver {
-        major,
-        minor,
-        patch,
+    Version::parse(value).map_err(|_| {
+        PluginError::InvalidManifest(format!(
+            "invalid semver version `{}`",
+            sanitize_plugin_error(value)
+        ))
     })
-}
-
-fn parse_semver_part(part: Option<&str>, value: &str) -> Result<u64, PluginError> {
-    part.ok_or_else(|| PluginError::InvalidManifest(format!("invalid semver version `{value}`")))?
-        .parse::<u64>()
-        .map_err(|_| PluginError::InvalidManifest(format!("invalid semver version `{value}`")))
 }
 
 fn plugin_id(name: &str, marketplace: &str) -> String {
     format!("{name}@{marketplace}")
+}
+
+fn plugin_package_id(name: &str, marketplace: &str) -> String {
+    plugin_id(name, marketplace)
+}
+
+fn installed_archive_id(plugin_id: &str, version: &str) -> String {
+    format!("{plugin_id}#{version}")
+}
+
+fn compare_semver_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    match (Version::parse(left), Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
 }
 
 #[must_use]
@@ -9325,6 +10070,20 @@ fn truncate_plugin_error(value: &str) -> String {
         out.push_str("...[truncated]");
     }
     out
+}
+
+fn append_cleanup_warning(target: &mut Option<String>, warning: String) {
+    let warning = truncate_plugin_error(&sanitize_plugin_error(&warning));
+    match target {
+        Some(existing) if !existing.is_empty() => {
+            existing.push_str("; ");
+            existing.push_str(&warning);
+            *existing = truncate_plugin_error(existing);
+        }
+        _ => {
+            *target = Some(warning);
+        }
+    }
 }
 
 fn redact_after_marker(value: &str, marker: &str) -> String {
@@ -9458,10 +10217,77 @@ fn describe_install_source(source: &PluginInstallSource) -> String {
     }
 }
 
+fn installed_available_versions_by_id(
+    registry: &InstalledPluginRegistry,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut versions = BTreeMap::<String, BTreeSet<String>>::new();
+    for (plugin_id, record) in &registry.plugins {
+        versions
+            .entry(plugin_id.clone())
+            .or_default()
+            .insert(record.version.clone());
+    }
+    for (plugin_id, records) in &registry.versions {
+        let entry = versions.entry(plugin_id.clone()).or_default();
+        for record in records {
+            entry.insert(record.version.clone());
+        }
+    }
+    versions
+}
+
+fn stale_installed_registry_ids(registry: &InstalledPluginRegistry) -> Vec<String> {
+    registry
+        .plugins
+        .values()
+        .filter_map(|record| {
+            (!record.install_path.exists() || plugin_manifest_path(&record.install_path).is_err())
+                .then_some(record.id.clone())
+        })
+        .collect()
+}
+
+fn record_uncommitted_registry_migration(
+    registry: &InstalledPluginRegistry,
+    discovery: &mut PluginDiscovery,
+) {
+    if registry.migration_blocked_plugin_ids.is_empty() || registry.migration_warnings.is_empty() {
+        return;
+    }
+    let warning = registry
+        .migration_warnings
+        .iter()
+        .map(|warning| sanitize_plugin_error(warning))
+        .collect::<Vec<_>>()
+        .join("; ");
+    record_scan_warning(&mut discovery.scan_report, &warning);
+    for plugin_id in &registry.migration_blocked_plugin_ids {
+        let Some(record) = registry.plugins.get(plugin_id) else {
+            continue;
+        };
+        discovery.blocked_plugin_ids.insert(plugin_id.clone());
+        discovery.scan_report.failure_count += 1;
+        discovery.push_failure(PluginLoadFailure::new(
+            record.install_path.clone(),
+            record.kind,
+            describe_install_source(&record.source),
+            PluginError::InvalidManifest(format!(
+                "plugin registry migration for `{plugin_id}` is not persisted; runtime loading is disabled: {warning}"
+            )),
+        ));
+    }
+}
+
 fn sanitize_registry_for_storage(registry: &InstalledPluginRegistry) -> InstalledPluginRegistry {
     let mut sanitized = registry.clone();
+    sanitized.schema_version = INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION;
     for record in sanitized.plugins.values_mut() {
         record.source = sanitize_install_source_for_storage(&record.source);
+    }
+    for versions in sanitized.versions.values_mut() {
+        for record in versions {
+            record.source = sanitize_plugin_error(&record.source);
+        }
     }
     sanitized
 }
@@ -9606,6 +10432,7 @@ fn migrate_registry_source_metadata_under_lock(
     mut sanitized: InstalledPluginRegistry,
 ) -> Result<InstalledPluginRegistry, PluginError> {
     if let Err(error) = store_registry_at_path(path, &sanitized) {
+        sanitized.migration_blocked_plugin_ids = sanitized.plugins.keys().cloned().collect();
         push_manifest_warning(
             &mut sanitized.migration_warnings,
             format!(
@@ -9688,6 +10515,232 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
     fs::set_permissions(destination, source_metadata.permissions())?;
     audit_plugin_tree(destination)?;
     Ok(())
+}
+
+fn copy_dir_all_atomic(source: &Path, destination: &Path) -> Result<(), PluginError> {
+    if destination.exists() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install target `{}` already exists",
+            destination.display()
+        )));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        PluginError::InvalidManifest(format!(
+            "plugin install target `{}` has no parent directory",
+            destination.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    static COPY_DIR_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_destination = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin-dir"),
+        std::process::id(),
+        COPY_DIR_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let cleanup = TempDirCleanupGuard::new(temp_destination.clone());
+    copy_dir_all(source, &temp_destination)?;
+    if destination.exists() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install target `{}` already exists",
+            destination.display()
+        )));
+    }
+    fs::rename(&temp_destination, destination)?;
+    cleanup.disarm();
+    Ok(())
+}
+
+#[derive(Debug)]
+struct UninstallTrash {
+    trash_root: PathBuf,
+    entries: Vec<TrashedPluginPath>,
+}
+
+#[derive(Debug)]
+struct TrashedPluginPath {
+    original: PathBuf,
+    trashed: PathBuf,
+}
+
+fn move_plugin_paths_to_uninstall_trash(
+    paths: &BTreeSet<PathBuf>,
+    install_root: &Path,
+) -> Result<Option<UninstallTrash>, PluginError> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let trash_parent = install_root.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(trash_parent)?;
+    static UNINSTALL_TRASH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let trash_root = trash_parent.join(format!(
+        ".uninstall-trash-{}-{}-{}",
+        std::process::id(),
+        unix_time_ms(),
+        UNINSTALL_TRASH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&trash_root)?;
+    let mut trash = UninstallTrash {
+        trash_root,
+        entries: Vec::new(),
+    };
+
+    for (index, path) in paths.iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        let trashed = trash.trash_root.join(format!("entry-{index}"));
+        if let Err(error) = fs::rename(path, &trashed) {
+            let restore_error = restore_uninstall_trash(&trash).err();
+            let _ = fs::remove_dir_all(&trash.trash_root);
+            if let Some(restore_error) = restore_error {
+                return Err(PluginError::CommandFailed(truncate_plugin_error(&format!(
+                    "{}; uninstall staging rollback failed: {}",
+                    sanitize_plugin_error(&error.to_string()),
+                    sanitize_plugin_error(&restore_error.to_string())
+                ))));
+            }
+            return Err(error.into());
+        }
+        trash.entries.push(TrashedPluginPath {
+            original: path.clone(),
+            trashed,
+        });
+    }
+
+    Ok(Some(trash))
+}
+
+fn restore_uninstall_trash(trash: &UninstallTrash) -> Result<(), PluginError> {
+    let mut errors = Vec::new();
+    for entry in trash.entries.iter().rev() {
+        if let Some(parent) = entry.original.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                errors.push(format!(
+                    "create `{}`: {}",
+                    parent.display(),
+                    sanitize_plugin_error(&error.to_string())
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = fs::rename(&entry.trashed, &entry.original) {
+            errors.push(format!(
+                "restore `{}`: {}",
+                entry.original.display(),
+                sanitize_plugin_error(&error.to_string())
+            ));
+        }
+    }
+    if trash.trash_root.exists() {
+        let _ = fs::remove_dir_all(&trash.trash_root);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(PluginError::CommandFailed(truncate_plugin_error(
+            &errors.join("; "),
+        )))
+    }
+}
+
+fn cleanup_uninstall_trash(trash_root: &Path) -> Result<(), PluginError> {
+    maybe_fail_uninstall_trash_cleanup_for_test()?;
+    if trash_root.exists() {
+        fs::remove_dir_all(trash_root)?;
+    }
+    Ok(())
+}
+
+fn plugin_tree_hash(root: &Path) -> Result<String, PluginError> {
+    audit_plugin_tree(root)?;
+    let canonical_root = root.canonicalize()?;
+    let mut hasher = Sha256::new();
+    let mut budget = ScanBudget::new();
+    budget.count_dir(root, 0)?;
+    hash_plugin_tree_inner(root, &canonical_root, &mut hasher, &mut budget, 0)?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn hash_plugin_tree_inner(
+    root: &Path,
+    canonical_root: &Path,
+    hasher: &mut Sha256,
+    budget: &mut ScanBudget,
+    depth: usize,
+) -> Result<(), PluginError> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root)? {
+        budget.check_cooperative_deadline(root)?;
+        let entry = entry?;
+        entries.push(entry.path());
+    }
+    entries.sort_by(|left, right| {
+        relative_hash_path(canonical_root, left).cmp(&relative_hash_path(canonical_root, right))
+    });
+
+    for path in entries {
+        let metadata = fs::symlink_metadata(&path)?;
+        validate_plugin_entry_metadata(&path, &metadata)?;
+        ensure_source_path_within_root(canonical_root, &path)?;
+        budget.count_metadata(&path, &metadata, depth + 1)?;
+        let relative = relative_hash_path(canonical_root, &path);
+        if metadata.is_dir() {
+            hash_record_header(hasher, "dir", &relative, &metadata);
+            hash_plugin_tree_inner(&path, canonical_root, hasher, budget, depth + 1)?;
+        } else if metadata.is_file() {
+            hash_record_header(hasher, "file", &relative, &metadata);
+            let mut file = fs::File::open(&path)?;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden special file `{}`",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn hash_record_header(hasher: &mut Sha256, kind: &str, relative: &str, metadata: &fs::Metadata) {
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(relative.as_bytes());
+    hasher.update([0]);
+    hasher.update(plugin_metadata_mode(metadata).to_string().as_bytes());
+    hasher.update([0]);
+}
+
+fn relative_hash_path(root: &Path, path: &Path) -> String {
+    path.canonicalize()
+        .ok()
+        .and_then(|canonical| canonical.strip_prefix(root).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| path.to_path_buf())
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(unix)]
+fn plugin_metadata_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn plugin_metadata_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
 }
 
 fn copy_dir_all_inner(
@@ -9945,6 +10998,29 @@ impl Drop for TempPathCleanupGuard {
     }
 }
 
+struct TempDirCleanupGuard {
+    path: PathBuf,
+    active: bool,
+}
+
+impl TempDirCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, active: true }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TempDirCleanupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn promote_temp_file_no_replace(
     cleanup: TempPathCleanupGuard,
     target: &Path,
@@ -9979,14 +11055,31 @@ fn promote_temp_file_no_replace(
     }
 }
 
-fn prune_archived_versions(versions: &mut Vec<InstalledPluginVersionRecord>, keep_versions: usize) {
+fn prune_archived_versions(
+    versions: &mut Vec<InstalledPluginVersionRecord>,
+    keep_versions: usize,
+    protected_versions: &[&str],
+) {
+    let protected_versions = protected_versions.iter().copied().collect::<BTreeSet<_>>();
     versions.sort_by(|left, right| {
         left.archived_at_unix_ms
             .cmp(&right.archived_at_unix_ms)
+            .then_with(|| compare_semver_strings(&left.version, &right.version))
             .then_with(|| left.version.cmp(&right.version))
     });
-    while versions.len() > keep_versions {
-        let removed = versions.remove(0);
+    while versions
+        .iter()
+        .filter(|record| !protected_versions.contains(record.version.as_str()))
+        .count()
+        > keep_versions
+    {
+        let Some(index) = versions
+            .iter()
+            .position(|record| !protected_versions.contains(record.version.as_str()))
+        else {
+            break;
+        };
+        let removed = versions.remove(index);
         if removed.install_path.exists() {
             let _ = fs::remove_dir_all(removed.install_path);
         }
@@ -10014,7 +11107,59 @@ fn update_settings_json(
         ))
     })?;
     update(object);
-    fs::write(path, serde_json::to_string_pretty(&root)?)?;
+    maybe_fail_settings_store_for_test()?;
+    let payload = serde_json::to_vec_pretty(&root)?;
+    let mut output = atomic_write_file::AtomicWriteFile::open(path)?;
+    output.as_file_mut().write_all(&payload)?;
+    output.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+static FAIL_SETTINGS_STORE_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_fail_settings_store_for_test(value: bool) {
+    FAIL_SETTINGS_STORE_FOR_TEST.store(value, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn maybe_fail_settings_store_for_test() -> Result<(), PluginError> {
+    if FAIL_SETTINGS_STORE_FOR_TEST.load(Ordering::SeqCst) {
+        Err(PluginError::CommandFailed(
+            "injected plugin settings store failure token=[redacted]".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_fail_settings_store_for_test() -> Result<(), PluginError> {
+    Ok(())
+}
+
+#[cfg(test)]
+static FAIL_UNINSTALL_TRASH_CLEANUP_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_fail_uninstall_trash_cleanup_for_test(value: bool) {
+    FAIL_UNINSTALL_TRASH_CLEANUP_FOR_TEST.store(value, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn maybe_fail_uninstall_trash_cleanup_for_test() -> Result<(), PluginError> {
+    if FAIL_UNINSTALL_TRASH_CLEANUP_FOR_TEST.load(Ordering::SeqCst) {
+        Err(PluginError::CommandFailed(
+            "injected uninstall trash cleanup failure token=[redacted]".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_fail_uninstall_trash_cleanup_for_test() -> Result<(), PluginError> {
     Ok(())
 }
 
@@ -11442,6 +12587,7 @@ mod tests {
         let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         let secret = "SECRET-token-value";
         let mut registry = InstalledPluginRegistry::default();
+        registry.schema_version = LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION;
         registry.plugins.insert(
             "legacy@external".to_string(),
             InstalledPluginRecord {
@@ -11537,6 +12683,7 @@ mod tests {
         let manager = PluginManager::new(manager_config);
         let secret = "SECRET-token-value";
         let mut registry = InstalledPluginRegistry::default();
+        registry.schema_version = LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION;
         registry.plugins.insert(
             "legacy-list@external".to_string(),
             InstalledPluginRecord {
@@ -11583,6 +12730,20 @@ mod tests {
             .expect("migration warning should be surfaced");
         assert!(degraded.contains("migration failed"));
         assert!(!degraded.contains(secret));
+
+        let report = manager
+            .installed_plugin_registry_report()
+            .expect("readonly report should be available");
+        assert!(report
+            .failures()
+            .iter()
+            .any(|failure| failure.error().to_string().contains("not persisted")));
+        assert!(report.scan_report().failure_count > 0);
+        assert!(!report.healthy_registry().contains("legacy-list@external"));
+        let runtime_error = manager
+            .plugin_registry()
+            .expect_err("runtime registry must reject unpersisted migration");
+        assert!(runtime_error.to_string().contains("not persisted"));
 
         let store_error = manager
             .store_registry(&InstalledPluginRegistry::default())
@@ -12348,6 +13509,7 @@ mod tests {
         let manager = PluginManager::new(config);
 
         let mut registry = InstalledPluginRegistry::default();
+        registry.schema_version = LEGACY_INSTALLED_PLUGIN_REGISTRY_SCHEMA_VERSION;
         registry.plugins.insert(
             "registry-fallback@external".to_string(),
             InstalledPluginRecord {
@@ -12365,7 +13527,14 @@ mod tests {
                 updated_at_unix_ms: 1,
             },
         );
-        manager.store_registry(&registry).expect("store registry");
+        if let Some(parent) = manager.registry_path().parent() {
+            fs::create_dir_all(parent).expect("registry parent");
+        }
+        fs::write(
+            manager.registry_path(),
+            serde_json::to_string_pretty(&registry).expect("registry json"),
+        )
+        .expect("write legacy registry");
         manager
             .write_enabled_state("stale-external@external", Some(true))
             .expect("seed stale external enabled state");
@@ -12749,8 +13918,8 @@ mod tests {
             .expect_err("slow lifecycle should be cut off by total deadline");
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(
-            started.elapsed() < Duration::from_millis(1_500),
-            "deadline should cut lifecycle before standalone 5s sleep"
+            started.elapsed() < Duration::from_millis(2_900),
+            "deadline should stay below the 3s hot-reload product budget and cut lifecycle before standalone 5s sleep"
         );
         assert!(runtime.snapshot().contains("old@builtin"));
         assert!(!runtime.snapshot().contains("slow@bundled"));
@@ -14643,16 +15812,28 @@ mod tests {
   ]
 }"#,
         );
-        let mut cycle_manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        cycle_manager
-            .install(cycle_a.to_str().expect("utf8 path"))
-            .expect("install cycle a");
-        cycle_manager
-            .install(cycle_b.to_str().expect("utf8 path"))
-            .expect("install cycle b");
-        let cycle_registry = cycle_manager
-            .plugin_registry()
-            .expect("registry should load");
+        let cycle_registry = PluginRegistry::new(vec![
+            RegisteredPlugin::new(
+                load_plugin_definition(
+                    &cycle_a,
+                    PluginKind::External,
+                    cycle_a.display().to_string(),
+                    EXTERNAL_MARKETPLACE,
+                )
+                .expect("load cycle a"),
+                true,
+            ),
+            RegisteredPlugin::new(
+                load_plugin_definition(
+                    &cycle_b,
+                    PluginKind::External,
+                    cycle_b.display().to_string(),
+                    EXTERNAL_MARKETPLACE,
+                )
+                .expect("load cycle b"),
+                true,
+            ),
+        ]);
         let error = cycle_registry
             .dependency_order()
             .expect_err("cycle should fail");
@@ -14694,14 +15875,13 @@ mod tests {
         manager
             .install(first.to_str().expect("utf8 path"))
             .expect("install first");
-        manager
+        let error = manager
             .install(second.to_str().expect("utf8 path"))
-            .expect("install second");
-        let registry = manager.plugin_registry().expect("registry should build");
-        let error = registry
-            .dependency_order()
-            .expect_err("version mismatch should fail");
-        assert!(error.to_string().contains("active version is `1.0.0`"));
+            .expect_err("dependency mismatch should fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("single active runtime version is `1.0.0`"));
+        assert!(rendered.contains("available installed slots are `1.0.0`"));
+        assert!(rendered.contains("rollback `first@external`"));
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
@@ -14712,14 +15892,28 @@ mod tests {
         let _guard = env_guard();
         let config_home = temp_dir("rollback-home");
         let source_root = temp_dir("rollback-source");
+        write_file(source_root.join("payload.txt").as_path(), "v1");
         write_external_plugin(&source_root, "rollback-demo", "1.0.0");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         manager
             .install(source_root.to_str().expect("utf8 path"))
             .expect("install should succeed");
+        let installed_v1 = manager
+            .load_registry()
+            .expect("registry")
+            .plugins
+            .get("rollback-demo@external")
+            .expect("installed record")
+            .install_path
+            .clone();
+        assert!(installed_v1
+            .components()
+            .any(|component| component.as_os_str() == PLUGIN_VERSIONS_DIR_NAME));
         write_external_plugin(&source_root, "rollback-demo", "2.0.0");
-        manager.update("rollback-demo@external").expect("update");
+        let update = manager.update("rollback-demo@external").expect("update");
+        assert_ne!(installed_v1, update.install_path);
+        assert!(installed_v1.exists(), "old immutable version remains");
 
         let versions = manager
             .list_versions("rollback-demo@external")
@@ -14732,9 +15926,476 @@ mod tests {
             .expect("rollback should succeed");
         assert_eq!(rollback.previous_version, "2.0.0");
         assert_eq!(rollback.active_version, "1.0.0");
+        assert_eq!(rollback.install_path, installed_v1);
+        let registry = manager.load_registry().expect("registry");
+        let archived_versions = registry
+            .versions
+            .get("rollback-demo@external")
+            .expect("version records");
+        let v1_record = archived_versions
+            .iter()
+            .find(|record| record.version == "1.0.0")
+            .expect("v1 record");
+        assert_eq!(v1_record.archive_id, "rollback-demo@external#1.0.0");
+        assert!(!v1_record.content_hash.is_empty());
+        assert!(!v1_record.source.is_empty());
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn archive_id_and_content_hash_tamper_are_rejected() {
+        let _guard = env_guard();
+        let config_home = temp_dir("archive-tamper-home");
+        let source_root = temp_dir("archive-tamper-source");
+        write_file(source_root.join("payload.txt").as_path(), "v1");
+        write_external_plugin(&source_root, "tamper-demo", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install v1");
+        write_file(source_root.join("payload.txt").as_path(), "v2");
+        write_external_plugin(&source_root, "tamper-demo", "2.0.0");
+        manager.update("tamper-demo@external").expect("update v2");
+
+        let mut registry = manager.load_registry().expect("registry");
+        {
+            let v1_record = registry
+                .versions
+                .get_mut("tamper-demo@external")
+                .and_then(|records| records.iter_mut().find(|record| record.version == "1.0.0"))
+                .expect("v1 record");
+            v1_record.archive_id = "tamper-demo@external#wrong".to_string();
+        }
+        manager
+            .store_registry(&registry)
+            .expect("store tampered id");
+        let error = manager
+            .list_versions("tamper-demo@external")
+            .expect_err("tampered archiveId should fail");
+        assert!(error.to_string().contains("archiveId"));
+
+        registry
+            .versions
+            .get_mut("tamper-demo@external")
+            .and_then(|records| records.iter_mut().find(|record| record.version == "1.0.0"))
+            .expect("v1 record")
+            .archive_id = "tamper-demo@external#1.0.0".to_string();
+        manager.store_registry(&registry).expect("store fixed id");
+        let v1_path = registry
+            .versions
+            .get("tamper-demo@external")
+            .and_then(|records| records.iter().find(|record| record.version == "1.0.0"))
+            .expect("v1 record")
+            .install_path
+            .clone();
+        write_file(v1_path.join("payload.txt").as_path(), "tampered");
+        let error = manager
+            .list_versions("tamper-demo@external")
+            .expect_err("tampered content should fail");
+        assert!(error.to_string().contains("contentHash mismatch"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn version_slot_hash_covers_tmp_named_plugin_files() {
+        let _guard = env_guard();
+        let config_home = temp_dir("archive-tmp-tamper-home");
+        let source_root = temp_dir("archive-tmp-tamper-source");
+        write_file(source_root.join(".tmp").as_path(), "guarded tmp payload");
+        let tmp_executable = source_root.join("bin").join("runner.tmp-tool");
+        write_file(&tmp_executable, "guarded executable payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&tmp_executable)
+                .expect("tmp executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmp_executable, permissions).expect("chmod tmp executable");
+        }
+        write_external_plugin(&source_root, "tmp-hash-demo", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install v1");
+        write_external_plugin(&source_root, "tmp-hash-demo", "2.0.0");
+        manager.update("tmp-hash-demo@external").expect("update v2");
+        let v1_path = manager
+            .load_registry()
+            .expect("registry")
+            .versions
+            .get("tmp-hash-demo@external")
+            .and_then(|records| records.iter().find(|record| record.version == "1.0.0"))
+            .expect("v1 record")
+            .install_path
+            .clone();
+
+        write_file(v1_path.join(".tmp").as_path(), "tampered tmp payload");
+        let error = manager
+            .list_versions("tmp-hash-demo@external")
+            .expect_err(".tmp tamper should fail");
+        assert!(error.to_string().contains("contentHash mismatch"));
+
+        write_file(v1_path.join(".tmp").as_path(), "guarded tmp payload");
+        write_file(
+            v1_path.join("bin").join("runner.tmp-tool").as_path(),
+            "tampered executable payload",
+        );
+        let error = manager
+            .list_versions("tmp-hash-demo@external")
+            .expect_err("*.tmp-* executable tamper should fail");
+        assert!(error.to_string().contains("contentHash mismatch"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn active_version_slot_record_is_required_before_runtime_load() {
+        let _guard = env_guard();
+        let config_home = temp_dir("active-version-slot-required-home");
+        let source_root = temp_dir("active-version-slot-required-source");
+        write_file(source_root.join("payload.txt").as_path(), "active payload");
+        write_external_plugin(&source_root, "active-audit", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install");
+        let original_registry = manager.load_registry().expect("registry");
+        let active_path = original_registry
+            .plugins
+            .get("active-audit@external")
+            .expect("active record")
+            .install_path
+            .clone();
+        let mut missing_record_registry = original_registry.clone();
+        missing_record_registry
+            .versions
+            .get_mut("active-audit@external")
+            .expect("version records")
+            .retain(|record| record.version != "1.0.0");
+        manager
+            .store_registry(&missing_record_registry)
+            .expect("store missing active version record");
+
+        let error = manager
+            .plugin_registry_report()
+            .expect_err("registry report should fail without active version record");
+        assert!(error
+            .to_string()
+            .contains("missing its immutable version slot record"));
+        let error = manager
+            .list_installed_plugins()
+            .expect_err("runtime list should fail without active version record");
+        assert!(error
+            .to_string()
+            .contains("missing its immutable version slot record"));
+
+        manager
+            .store_registry(&original_registry)
+            .expect("restore active version record");
+        write_file(
+            active_path.join("payload.txt").as_path(),
+            "tampered active payload",
+        );
+        let error = manager
+            .plugin_registry_report()
+            .expect_err("registry report should reject active slot tamper");
+        assert!(error.to_string().contains("contentHash mismatch"));
+        let error = manager
+            .list_installed_plugins()
+            .expect_err("runtime list should reject active slot tamper");
+        assert!(error.to_string().contains("contentHash mismatch"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn schema_downgrade_with_version_records_and_tamper_is_rejected() {
+        let _guard = env_guard();
+        let config_home = temp_dir("schema-downgrade-tamper-home");
+        let source_root = temp_dir("schema-downgrade-tamper-source");
+        write_file(source_root.join("payload.txt").as_path(), "active payload");
+        write_external_plugin(&source_root, "downgrade-audit", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install");
+        let registry = manager.load_registry().expect("registry");
+        let active_path = registry
+            .plugins
+            .get("downgrade-audit@external")
+            .expect("active record")
+            .install_path
+            .clone();
+        write_file(
+            active_path.join("payload.txt").as_path(),
+            "tampered payload",
+        );
+        let mut raw = serde_json::to_value(&registry).expect("registry json");
+        raw["schemaVersion"] = serde_json::json!(0);
+        fs::write(
+            manager.registry_path(),
+            serde_json::to_string_pretty(&raw).expect("raw registry json"),
+        )
+        .expect("write downgraded registry");
+
+        let error = manager
+            .plugin_registry_report()
+            .expect_err("schema downgrade with version records must be rejected");
+        assert!(error.to_string().contains("schema downgrade"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn install_rolls_back_registry_and_slot_when_settings_store_fails() {
+        let _guard = env_guard();
+        let config_home = temp_dir("install-settings-rollback-home");
+        let source_root = temp_dir("install-settings-rollback-source");
+        write_external_plugin(&source_root, "settings-fail", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        set_fail_settings_store_for_test(true);
+        let error = manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect_err("settings failure should fail install");
+        set_fail_settings_store_for_test(false);
+        assert!(error.to_string().contains("settings store failure"));
+        let registry = manager.load_registry().expect("registry");
+        assert!(!registry.plugins.contains_key("settings-fail@external"));
+        assert!(!manager
+            .install_root()
+            .join(PLUGIN_VERSIONS_DIR_NAME)
+            .join("settings-fail-external")
+            .join("1.0.0")
+            .exists());
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn uninstall_moves_install_tree_back_when_settings_commit_fails() {
+        let _guard = env_guard();
+        let config_home = temp_dir("uninstall-settings-rollback-home");
+        let source_root = temp_dir("uninstall-settings-rollback-source");
+        write_external_plugin(&source_root, "uninstall-settings", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install");
+        let install_path = manager
+            .load_registry()
+            .expect("registry")
+            .plugins
+            .get("uninstall-settings@external")
+            .expect("record")
+            .install_path
+            .clone();
+        assert!(install_path.exists());
+
+        set_fail_settings_store_for_test(true);
+        let error = manager
+            .uninstall("uninstall-settings@external")
+            .expect_err("settings commit failure should roll back uninstall");
+        set_fail_settings_store_for_test(false);
+        assert!(error.to_string().contains("settings store failure"));
+        assert!(install_path.exists(), "install tree should be moved back");
+        assert!(manager
+            .load_registry()
+            .expect("registry")
+            .plugins
+            .contains_key("uninstall-settings@external"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn uninstall_cleanup_failure_is_reported_as_warning_after_commit() {
+        let _guard = env_guard();
+        let config_home = temp_dir("uninstall-cleanup-warning-home");
+        let source_root = temp_dir("uninstall-cleanup-warning-source");
+        write_external_plugin(&source_root, "uninstall-cleanup", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install");
+        set_fail_uninstall_trash_cleanup_for_test(true);
+        manager
+            .uninstall("uninstall-cleanup@external")
+            .expect("cleanup failure should not revert committed uninstall");
+        set_fail_uninstall_trash_cleanup_for_test(false);
+        let warning = manager
+            .take_cleanup_warning()
+            .expect("cleanup warning should be captured");
+        assert!(warning.contains("uninstall trash cleanup failed"));
+        assert!(warning.contains("[redacted]"));
+        assert!(!manager
+            .load_registry()
+            .expect("registry")
+            .plugins
+            .contains_key("uninstall-cleanup@external"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn inactive_version_slots_do_not_satisfy_runtime_dependencies() {
+        let _guard = env_guard();
+        let config_home = temp_dir("dependency-version-slots-home");
+        let source_root = temp_dir("dependency-version-slots-source");
+        let base = source_root.join("base");
+        let old_consumer = source_root.join("old-consumer");
+        let new_consumer = source_root.join("new-consumer");
+
+        write_external_plugin(&base, "base-lib", "1.5.0");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(base.to_str().expect("utf8 path"))
+            .expect("install base v1");
+        write_external_plugin(&base, "base-lib", "2.1.0");
+        manager.update("base-lib@external").expect("update base v2");
+        write_file(
+            old_consumer.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "old-consumer",
+  "version": "1.0.0",
+  "description": "Old consumer",
+  "dependencies": [
+    { "name": "base-lib", "versionRequirement": "<2.0.0" }
+  ]
+}"#,
+        );
+        write_file(
+            new_consumer.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "new-consumer",
+  "version": "1.0.0",
+  "description": "New consumer",
+  "dependencies": [
+    { "name": "base-lib", "versionRequirement": ">=2.0.0, <3.0.0" }
+  ]
+}"#,
+        );
+
+        let error = manager
+            .install(old_consumer.to_str().expect("utf8 path"))
+            .expect_err("inactive archived v1 must not satisfy runtime dependency");
+        let rendered = error.to_string();
+        assert!(rendered.contains("single active runtime version is `2.1.0`"));
+        assert!(rendered.contains("available installed slots are `1.5.0, 2.1.0`"));
+        assert!(rendered.contains("rollback `base-lib@external`"));
+        manager
+            .install(new_consumer.to_str().expect("utf8 path"))
+            .expect("new consumer can use active v2 slot");
+        let registry = manager.plugin_registry().expect("registry should build");
+        let order = registry.dependency_order().expect("dependency order");
+        assert!(
+            order.iter().position(|id| id == "base-lib@external")
+                < order.iter().position(|id| id == "new-consumer@external")
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn archived_dependency_versions_with_surfaces_are_still_inactive() {
+        let _guard = env_guard();
+        let config_home = temp_dir("dependency-surface-slots-home");
+        let source_root = temp_dir("dependency-surface-slots-source");
+        let base = source_root.join("base");
+        let consumer = source_root.join("consumer");
+
+        write_file(
+            base.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "surface-lib",
+  "version": "1.0.0",
+  "description": "Surface dependency",
+  "capabilities": { "resources": true },
+  "resources": [
+    { "uri": "claw://surface-lib/v1", "name": "Surface v1" }
+  ]
+}"#,
+        );
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(base.to_str().expect("utf8 path"))
+            .expect("install base v1");
+        write_external_plugin(&base, "surface-lib", "2.0.0");
+        manager
+            .update("surface-lib@external")
+            .expect("update base v2");
+        write_file(
+            consumer.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "surface-consumer",
+  "version": "1.0.0",
+  "description": "Surface consumer",
+  "dependencies": [
+    { "name": "surface-lib", "versionRequirement": "<2.0.0" }
+  ]
+}"#,
+        );
+
+        let error = manager
+            .install(consumer.to_str().expect("utf8 path"))
+            .expect_err("non-active surface dependency should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("single active runtime version is `2.0.0`"));
+        assert!(rendered.contains("available installed slots are `1.0.0, 2.0.0`"));
+        assert!(rendered.contains("rollback `surface-lib@external`"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn semver_uses_crate_ranges_and_rejects_version_path_injection() {
+        assert!(semver_requirement_matches("^0.2.0", "0.2.5").expect("range"));
+        assert!(!semver_requirement_matches("^0.2.0", "0.3.0").expect("range"));
+        assert!(semver_requirement_matches("=1.0.0-alpha.1", "1.0.0-alpha.1").expect("pre"));
+        assert!(semver_requirement_matches("*", "9.9.9").expect("explicit wildcard"));
+        assert!(semver_requirement_matches("   ", "1.0.0").is_err());
+        assert!(parse_semver("v1.0.0").is_err());
+        assert!(parse_semver("1.0.0/../../evil").is_err());
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_blank_dependency_version_requirement() {
+        let _guard = env_guard();
+        let root = temp_dir("blank-dependency-requirement");
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "blank-dep",
+  "version": "1.0.0",
+  "description": "Blank dependency",
+  "dependencies": [
+    { "name": "base", "versionRequirement": "   " }
+  ]
+}"#,
+        );
+        let error = load_plugin_from_directory(&root).expect_err("blank requirement should fail");
+        assert!(error.to_string().contains("versionRequirement"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

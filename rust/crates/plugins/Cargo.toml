@@ -9,8 +9,10 @@ publish.workspace = true
 atomic-write-file = "0.3"
 fs2 = "0.4"
 rustix = { version = "1", features = ["process"] }
+semver = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
 
 [lints]
 workspace = true

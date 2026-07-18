@@ -497,6 +497,7 @@ fn plugin_command_json(
         "status": plugin_json_status(failures, report.scan_report()),
         "message": result.message,
         "reload_runtime": result.reload_runtime,
+        "details": &result.details,
         "hot_reload": plugin_hot_reload_json(result.reload_runtime),
         "plugins": report.summaries().iter().map(plugin_summary_json).collect::<Vec<_>>(),
         "load_failures": failures.iter().map(plugin_load_failure_json).collect::<Vec<_>>(),
@@ -4830,6 +4831,8 @@ fn run_resume_command(
                     "load_failures": payload.load_failures.len(),
                 },
                 "config_load_error": payload.config_load_error,
+                "details": payload.details,
+                "cleanup_warning": payload.cleanup_warning,
                 "plugins": payload.plugins,
                 "load_failures": payload.load_failures,
                 "scan": payload.scan,
@@ -7616,6 +7619,8 @@ impl LiveCli {
                     "plugins": filtered_plugins,
                     "load_failures": payload.load_failures,
                     "scan": payload.scan,
+                    "details": payload.details,
+                    "cleanup_warning": payload.cleanup_warning,
                     "hot_reload": plugin_hot_reload_json(payload.reload_runtime),
                 });
                 // Only include operation-result fields for mutating actions (not list/show)
@@ -10475,6 +10480,8 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
 struct PluginsCommandPayload {
     message: String,
     reload_runtime: bool,
+    details: Option<Value>,
+    cleanup_warning: Option<String>,
     status: &'static str,
     config_load_error: Option<String>,
     plugins: Vec<Value>,
@@ -10495,12 +10502,24 @@ fn plugins_command_payload_for(
         Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
     };
     let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
-    let result = handle_plugins_slash_command(action, target, &mut manager)?;
+    let (result, cleanup_warning) = if plugin_action_may_mutate(action) {
+        let prepared = manager.prepare_hot_reload_transaction(|manager| {
+            let result = handle_plugins_slash_command(action, target, manager)?;
+            let reload_runtime = result.reload_runtime;
+            Ok((result, reload_runtime))
+        })?;
+        let finish = manager.finish_prepared_hot_reload(prepared);
+        (finish.result, finish.cleanup_warning)
+    } else {
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        (result, manager.take_cleanup_warning())
+    };
     let report = manager.plugin_registry_report()?;
     Ok(plugins_command_payload_from_result(
         result,
         config_load_error,
         &report,
+        cleanup_warning,
     ))
 }
 
@@ -10508,15 +10527,19 @@ fn plugins_command_payload_from_result(
     result: PluginsCommandResult,
     config_load_error: Option<String>,
     report: &plugins::PluginRegistryReport,
+    cleanup_warning: Option<String>,
 ) -> PluginsCommandPayload {
+    let cleanup_warning = cleanup_warning.map(|warning| plugins::sanitize_plugin_error(&warning));
     let failures = report.failures();
     let scan_report = report.scan_report();
-    let status =
-        if config_load_error.is_some() || plugin_json_status(failures, scan_report) == "degraded" {
-            "degraded"
-        } else {
-            "ok"
-        };
+    let status = if config_load_error.is_some()
+        || cleanup_warning.is_some()
+        || plugin_json_status(failures, scan_report) == "degraded"
+    {
+        "degraded"
+    } else {
+        "ok"
+    };
     let message = match config_load_error.as_deref() {
         Some(error) => format!(
             "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
@@ -10527,11 +10550,48 @@ fn plugins_command_payload_from_result(
     PluginsCommandPayload {
         message,
         reload_runtime: result.reload_runtime,
+        details: plugin_details_with_cleanup_warning(result.details, cleanup_warning.as_deref()),
+        cleanup_warning,
         status,
         config_load_error,
         plugins: report.summaries().iter().map(plugin_summary_json).collect(),
         load_failures: failures.iter().map(plugin_load_failure_json).collect(),
         scan: plugin_scan_report_json(report.scan_report()),
+    }
+}
+
+fn plugin_details_with_cleanup_warning(
+    details: Option<Value>,
+    cleanup_warning: Option<&str>,
+) -> Option<Value> {
+    let Some(cleanup_warning) = cleanup_warning else {
+        return details;
+    };
+    match details {
+        Some(Value::Object(mut object)) => {
+            object.insert(
+                "cleanup_warning".to_string(),
+                Value::String(cleanup_warning.to_string()),
+            );
+            Some(Value::Object(object))
+        }
+        Some(value) => {
+            let mut object = Map::new();
+            object.insert("result".to_string(), value);
+            object.insert(
+                "cleanup_warning".to_string(),
+                Value::String(cleanup_warning.to_string()),
+            );
+            Some(Value::Object(object))
+        }
+        None => {
+            let mut object = Map::new();
+            object.insert(
+                "cleanup_warning".to_string(),
+                Value::String(cleanup_warning.to_string()),
+            );
+            Some(Value::Object(object))
+        }
     }
 }
 
@@ -13553,12 +13613,12 @@ mod tests {
             fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
             fs::write(
                 root.join("lifecycle").join("init.sh"),
-                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                format!("#!/bin/sh\nprintf 'init\\n' >> ../{name}.lifecycle.log\n"),
             )
             .expect("write init lifecycle");
             fs::write(
                 root.join("lifecycle").join("shutdown.sh"),
-                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+                format!("#!/bin/sh\nprintf 'shutdown\\n' >> ../{name}.lifecycle.log\n"),
             )
             .expect("write shutdown lifecycle");
         }
@@ -13585,6 +13645,24 @@ mod tests {
             ),
         )
         .expect("write plugin manifest");
+    }
+
+    fn runtime_plugin_log_path(state: &super::RuntimePluginState, plugin_id: &str) -> PathBuf {
+        let root = state
+            .plugin_registry
+            .get(plugin_id)
+            .and_then(|plugin| plugin.metadata().root.as_ref())
+            .expect("runtime plugin should expose active root");
+        let name = state
+            .plugin_registry
+            .get(plugin_id)
+            .expect("runtime plugin should exist")
+            .metadata()
+            .name
+            .clone();
+        root.parent()
+            .expect("active plugin root should have parent")
+            .join(format!("{name}.lifecycle.log"))
     }
 
     fn write_plugin_mcp_fixture(root: &Path, name: &str, script_path: &Path) {
@@ -14832,6 +14910,129 @@ mod tests {
         assert!(payload.message.contains("Plugins"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugins_direct_payload_exposes_version_coexistence_contract() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        let source_root = root.join("plugin-source");
+        std::fs::create_dir_all(&cwd).expect("project dir");
+        std::fs::create_dir_all(source_root.join(".claude-plugin")).expect("manifest dir");
+        let write_plugin = |version: &str| {
+            std::fs::write(
+                source_root.join(".claude-plugin").join("plugin.json"),
+                format!(
+                    r#"{{
+  "name": "direct-version",
+  "version": "{version}",
+  "description": "Direct version plugin"
+}}"#
+                ),
+            )
+            .expect("write plugin");
+        };
+
+        let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        write_plugin("1.0.0");
+        let install = super::plugins_command_payload_for(
+            &cwd,
+            Some("install"),
+            Some(source_root.to_str().expect("utf8 source")),
+            super::ConfigWarningMode::SuppressStderr,
+        )
+        .expect("install payload");
+        assert_eq!(
+            install.details.as_ref().expect("install details")["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+        assert_eq!(
+            install.details.as_ref().expect("install details")["active_version"],
+            "1.0.0"
+        );
+
+        write_plugin("2.0.0");
+        let update = super::plugins_command_payload_for(
+            &cwd,
+            Some("update"),
+            Some("direct-version@external"),
+            super::ConfigWarningMode::SuppressStderr,
+        )
+        .expect("update payload");
+        let update_details = update.details.as_ref().expect("update details");
+        assert_eq!(update_details["operation"], "update");
+        assert_eq!(update_details["active_version"], "2.0.0");
+        assert_eq!(update_details["available_versions"][0], "1.0.0");
+        assert_eq!(update_details["available_versions"][1], "2.0.0");
+
+        let versions = super::plugins_command_payload_for(
+            &cwd,
+            Some("versions"),
+            Some("direct-version@external"),
+            super::ConfigWarningMode::SuppressStderr,
+        )
+        .expect("versions payload");
+        let versions_details = versions.details.as_ref().expect("versions details");
+        assert_eq!(versions_details["operation"], "versions");
+        assert_eq!(versions_details["active_version"], "2.0.0");
+        assert_eq!(
+            versions_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+
+        let rollback = super::plugins_command_payload_for(
+            &cwd,
+            Some("rollback"),
+            Some("direct-version@external 1.0.0"),
+            super::ConfigWarningMode::SuppressStderr,
+        )
+        .expect("rollback payload");
+        let rollback_details = rollback.details.as_ref().expect("rollback details");
+        assert_eq!(rollback_details["operation"], "rollback");
+        assert_eq!(rollback_details["active_version"], "1.0.0");
+        assert_eq!(
+            rollback_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugins_direct_payload_marks_cleanup_warning_degraded() {
+        let report =
+            plugins::PluginRegistryReport::new(PluginRegistry::new(Vec::new()), Vec::new());
+        let result = commands::PluginsCommandResult {
+            message: "done".to_string(),
+            reload_runtime: true,
+            details: Some(json!({
+                "operation": "uninstall",
+                "pluginId": "cleanup@external"
+            })),
+        };
+
+        let payload = super::plugins_command_payload_from_result(
+            result,
+            None,
+            &report,
+            Some("cleanup token=SECRET".to_string()),
+        );
+
+        assert_eq!(payload.status, "degraded");
+        assert_eq!(
+            payload.cleanup_warning.as_deref(),
+            Some("cleanup token=[redacted]")
+        );
+        let details = payload.details.expect("details");
+        assert_eq!(details["operation"], "uninstall");
+        assert_eq!(details["cleanup_warning"], "cleanup token=[redacted]");
     }
 
     #[test]
@@ -19022,16 +19223,13 @@ UU conflicted.rs",
             .expect("serialize plugin settings"),
         )
         .expect("write plugin settings");
-        let log_path = config_home
-            .join("plugins")
-            .join("installed")
-            .join("lifecycle-runtime-demo-bundled")
-            .join("lifecycle.log");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let runtime_plugin_state =
             build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
                 .expect("plugin state should load");
+        let log_path =
+            runtime_plugin_log_path(&runtime_plugin_state, "lifecycle-runtime-demo@bundled");
         let mut runtime = build_runtime_with_plugin_state(
             Session::new(),
             "runtime-plugin-lifecycle",
@@ -19091,16 +19289,13 @@ UU conflicted.rs",
             .expect("serialize plugin settings"),
         )
         .expect("write plugin settings");
-        let log_path = config_home
-            .join("plugins")
-            .join("installed")
-            .join("hot-swap-runtime-demo-bundled")
-            .join("lifecycle.log");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let runtime_plugin_state =
             build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
                 .expect("plugin state should load");
+        let log_path =
+            runtime_plugin_log_path(&runtime_plugin_state, "hot-swap-runtime-demo@bundled");
         let mut runtime = build_runtime_with_plugin_state(
             Session::new(),
             "runtime-plugin-hot-swap",
@@ -19186,16 +19381,12 @@ UU conflicted.rs",
             .expect("serialize plugin settings"),
         )
         .expect("write plugin settings");
-        let log_path = config_home
-            .join("plugins")
-            .join("installed")
-            .join("turn-owner-demo-bundled")
-            .join("lifecycle.log");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let runtime_plugin_state =
             build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
                 .expect("plugin state should load");
+        let log_path = runtime_plugin_log_path(&runtime_plugin_state, "turn-owner-demo@bundled");
         let runtime = build_runtime_with_plugin_state(
             Session::new(),
             "runtime-plugin-turn-owner",

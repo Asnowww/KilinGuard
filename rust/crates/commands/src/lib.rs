@@ -2135,6 +2135,28 @@ pub struct SlashCommandResult {
 pub struct PluginsCommandResult {
     pub message: String,
     pub reload_runtime: bool,
+    pub details: Option<Value>,
+}
+
+fn plugin_version_contract_json(
+    manager: &PluginManager,
+    operation: &str,
+    plugin_id: &str,
+) -> Result<Value, PluginError> {
+    let available_versions = manager.list_versions(plugin_id)?;
+    let active_version = manager
+        .list_installed_plugins()?
+        .into_iter()
+        .find(|plugin| plugin.metadata.id == plugin_id)
+        .map(|plugin| plugin.metadata.version)
+        .ok_or_else(|| PluginError::NotFound(format!("plugin `{plugin_id}` is not installed")))?;
+    Ok(json!({
+        "operation": operation,
+        "coexistence_mode": "installed_slots_single_active",
+        "pluginId": plugin_id,
+        "active_version": active_version,
+        "available_versions": available_versions,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2269,6 +2291,7 @@ pub fn handle_plugins_slash_command(
                     report.scan_report(),
                 ),
                 reload_runtime: false,
+                details: None,
             })
         }
         Some("install") => {
@@ -2276,6 +2299,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins install <path>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let install = manager.install(target)?;
@@ -2283,9 +2307,19 @@ pub fn handle_plugins_slash_command(
                 .list_installed_plugins()?
                 .into_iter()
                 .find(|plugin| plugin.metadata.id == install.plugin_id);
+            let mut details =
+                plugin_version_contract_json(manager, "install", &install.plugin_id)?;
+            if let Some(object) = details.as_object_mut() {
+                object.insert("version".to_string(), json!(install.version));
+                object.insert(
+                    "installPath".to_string(),
+                    json!(install.install_path.display().to_string()),
+                );
+            }
             Ok(PluginsCommandResult {
                 message: render_plugin_install_report(&install.plugin_id, plugin.as_ref()),
                 reload_runtime: true,
+                details: Some(details),
             })
         }
         Some("enable") => {
@@ -2293,6 +2327,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins enable <name>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let plugin = resolve_plugin_target(manager, target)?;
@@ -2303,6 +2338,7 @@ pub fn handle_plugins_slash_command(
                     plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
                 ),
                 reload_runtime: true,
+                details: None,
             })
         }
         Some("disable") => {
@@ -2310,6 +2346,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins disable <name>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let plugin = resolve_plugin_target(manager, target)?;
@@ -2320,6 +2357,7 @@ pub fn handle_plugins_slash_command(
                     plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
                 ),
                 reload_runtime: true,
+                details: None,
             })
         }
         Some("remove") | Some("uninstall") => {
@@ -2327,12 +2365,14 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins uninstall <plugin-id>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             manager.uninstall(target)?;
             Ok(PluginsCommandResult {
                 message: format!("Plugins\n  Result           uninstalled {target}"),
                 reload_runtime: true,
+                details: None,
             })
         }
         Some("update") => {
@@ -2340,6 +2380,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins update <plugin-id>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let update = manager.update(target)?;
@@ -2347,6 +2388,16 @@ pub fn handle_plugins_slash_command(
                 .list_installed_plugins()?
                 .into_iter()
                 .find(|plugin| plugin.metadata.id == update.plugin_id);
+            let mut details =
+                plugin_version_contract_json(manager, "update", &update.plugin_id)?;
+            if let Some(object) = details.as_object_mut() {
+                object.insert("oldVersion".to_string(), json!(update.old_version.clone()));
+                object.insert("newVersion".to_string(), json!(update.new_version.clone()));
+                object.insert(
+                    "installPath".to_string(),
+                    json!(update.install_path.display().to_string()),
+                );
+            }
             Ok(PluginsCommandResult {
                 message: format!(
                     "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
@@ -2361,6 +2412,7 @@ pub fn handle_plugins_slash_command(
                         .map_or("unknown", |plugin| if plugin.enabled { "enabled" } else { "disabled" }),
                 ),
                 reload_runtime: true,
+                details: Some(details),
             })
         }
         Some("versions" | "list-versions") => {
@@ -2368,6 +2420,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins versions <plugin-id>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let versions = manager.list_versions(target)?;
@@ -2376,12 +2429,13 @@ pub fn handle_plugins_slash_command(
                 format!("  Plugin           {target}"),
                 "  Versions".to_string(),
             ];
-            for version in versions {
+            for version in &versions {
                 lines.push(format!("    {version}"));
             }
             Ok(PluginsCommandResult {
                 message: lines.join("\n"),
                 reload_runtime: false,
+                details: Some(plugin_version_contract_json(manager, "versions", target)?),
             })
         }
         Some("rollback") => {
@@ -2389,6 +2443,7 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins rollback <plugin-id> <version>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let mut parts = target.split_whitespace();
@@ -2396,27 +2451,47 @@ pub fn handle_plugins_slash_command(
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins rollback <plugin-id> <version>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             let Some(version) = parts.next() else {
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins rollback <plugin-id> <version>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             };
             if parts.next().is_some() {
                 return Ok(PluginsCommandResult {
                     message: "Usage: /plugins rollback <plugin-id> <version>".to_string(),
                     reload_runtime: false,
+                    details: None,
                 });
             }
             let rollback = manager.rollback(plugin_id, version)?;
+            let mut details =
+                plugin_version_contract_json(manager, "rollback", &rollback.plugin_id)?;
+            if let Some(object) = details.as_object_mut() {
+                object.insert(
+                    "previousVersion".to_string(),
+                    json!(rollback.previous_version.clone()),
+                );
+                object.insert(
+                    "activeVersion".to_string(),
+                    json!(rollback.active_version.clone()),
+                );
+                object.insert(
+                    "installPath".to_string(),
+                    json!(rollback.install_path.display().to_string()),
+                );
+            }
             Ok(PluginsCommandResult {
                 message: format!(
                     "Plugins\n  Result           rolled back {}\n  Previous version {}\n  Active version   {}",
                     rollback.plugin_id, rollback.previous_version, rollback.active_version
                 ),
                 reload_runtime: true,
+                details: Some(details),
             })
         }
         Some("show" | "info" | "describe") => {
@@ -2441,6 +2516,7 @@ pub fn handle_plugins_slash_command(
                     report.scan_report(),
                 ),
                 reload_runtime: false,
+                details: None,
             })
         }
         // #743/#420: "help" was caught by Some(other) → unknown_plugins_action error with hint:null.
@@ -2449,6 +2525,7 @@ pub fn handle_plugins_slash_command(
             message: "Plugins\n  Usage            /plugins [list|status|show <id>|install <id>|enable <id>|disable <id>|uninstall <id>|update <id>|versions <id>|rollback <id> <version>|help]\n  Subcommands      list  status  show  install  enable  disable  uninstall  update  versions  rollback  help"
                 .to_string(),
             reload_runtime: false,
+            details: None,
         }),
         Some(other) => Err(PluginError::CommandFailed(format!(
             "unknown_plugins_action: '{other}' is not a supported /plugins action.\nUse: list, show, install, enable, disable, uninstall, update, versions, or rollback."
@@ -6504,6 +6581,14 @@ mod tests {
         assert!(install.message.contains("Name             demo"));
         assert!(install.message.contains("Version          1.0.0"));
         assert!(install.message.contains("Status           enabled"));
+        let install_details = install.details.expect("install details");
+        assert_eq!(install_details["operation"], "install");
+        assert_eq!(
+            install_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+        assert_eq!(install_details["active_version"], "1.0.0");
+        assert_eq!(install_details["available_versions"][0], "1.0.0");
 
         let list = handle_plugins_slash_command(Some("list"), None, &mut manager)
             .expect("list command should succeed");
@@ -6535,8 +6620,18 @@ mod tests {
         )
         .expect("install command should succeed");
         write_external_plugin(&source_root, "demo", "2.0.0");
-        handle_plugins_slash_command(Some("update"), Some("demo@external"), &mut manager)
-            .expect("update command should succeed");
+        let update =
+            handle_plugins_slash_command(Some("update"), Some("demo@external"), &mut manager)
+                .expect("update command should succeed");
+        let update_details = update.details.expect("update details");
+        assert_eq!(update_details["operation"], "update");
+        assert_eq!(
+            update_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+        assert_eq!(update_details["active_version"], "2.0.0");
+        assert_eq!(update_details["available_versions"][0], "1.0.0");
+        assert_eq!(update_details["available_versions"][1], "2.0.0");
 
         let versions =
             handle_plugins_slash_command(Some("versions"), Some("demo@external"), &mut manager)
@@ -6544,6 +6639,16 @@ mod tests {
         assert!(!versions.reload_runtime);
         assert!(versions.message.contains("1.0.0"));
         assert!(versions.message.contains("2.0.0"));
+        let versions_details = versions.details.expect("versions details");
+        assert_eq!(versions_details["operation"], "versions");
+        assert_eq!(
+            versions_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+        assert_eq!(versions_details["pluginId"], "demo@external");
+        assert_eq!(versions_details["active_version"], "2.0.0");
+        assert_eq!(versions_details["available_versions"][0], "1.0.0");
+        assert_eq!(versions_details["available_versions"][1], "2.0.0");
 
         let rollback = handle_plugins_slash_command(
             Some("rollback"),
@@ -6555,6 +6660,17 @@ mod tests {
         assert!(rollback.message.contains("rolled back demo@external"));
         assert!(rollback.message.contains("Previous version 2.0.0"));
         assert!(rollback.message.contains("Active version   1.0.0"));
+        let rollback_details = rollback.details.expect("rollback details");
+        assert_eq!(rollback_details["operation"], "rollback");
+        assert_eq!(
+            rollback_details["coexistence_mode"],
+            "installed_slots_single_active"
+        );
+        assert_eq!(rollback_details["previousVersion"], "2.0.0");
+        assert_eq!(rollback_details["activeVersion"], "1.0.0");
+        assert_eq!(rollback_details["active_version"], "1.0.0");
+        assert_eq!(rollback_details["available_versions"][0], "1.0.0");
+        assert_eq!(rollback_details["available_versions"][1], "2.0.0");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
