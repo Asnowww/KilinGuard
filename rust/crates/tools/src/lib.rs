@@ -26,7 +26,7 @@ use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_with_policy, execute_bash,
     glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
     lsp_client::LspRegistry,
-    mcp_tool_bridge::McpToolRegistry,
+    mcp_tool_bridge::{McpProtocolStateSnapshot, McpToolRegistry},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_with_policy,
     summary_compression::compress_summary_text,
@@ -2292,6 +2292,17 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
     }
 }
 
+fn mcp_protocol_object(registry: &McpToolRegistry, server: &str) -> Value {
+    registry.get_server(server).map_or_else(
+        || json!(null),
+        |state| mcp_protocol_snapshot_object(&McpProtocolStateSnapshot::from(&state)),
+    )
+}
+
+fn mcp_protocol_snapshot_object(protocol: &McpProtocolStateSnapshot) -> Value {
+    serde_json::to_value(protocol).unwrap_or_else(|_| json!(null))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
     let registry = global_mcp_registry();
@@ -2316,12 +2327,14 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
                     let count = items.len();
                     McpAggregateEntry::item(json!({
                         "server": server,
+                        "protocol": mcp_protocol_object(registry, server),
                         "resources": items,
                         "count": count
                     }))
                 }
                 Err(e) => McpAggregateEntry::failure(json!({
                     "server": server,
+                    "protocol": mcp_protocol_object(registry, server),
                     "resources": [],
                     "error": e
                 })),
@@ -2344,12 +2357,14 @@ fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
             let count = items.len();
             to_bounded_mcp_json(json!({
                 "server": server,
+                "protocol": mcp_protocol_object(registry, server),
                 "resources": items,
                 "count": count
             }))
         }
         Err(e) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "resources": [],
             "error": e
         })),
@@ -2380,12 +2395,14 @@ fn run_list_mcp_resource_templates(input: McpResourceInput) -> Result<String, St
                     let count = items.len();
                     McpAggregateEntry::item(json!({
                         "server": server,
+                        "protocol": mcp_protocol_object(registry, server),
                         "resource_templates": items,
                         "count": count
                     }))
                 }
                 Err(e) => McpAggregateEntry::failure(json!({
                     "server": server,
+                    "protocol": mcp_protocol_object(registry, server),
                     "resource_templates": [],
                     "error": e
                 })),
@@ -2408,12 +2425,14 @@ fn run_list_mcp_resource_templates(input: McpResourceInput) -> Result<String, St
             let count = items.len();
             to_bounded_mcp_json(json!({
                 "server": server,
+                "protocol": mcp_protocol_object(registry, server),
                 "resource_templates": items,
                 "count": count
             }))
         }
         Err(e) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "resource_templates": [],
             "error": e
         })),
@@ -2428,12 +2447,14 @@ fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
     match registry.read_resource(server, uri) {
         Ok(resource) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "uri": uri,
             "contents": resource.contents,
             "count": resource.contents.len()
         })),
         Err(e) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "uri": uri,
             "error": e
         })),
@@ -2463,12 +2484,14 @@ fn run_list_mcp_prompts(input: McpPromptInput) -> Result<String, String> {
                     let count = items.len();
                     McpAggregateEntry::item(json!({
                         "server": server,
+                        "protocol": mcp_protocol_object(registry, server),
                         "prompts": items,
                         "count": count
                     }))
                 }
                 Err(e) => McpAggregateEntry::failure(json!({
                     "server": server,
+                    "protocol": mcp_protocol_object(registry, server),
                     "prompts": [],
                     "error": e
                 })),
@@ -2490,12 +2513,14 @@ fn run_list_mcp_prompts(input: McpPromptInput) -> Result<String, String> {
             let count = items.len();
             to_bounded_mcp_json(json!({
                 "server": server,
+                "protocol": mcp_protocol_object(registry, server),
                 "prompts": items,
                 "count": count
             }))
         }
         Err(e) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "prompts": [],
             "error": e
         })),
@@ -2510,11 +2535,13 @@ fn run_get_mcp_prompt(input: McpPromptInput) -> Result<String, String> {
     match registry.get_prompt(server, name, input.arguments) {
         Ok(prompt) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "name": name,
             "prompt": prompt
         })),
         Err(e) => to_bounded_mcp_json(json!({
             "server": server,
+            "protocol": mcp_protocol_object(registry, server),
             "name": name,
             "error": e
         })),
@@ -2529,6 +2556,12 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
             "server": input.server,
             "status": state.status,
             "server_info": state.server_info,
+            "protocol": {
+                "requested": state.requested_protocol_version,
+                "negotiated": state.negotiated_protocol_version,
+                "policy": state.protocol_transport_policy,
+                "configuredPreferred": state.protocol_configured_preferred,
+            },
             "tool_count": state.tools.len(),
             "resource_count": state.resources.len()
         })),
@@ -2607,18 +2640,29 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     let registry = global_mcp_registry();
+    run_mcp_tool_with_registry(input, registry)
+}
+
+fn run_mcp_tool_with_registry(
+    input: McpToolInput,
+    registry: &McpToolRegistry,
+) -> Result<String, String> {
     let args = input.arguments.unwrap_or(serde_json::json!({}));
-    match registry.call_tool(&input.server, &input.tool, &args) {
-        Ok(result) => to_pretty_json(json!({
-            "server": input.server,
-            "tool": input.tool,
-            "result": result,
+    let server = input.server;
+    let tool = input.tool;
+    match registry.call_tool_with_protocol(&server, &tool, &args) {
+        Ok(output) => to_bounded_mcp_json(json!({
+            "server": server,
+            "protocol": mcp_protocol_snapshot_object(&output.protocol),
+            "tool": tool,
+            "result": output.result,
             "status": "success"
         })),
-        Err(e) => to_pretty_json(json!({
-            "server": input.server,
-            "tool": input.tool,
-            "error": e,
+        Err(error) => to_bounded_mcp_json(json!({
+            "server": server,
+            "protocol": mcp_protocol_snapshot_object(&error.protocol),
+            "tool": tool,
+            "error": error.message,
             "status": "error"
         })),
     }
@@ -8468,6 +8512,15 @@ mod tests {
             vec![],
             None,
         );
+        registry
+            .set_negotiated_protocol_version(
+                &server_name,
+                Some("2025-03-26".to_string()),
+                Some("2024-11-05".to_string()),
+                Some("stdio".to_string()),
+                true,
+            )
+            .expect("protocol state should set");
 
         let output = execute_tool(
             "ListMcpResourceTemplates",
@@ -8480,8 +8533,232 @@ mod tests {
             "file://logs/{unit}.txt"
         );
         assert_eq!(value["count"], 1);
+        assert_eq!(value["protocol"]["requested"], "2025-03-26");
+        assert_eq!(value["protocol"]["negotiated"], "2024-11-05");
+        assert_eq!(value["protocol"]["policy"], "stdio");
+        assert_eq!(value["protocol"]["configuredPreferred"], true);
 
         let _ = registry.disconnect(&server_name);
+    }
+
+    fn write_mcp_tool_protocol_fixture(root: &Path) -> PathBuf {
+        fs::create_dir_all(root).expect("fixture root");
+        let script_path = root.join("mcp-tool-protocol.py");
+        let script = [
+            "import json, os, sys",
+            "",
+            "def read_message():",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message, separators=(',', ':')).encode()",
+            "    sys.stdout.buffer.write(payload + b'\\n')",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    if 'id' not in request:",
+            "        continue",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': '2025-03-26',",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'tools-fixture', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'tools': [{",
+            "                'name': 'echo',",
+            "                'description': 'Echo tool',",
+            "                'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}",
+            "            }]}",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        if os.environ.get('MCP_TOOL_CALL_ERROR') == '1':",
+            "            send_message({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32042, 'message': 'fixture call failed'}})",
+            "            continue",
+            "        text = (request['params'].get('arguments') or {}).get('text', '')",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': text}],",
+            "                'structuredContent': {'echoed': text},",
+            "                'isError': False",
+            "            }",
+            "        })",
+            "    else:",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': method}})",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("fixture script");
+        script_path
+    }
+
+    #[test]
+    fn mcp_tool_manager_backed_success_uses_operation_protocol_snapshot() {
+        let Some(python) = super::python_runtime_candidates()
+            .iter()
+            .find_map(|candidate| super::find_command_path(candidate))
+        else {
+            eprintln!("skipping MCP protocol snapshot test because Python is unavailable");
+            return;
+        };
+
+        let root = temp_path("mcp-tool-protocol");
+        let script_path = write_mcp_tool_protocol_fixture(&root);
+        let mut env = BTreeMap::new();
+        env.insert(
+            "CLAWD_MCP_PROTOCOL_VERSION".to_string(),
+            "2024-11-05".to_string(),
+        );
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            runtime::ScopedMcpServerConfig {
+                required: false,
+                scope: runtime::ConfigSource::Project,
+                config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                    command: python,
+                    args: vec![script_path.to_string_lossy().into_owned()],
+                    env,
+                    tool_call_timeout_ms: Some(5_000),
+                }),
+            },
+        )]);
+        let registry = runtime::mcp_tool_bridge::McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            runtime::mcp_tool_bridge::McpConnectionStatus::Connected,
+            vec![runtime::mcp_tool_bridge::McpToolInfo {
+                name: "echo".to_string(),
+                description: Some("Echo tool".to_string()),
+                input_schema: Some(json!({"type": "object"})),
+            }],
+            vec![],
+            None,
+        );
+        registry
+            .set_manager(Arc::new(Mutex::new(
+                runtime::McpServerManager::from_servers(&servers),
+            )))
+            .expect("manager set");
+
+        let output = super::run_mcp_tool_with_registry(
+            super::McpToolInput {
+                server: "alpha".to_string(),
+                tool: "echo".to_string(),
+                arguments: Some(json!({"text": "hello"})),
+            },
+            &registry,
+        )
+        .expect("MCP tool should execute");
+        assert!(output.len() <= super::MCP_TOOL_OUTPUT_MAX_BYTES);
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["result"]["structuredContent"]["echoed"], "hello");
+        assert_eq!(value["protocol"]["requested"], "2024-11-05");
+        assert_eq!(value["protocol"]["negotiated"], "2025-03-26");
+        assert_eq!(value["protocol"]["policy"], "stdio");
+        assert_eq!(value["protocol"]["configuredPreferred"], true);
+
+        let state = registry.get_server("alpha").expect("server state");
+        assert!(state.requested_protocol_version.is_none());
+        assert!(state.negotiated_protocol_version.is_none());
+        assert!(state.protocol_transport_policy.is_none());
+
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn mcp_tool_manager_backed_jsonrpc_error_uses_operation_protocol_snapshot() {
+        let Some(python) = super::python_runtime_candidates()
+            .iter()
+            .find_map(|candidate| super::find_command_path(candidate))
+        else {
+            eprintln!("skipping MCP protocol error snapshot test because Python is unavailable");
+            return;
+        };
+
+        let root = temp_path("mcp-tool-protocol-error");
+        let script_path = write_mcp_tool_protocol_fixture(&root);
+        let mut env = BTreeMap::new();
+        env.insert(
+            "CLAWD_MCP_PROTOCOL_VERSION".to_string(),
+            "2024-11-05".to_string(),
+        );
+        env.insert("MCP_TOOL_CALL_ERROR".to_string(), "1".to_string());
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            runtime::ScopedMcpServerConfig {
+                required: false,
+                scope: runtime::ConfigSource::Project,
+                config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                    command: python,
+                    args: vec![script_path.to_string_lossy().into_owned()],
+                    env,
+                    tool_call_timeout_ms: Some(5_000),
+                }),
+            },
+        )]);
+        let registry = runtime::mcp_tool_bridge::McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            runtime::mcp_tool_bridge::McpConnectionStatus::Connected,
+            vec![runtime::mcp_tool_bridge::McpToolInfo {
+                name: "echo".to_string(),
+                description: Some("Echo tool".to_string()),
+                input_schema: Some(json!({"type": "object"})),
+            }],
+            vec![],
+            None,
+        );
+        registry
+            .set_manager(Arc::new(Mutex::new(
+                runtime::McpServerManager::from_servers(&servers),
+            )))
+            .expect("manager set");
+
+        let output = super::run_mcp_tool_with_registry(
+            super::McpToolInput {
+                server: "alpha".to_string(),
+                tool: "echo".to_string(),
+                arguments: Some(json!({"text": "hello"})),
+            },
+            &registry,
+        )
+        .expect("MCP tool error should serialize");
+        assert!(output.len() <= super::MCP_TOOL_OUTPUT_MAX_BYTES);
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["status"], "error");
+        assert!(
+            value["error"].as_str().is_some_and(
+                |error| error.contains("fixture call failed") && error.contains("-32042")
+            )
+        );
+        assert_eq!(value["protocol"]["requested"], "2024-11-05");
+        assert_eq!(value["protocol"]["negotiated"], "2025-03-26");
+        assert_eq!(value["protocol"]["policy"], "stdio");
+        assert_eq!(value["protocol"]["configuredPreferred"], true);
+
+        let state = registry.get_server("alpha").expect("server state");
+        assert!(state.requested_protocol_version.is_none());
+        assert!(state.negotiated_protocol_version.is_none());
+        assert!(state.protocol_transport_policy.is_none());
+
+        fs::remove_dir_all(root).expect("cleanup fixture");
     }
 
     #[test]

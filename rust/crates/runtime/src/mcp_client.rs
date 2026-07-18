@@ -8,7 +8,14 @@ use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS: u64 = 5_000;
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
+pub const LATEST_STDIO_MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const LEGACY_SSE_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const STDIO_SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    LATEST_STDIO_MCP_PROTOCOL_VERSION,
+    LEGACY_SSE_MCP_PROTOCOL_VERSION,
+];
+pub const LEGACY_SSE_SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[LEGACY_SSE_MCP_PROTOCOL_VERSION];
+pub const MCP_PROTOCOL_VERSION_MAX_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpClientTransport {
@@ -75,6 +82,60 @@ pub struct McpProtocolNegotiation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum McpProtocolTransportPolicy {
+    Stdio,
+    LegacySse,
+}
+
+impl McpProtocolTransportPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::LegacySse => "legacy_sse",
+        }
+    }
+
+    #[must_use]
+    pub const fn default_protocol_version(self) -> &'static str {
+        match self {
+            Self::Stdio => LATEST_STDIO_MCP_PROTOCOL_VERSION,
+            Self::LegacySse => LEGACY_SSE_MCP_PROTOCOL_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub const fn supported_protocol_versions(self) -> &'static [&'static str] {
+        match self {
+            Self::Stdio => STDIO_SUPPORTED_MCP_PROTOCOL_VERSIONS,
+            Self::LegacySse => LEGACY_SSE_SUPPORTED_MCP_PROTOCOL_VERSIONS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpProtocolSelection {
+    pub requested_protocol_version: String,
+    pub transport_policy: McpProtocolTransportPolicy,
+    pub configured_preferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpProtocolVersionError {
+    Missing,
+    TooLong {
+        length: usize,
+        limit: usize,
+    },
+    Malformed(String),
+    Unsupported {
+        version: String,
+        transport_policy: McpProtocolTransportPolicy,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum McpTransportHealthStatus {
     Healthy,
     Degraded,
@@ -101,20 +162,156 @@ impl McpClientBootstrap {
         }
     }
 
-    #[must_use]
     pub fn negotiate_protocol(
         &self,
         requested_protocol_version: &str,
         server_protocol_version: &str,
-    ) -> McpProtocolNegotiation {
-        McpProtocolNegotiation {
-            requested_protocol_version: requested_protocol_version.to_string(),
-            server_protocol_version: server_protocol_version.to_string(),
-            compatible: requested_protocol_version == server_protocol_version
-                && SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&server_protocol_version),
+    ) -> Result<McpProtocolNegotiation, McpProtocolVersionError> {
+        negotiate_mcp_protocol_version(
+            self.protocol_transport_policy(),
+            requested_protocol_version,
+            server_protocol_version,
+        )
+    }
+
+    pub fn select_protocol_version(&self) -> Result<McpProtocolSelection, McpProtocolVersionError> {
+        match &self.transport {
+            McpClientTransport::Stdio(transport) => select_mcp_protocol_version(
+                transport
+                    .env
+                    .get("CLAWD_MCP_PROTOCOL_VERSION")
+                    .map(String::as_str),
+                McpProtocolTransportPolicy::Stdio,
+            ),
+            McpClientTransport::Sse(transport) => select_mcp_protocol_version(
+                transport.protocol_version.as_deref(),
+                McpProtocolTransportPolicy::LegacySse,
+            ),
+            _ => Ok(McpProtocolSelection {
+                requested_protocol_version: LATEST_STDIO_MCP_PROTOCOL_VERSION.to_string(),
+                transport_policy: McpProtocolTransportPolicy::Stdio,
+                configured_preferred: false,
+            }),
         }
     }
 
+    #[must_use]
+    pub fn protocol_transport_policy(&self) -> McpProtocolTransportPolicy {
+        match &self.transport {
+            McpClientTransport::Sse(_) => McpProtocolTransportPolicy::LegacySse,
+            _ => McpProtocolTransportPolicy::Stdio,
+        }
+    }
+
+    #[must_use]
+    pub fn supported_protocol_versions(&self) -> &'static [&'static str] {
+        match &self.transport {
+            McpClientTransport::Stdio(_) => STDIO_SUPPORTED_MCP_PROTOCOL_VERSIONS,
+            McpClientTransport::Sse(_) => LEGACY_SSE_SUPPORTED_MCP_PROTOCOL_VERSIONS,
+            _ => &[],
+        }
+    }
+}
+
+pub fn select_mcp_protocol_version(
+    configured_preferred: Option<&str>,
+    transport_policy: McpProtocolTransportPolicy,
+) -> Result<McpProtocolSelection, McpProtocolVersionError> {
+    let requested_protocol_version = match configured_preferred {
+        Some(version) => {
+            validate_supported_mcp_protocol_version(transport_policy, version)?;
+            version.to_string()
+        }
+        None => transport_policy.default_protocol_version().to_string(),
+    };
+    Ok(McpProtocolSelection {
+        requested_protocol_version,
+        transport_policy,
+        configured_preferred: configured_preferred.is_some(),
+    })
+}
+
+pub fn negotiate_mcp_protocol_version(
+    transport_policy: McpProtocolTransportPolicy,
+    requested_protocol_version: &str,
+    server_protocol_version: &str,
+) -> Result<McpProtocolNegotiation, McpProtocolVersionError> {
+    validate_supported_mcp_protocol_version(transport_policy, requested_protocol_version)?;
+    validate_supported_mcp_protocol_version(transport_policy, server_protocol_version)?;
+    Ok(McpProtocolNegotiation {
+        requested_protocol_version: requested_protocol_version.to_string(),
+        server_protocol_version: server_protocol_version.to_string(),
+        compatible: true,
+    })
+}
+
+pub fn validate_supported_mcp_protocol_version(
+    transport_policy: McpProtocolTransportPolicy,
+    version: &str,
+) -> Result<(), McpProtocolVersionError> {
+    validate_mcp_protocol_version_syntax(version)?;
+    if !transport_policy
+        .supported_protocol_versions()
+        .contains(&version)
+    {
+        return Err(McpProtocolVersionError::Unsupported {
+            version: version.to_string(),
+            transport_policy,
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_mcp_protocol_version_syntax(version: &str) -> Result<(), McpProtocolVersionError> {
+    if version.is_empty() {
+        return Err(McpProtocolVersionError::Missing);
+    }
+    if version.len() > MCP_PROTOCOL_VERSION_MAX_BYTES {
+        return Err(McpProtocolVersionError::TooLong {
+            length: version.len(),
+            limit: MCP_PROTOCOL_VERSION_MAX_BYTES,
+        });
+    }
+    let bytes = version.as_bytes();
+    if bytes.len() != 10 {
+        return Err(McpProtocolVersionError::Malformed(version.to_string()));
+    }
+    let valid = bytes.iter().enumerate().all(|(index, byte)| match index {
+        4 | 7 => *byte == b'-',
+        _ => byte.is_ascii_digit(),
+    });
+    if !valid {
+        return Err(McpProtocolVersionError::Malformed(version.to_string()));
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for McpProtocolVersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "missing protocolVersion"),
+            Self::TooLong { length, limit } => write!(
+                f,
+                "protocolVersion length {length} exceeds maximum {limit} bytes"
+            ),
+            Self::Malformed(version) => write!(f, "malformed protocolVersion `{version}`"),
+            Self::Unsupported {
+                version,
+                transport_policy,
+            } => {
+                write!(
+                    f,
+                    "unsupported protocolVersion `{version}` for {} transport policy",
+                    transport_policy.as_str()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpProtocolVersionError {}
+
+impl McpClientBootstrap {
     #[must_use]
     pub fn healthcheck_model(&self) -> McpTransportHealthcheck {
         match &self.transport {
@@ -354,7 +551,7 @@ mod tests {
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
                 heartbeat_timeout_ms: Some(2_500),
-                protocol_version: Some("2025-03-26".to_string()),
+                protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
             }),
         };
@@ -364,11 +561,37 @@ mod tests {
         assert_eq!(health.status, McpTransportHealthStatus::Degraded);
         assert!(health.message.contains("SSE MCP endpoint"));
 
-        let negotiation = bootstrap.negotiate_protocol("2025-03-26", "2025-03-26");
-        assert!(negotiation.compatible);
+        let new_sse_negotiation = bootstrap.negotiate_protocol("2025-03-26", "2025-03-26");
+        assert!(new_sse_negotiation.is_err());
 
-        let legacy_negotiation = bootstrap.negotiate_protocol("2024-11-05", "2024-11-05");
+        let legacy_negotiation = bootstrap
+            .negotiate_protocol("2024-11-05", "2024-11-05")
+            .expect("legacy SSE protocol should negotiate legacy version");
         assert!(legacy_negotiation.compatible);
+    }
+
+    #[test]
+    fn sse_protocol_version_2025_03_26_is_rejected_by_legacy_policy() {
+        let config = ScopedMcpServerConfig {
+            required: false,
+            scope: ConfigSource::Project,
+            config: McpServerConfig::Sse(McpRemoteServerConfig {
+                url: "http://vendor.example/sse".to_string(),
+                headers: BTreeMap::new(),
+                headers_helper: None,
+                oauth: None,
+                tool_call_timeout_ms: Some(15_000),
+                heartbeat_timeout_ms: Some(2_500),
+                protocol_version: Some("2025-03-26".to_string()),
+                capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
+            }),
+        };
+
+        let bootstrap = McpClientBootstrap::from_scoped_config("remote sse", &config);
+        let error = bootstrap
+            .select_protocol_version()
+            .expect_err("legacy SSE must not request 2025-03-26");
+        assert!(error.to_string().contains("legacy_sse"));
     }
 
     #[test]
@@ -383,7 +606,7 @@ mod tests {
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
                 heartbeat_timeout_ms: Some(2_500),
-                protocol_version: Some("2025-03-26".to_string()),
+                protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
             }),
         };
@@ -407,7 +630,7 @@ mod tests {
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
                 heartbeat_timeout_ms: Some(2_500),
-                protocol_version: Some("2025-03-26".to_string()),
+                protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
             }),
         };

@@ -5265,16 +5265,17 @@ impl RuntimeMcpState {
                 .iter()
                 .map(|failure| runtime::McpFailedServer {
                     server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                    phase: failure.phase,
                     error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        failure.phase,
                         Some(failure.server_name.clone()),
                         failure.error.clone(),
-                        std::collections::BTreeMap::from([(
-                            "required".to_string(),
-                            failure.required.to_string(),
-                        )]),
-                        true,
+                        {
+                            let mut context = failure.context.clone();
+                            context.insert("required".to_string(), failure.required.to_string());
+                            context
+                        },
+                        failure.recoverable,
                     ),
                 })
                 .chain(discovery.unsupported_servers.iter().map(|server| {
@@ -5349,41 +5350,119 @@ impl RuntimeMcpState {
         self.manager.server_names()
     }
 
+    fn protocol_state_for_server(&self, server_name: &str) -> serde_json::Value {
+        self.manager
+            .server_catalogs()
+            .into_iter()
+            .find(|catalog| catalog.server_name == server_name)
+            .map_or_else(
+                || json!(null),
+                |catalog| {
+                    json!({
+                        "requested": catalog.requested_protocol_version,
+                        "negotiated": catalog.negotiated_protocol_version,
+                        "policy": catalog
+                            .protocol_transport_policy
+                            .map(|policy| policy.as_str()),
+                        "configuredPreferred": catalog.protocol_configured_preferred,
+                    })
+                },
+            )
+    }
+
+    fn protocol_state_for_qualified_tool(&self, qualified_tool_name: &str) -> serde_json::Value {
+        self.manager
+            .server_catalogs()
+            .into_iter()
+            .find(|catalog| {
+                catalog
+                    .tools
+                    .iter()
+                    .any(|tool| tool.qualified_name == qualified_tool_name)
+            })
+            .map_or_else(
+                || json!(null),
+                |catalog| self.protocol_state_for_server(&catalog.server_name),
+            )
+    }
+
+    fn value_with_protocol(
+        mut value: serde_json::Value,
+        protocol: serde_json::Value,
+    ) -> serde_json::Value {
+        match &mut value {
+            serde_json::Value::Object(object) => {
+                object.insert("protocol".to_string(), protocol);
+                value
+            }
+            _ => json!({
+                "protocol": protocol,
+                "result": value,
+            }),
+        }
+    }
+
     fn call_tool(
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let response = self
+        let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+        let response = match self
             .runtime
             .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return bounded_mcp_tool_json(&json!({
+                    "status": "error",
+                    "protocol": protocol,
+                    "error": error.to_string(),
+                }));
+            }
+        };
         if let Some(error) = response.error {
-            return Err(ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
-                error.message, error.code
-            )));
+            return bounded_mcp_tool_json(&json!({
+                "status": "error",
+                "protocol": protocol,
+                "error": format!(
+                    "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
+                    error.message, error.code
+                ),
+            }));
         }
 
-        let result = response.result.ok_or_else(|| {
-            ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned no result payload"
-            ))
-        })?;
-        bounded_mcp_tool_json(&serde_json::to_value(result).map_err(|error| {
+        let Some(result) = response.result else {
+            return bounded_mcp_tool_json(&json!({
+                "status": "error",
+                "protocol": protocol,
+                "error": format!("MCP tool `{qualified_tool_name}` returned no result payload"),
+            }));
+        };
+        let value = serde_json::to_value(result).map_err(|error| {
             ToolError::new(format!("failed to serialize MCP tool result: {error}"))
-        })?)
+        })?;
+        bounded_mcp_tool_json(&Self::value_with_protocol(value, protocol))
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let result = self
+        let protocol = self.protocol_state_for_server(server_name);
+        match self
             .runtime
             .block_on(self.manager.list_resources(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        bounded_mcp_tool_json(&json!({
-            "server": server_name,
-            "resources": result.resources,
-        }))
+        {
+            Ok(result) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "resources": result.resources,
+            })),
+            Err(error) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "resources": [],
+                "error": error.to_string(),
+            })),
+        }
     }
 
     fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
@@ -5397,10 +5476,13 @@ impl RuntimeMcpState {
             {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
                     "resources": result.resources,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
+                    "resources": [],
                     "error": error.to_string(),
                 })),
             },
@@ -5411,14 +5493,23 @@ impl RuntimeMcpState {
         &mut self,
         server_name: &str,
     ) -> Result<String, ToolError> {
-        let result = self
+        let protocol = self.protocol_state_for_server(server_name);
+        match self
             .runtime
             .block_on(self.manager.list_resource_templates(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        bounded_mcp_tool_json(&json!({
-            "server": server_name,
-            "resource_templates": result.resource_templates,
-        }))
+        {
+            Ok(result) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "resource_templates": result.resource_templates,
+            })),
+            Err(error) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "resource_templates": [],
+                "error": error.to_string(),
+            })),
+        }
     }
 
     fn list_resource_templates_for_all_servers(&mut self) -> Result<String, ToolError> {
@@ -5432,10 +5523,13 @@ impl RuntimeMcpState {
             {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
                     "resource_templates": result.resource_templates,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
+                    "resource_templates": [],
                     "error": error.to_string(),
                 })),
             },
@@ -5443,25 +5537,43 @@ impl RuntimeMcpState {
     }
 
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
-        let result = self
+        let protocol = self.protocol_state_for_server(server_name);
+        match self
             .runtime
             .block_on(self.manager.read_resource(server_name, uri))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        bounded_mcp_tool_json(&json!({
-            "server": server_name,
-            "contents": result.contents,
-        }))
+        {
+            Ok(result) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "contents": result.contents,
+            })),
+            Err(error) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "uri": uri,
+                "error": error.to_string(),
+            })),
+        }
     }
 
     fn list_prompts_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let result = self
+        let protocol = self.protocol_state_for_server(server_name);
+        match self
             .runtime
             .block_on(self.manager.list_prompts(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        bounded_mcp_tool_json(&json!({
-            "server": server_name,
-            "prompts": result.prompts,
-        }))
+        {
+            Ok(result) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "prompts": result.prompts,
+            })),
+            Err(error) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "prompts": [],
+                "error": error.to_string(),
+            })),
+        }
     }
 
     fn list_prompts_for_all_servers(&mut self) -> Result<String, ToolError> {
@@ -5475,10 +5587,13 @@ impl RuntimeMcpState {
             {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
                     "prompts": result.prompts,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
+                    "protocol": self.protocol_state_for_server(server_name),
+                    "prompts": [],
                     "error": error.to_string(),
                 })),
             },
@@ -5491,14 +5606,23 @@ impl RuntimeMcpState {
         name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let result = self
+        let protocol = self.protocol_state_for_server(server_name);
+        match self
             .runtime
             .block_on(self.manager.get_prompt(server_name, name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        bounded_mcp_tool_json(&json!({
-            "server": server_name,
-            "prompt": result,
-        }))
+        {
+            Ok(result) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "prompt": result,
+            })),
+            Err(error) => bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": protocol,
+                "name": name,
+                "error": error.to_string(),
+            })),
+        }
     }
 }
 
@@ -13795,7 +13919,10 @@ mod tests {
 
         // Phase 1 contract: workspace/git/sandbox fields are still populated
         // (independent of config parse). Sandbox falls back to defaults.
-        assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+        assert_eq!(
+            context.cwd.canonicalize().unwrap_or(context.cwd.clone()),
+            cwd.canonicalize().unwrap_or(cwd.clone())
+        );
         assert_eq!(
             context.loaded_config_files, 0,
             "loaded_config_files should be 0 when config parse fails"
@@ -16940,6 +17067,10 @@ UU conflicted.rs",
         let wrapped_json: serde_json::Value =
             serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
+        assert_eq!(wrapped_json["protocol"]["requested"], "2025-03-26");
+        assert_eq!(wrapped_json["protocol"]["negotiated"], "2025-03-26");
+        assert_eq!(wrapped_json["protocol"]["policy"], "stdio");
+        assert_eq!(wrapped_json["protocol"]["configuredPreferred"], false);
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
@@ -16954,7 +17085,7 @@ UU conflicted.rs",
         );
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["phase"],
-            "tool_discovery"
+            "initialize_handshake"
         );
         assert_eq!(
             search_json["mcp_degraded"]["available_tools"][0],
@@ -16967,6 +17098,9 @@ UU conflicted.rs",
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
+        assert_eq!(listed_json["protocol"]["requested"], "2025-03-26");
+        assert_eq!(listed_json["protocol"]["negotiated"], "2025-03-26");
+        assert_eq!(listed_json["protocol"]["policy"], "stdio");
 
         let templates = executor
             .execute("ListMcpResourceTemplatesTool", r#"{"server":"alpha"}"#)
@@ -16977,6 +17111,7 @@ UU conflicted.rs",
             templates_json["resource_templates"][0]["uriTemplate"],
             "file://logs/{unit}.txt"
         );
+        assert_eq!(templates_json["protocol"]["requested"], "2025-03-26");
 
         let read = executor
             .execute(
@@ -16990,6 +17125,7 @@ UU conflicted.rs",
             read_json["contents"][0]["text"],
             "contents for file://logs/api.txt"
         );
+        assert_eq!(read_json["protocol"]["negotiated"], "2025-03-26");
 
         let prompts = executor
             .execute("ListMcpPromptsTool", r#"{"server":"alpha"}"#)
@@ -16997,6 +17133,7 @@ UU conflicted.rs",
         let prompts_json: serde_json::Value =
             serde_json::from_str(&prompts).expect("prompt output should be json");
         assert_eq!(prompts_json["prompts"][0]["name"], "triage");
+        assert_eq!(prompts_json["protocol"]["policy"], "stdio");
 
         let prompt = executor
             .execute(
@@ -17007,6 +17144,7 @@ UU conflicted.rs",
         let prompt_json: serde_json::Value =
             serde_json::from_str(&prompt).expect("prompt get output should be json");
         assert_eq!(prompt_json["prompt"]["description"], "Triage api");
+        assert_eq!(prompt_json["protocol"]["configuredPreferred"], false);
 
         if let Some(mcp_state) = state.mcp_state {
             mcp_state

@@ -22,8 +22,9 @@ use tokio::time::timeout;
 use crate::config::{McpServerConfig, McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{
-    McpClientBootstrap, McpClientTransport, McpRemoteTransport, McpStdioTransport,
-    SUPPORTED_MCP_PROTOCOL_VERSIONS,
+    negotiate_mcp_protocol_version, select_mcp_protocol_version, McpClientBootstrap,
+    McpClientTransport, McpProtocolSelection, McpProtocolTransportPolicy, McpProtocolVersionError,
+    McpRemoteTransport, McpStdioTransport, LATEST_STDIO_MCP_PROTOCOL_VERSION,
 };
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
@@ -477,6 +478,14 @@ pub struct McpServerCatalog {
     pub server_name: String,
     pub server_info: Option<McpInitializeServerInfo>,
     pub capabilities: Option<McpServerCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_transport_policy: Option<McpProtocolTransportPolicy>,
+    #[serde(default)]
+    pub protocol_configured_preferred: bool,
     pub tools: Vec<ManagedMcpTool>,
     pub resources: Vec<ManagedMcpResource>,
     pub resource_templates: Vec<ManagedMcpResourceTemplate>,
@@ -493,6 +502,10 @@ impl McpServerCatalog {
             server_name: server_name.into(),
             server_info: None,
             capabilities: None,
+            requested_protocol_version: None,
+            negotiated_protocol_version: None,
+            protocol_transport_policy: None,
+            protocol_configured_preferred: false,
             tools: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
@@ -571,6 +584,14 @@ pub enum McpHeartbeatStatus {
 pub struct McpServerHeartbeat {
     pub server_name: String,
     pub status: McpHeartbeatStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_transport_policy: Option<McpProtocolTransportPolicy>,
+    #[serde(default)]
+    pub protocol_configured_preferred: bool,
     pub last_checked_at_ms: Option<u64>,
     pub last_success_at_ms: Option<u64>,
     pub last_failure_at_ms: Option<u64>,
@@ -582,6 +603,10 @@ impl McpServerHeartbeat {
         Self {
             server_name: server_name.into(),
             status,
+            requested_protocol_version: None,
+            negotiated_protocol_version: None,
+            protocol_transport_policy: None,
+            protocol_configured_preferred: false,
             last_checked_at_ms: None,
             last_success_at_ms: None,
             last_failure_at_ms: None,
@@ -595,6 +620,33 @@ impl McpServerHeartbeat {
         self.last_checked_at_ms = Some(now);
         self.last_success_at_ms = Some(now);
         self.last_failure_reason = None;
+    }
+
+    fn mark_success_with_protocol_version(
+        &mut self,
+        protocol_selection: &McpProtocolSelection,
+        negotiated_protocol_version: Option<String>,
+    ) {
+        self.mark_success();
+        self.mark_protocol_state(Some(protocol_selection), negotiated_protocol_version);
+    }
+
+    fn mark_protocol_state(
+        &mut self,
+        protocol_selection: Option<&McpProtocolSelection>,
+        negotiated_protocol_version: Option<String>,
+    ) {
+        if let Some(protocol_selection) = protocol_selection {
+            self.requested_protocol_version =
+                Some(protocol_selection.requested_protocol_version.clone());
+            self.protocol_transport_policy = Some(protocol_selection.transport_policy);
+            self.protocol_configured_preferred = protocol_selection.configured_preferred;
+        } else {
+            self.requested_protocol_version = None;
+            self.protocol_transport_policy = None;
+            self.protocol_configured_preferred = false;
+        }
+        self.negotiated_protocol_version = negotiated_protocol_version;
     }
 
     fn mark_failure(&mut self, reason: impl Into<String>) {
@@ -871,6 +923,33 @@ impl McpServerManagerError {
             ]),
         }
     }
+}
+
+fn protocol_version_error(
+    server_name: &str,
+    method: &'static str,
+    error: McpProtocolVersionError,
+) -> McpServerManagerError {
+    McpServerManagerError::InvalidResponse {
+        server_name: server_name.to_string(),
+        method,
+        details: error.to_string(),
+    }
+}
+
+fn negotiate_initialize_protocol_version(
+    server_name: &str,
+    transport_policy: McpProtocolTransportPolicy,
+    requested_protocol_version: &str,
+    server_protocol_version: &str,
+) -> Result<String, McpServerManagerError> {
+    negotiate_mcp_protocol_version(
+        transport_policy,
+        requested_protocol_version,
+        server_protocol_version,
+    )
+    .map(|negotiation| negotiation.server_protocol_version)
+    .map_err(|error| protocol_version_error(server_name, "initialize", error))
 }
 
 fn lifecycle_phase_for_method(method: &str) -> McpLifecyclePhase {
@@ -1268,6 +1347,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(&route.server_name, &response);
+            self.clear_catalog_if_initialize_failed(&route.server_name, &response)?;
             if let Ok(response) = &response {
                 Self::validate_json_size(
                     &route.server_name,
@@ -1457,6 +1537,13 @@ impl McpServerManager {
             }
             server.process = None;
             server.initialized = false;
+            server.catalog.requested_protocol_version = None;
+            server.catalog.negotiated_protocol_version = None;
+            server.catalog.protocol_transport_policy = None;
+            server.catalog.protocol_configured_preferred = false;
+            if let Some(heartbeat) = self.heartbeat.get_mut(&server_name) {
+                heartbeat.mark_protocol_state(None, None);
+            }
         }
         Ok(())
     }
@@ -1554,6 +1641,34 @@ impl McpServerManager {
         }
     }
 
+    fn clear_catalog_after_initialize_failure(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        self.clear_routes_for_server(server_name);
+        let server = self.server_mut(server_name)?;
+        server.initialized = false;
+        server.catalog = McpServerCatalog::new(server_name);
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat.mark_protocol_state(None, None);
+        }
+        Ok(())
+    }
+
+    fn clear_catalog_if_initialize_failed<T>(
+        &mut self,
+        server_name: &str,
+        result: &Result<T, McpServerManagerError>,
+    ) -> Result<(), McpServerManagerError> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.lifecycle_phase() == McpLifecyclePhase::InitializeHandshake)
+        {
+            self.clear_catalog_after_initialize_failure(server_name)?;
+        }
+        Ok(())
+    }
+
     fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
         let server = self.server_mut(server_name)?;
         match server.process.as_mut() {
@@ -1622,12 +1737,36 @@ impl McpServerManager {
         server_name: &str,
         result: McpInitializeResult,
     ) -> Result<(), McpServerManagerError> {
+        let protocol_selection = self
+            .servers
+            .get(server_name)
+            .ok_or_else(|| McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            })?
+            .bootstrap
+            .select_protocol_version()
+            .map_err(|error| protocol_version_error(server_name, "initialize", error))?;
+        let negotiated_protocol_version = negotiate_initialize_protocol_version(
+            server_name,
+            protocol_selection.transport_policy,
+            &protocol_selection.requested_protocol_version,
+            &result.protocol_version,
+        )?;
         let server_info = result.server_info;
         let capabilities = McpServerCapabilities::from_raw(result.capabilities);
         let server = self.server_mut(server_name)?;
         server.catalog.server_info = Some(server_info);
         server.catalog.capabilities = Some(capabilities);
+        server.catalog.requested_protocol_version =
+            Some(protocol_selection.requested_protocol_version.clone());
+        server.catalog.negotiated_protocol_version = Some(negotiated_protocol_version.clone());
+        server.catalog.protocol_transport_policy = Some(protocol_selection.transport_policy);
+        server.catalog.protocol_configured_preferred = protocol_selection.configured_preferred;
         server.initialized = true;
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat
+                .mark_protocol_state(Some(&protocol_selection), Some(negotiated_protocol_version));
+        }
         Ok(())
     }
 
@@ -1753,6 +1892,21 @@ impl McpServerManager {
         server_name: &str,
         discovery: McpSseCatalogDiscovery,
     ) -> Result<McpCatalogDiscoveryOutcome, McpServerManagerError> {
+        let protocol_selection = self
+            .servers
+            .get(server_name)
+            .ok_or_else(|| McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            })?
+            .bootstrap
+            .select_protocol_version()
+            .map_err(|error| protocol_version_error(server_name, "initialize", error))?;
+        let negotiated_protocol_version = negotiate_initialize_protocol_version(
+            server_name,
+            protocol_selection.transport_policy,
+            &protocol_selection.requested_protocol_version,
+            &discovery.initialize_result.protocol_version,
+        )?;
         let capabilities =
             McpServerCapabilities::from_raw(discovery.initialize_result.capabilities);
         let tools = discovery.tools;
@@ -1788,6 +1942,11 @@ impl McpServerManager {
             let server = self.server_mut(server_name)?;
             server.catalog.server_info = Some(discovery.initialize_result.server_info);
             server.catalog.capabilities = Some(capabilities);
+            server.catalog.requested_protocol_version =
+                Some(protocol_selection.requested_protocol_version.clone());
+            server.catalog.negotiated_protocol_version = Some(negotiated_protocol_version.clone());
+            server.catalog.protocol_transport_policy = Some(protocol_selection.transport_policy);
+            server.catalog.protocol_configured_preferred = protocol_selection.configured_preferred;
             server.catalog.tools = tools;
             server.catalog.resources = resources;
             server.catalog.resource_templates = resource_templates;
@@ -1799,6 +1958,12 @@ impl McpServerManager {
             server.initialized = true;
             server.catalog.clone()
         };
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat.mark_success_with_protocol_version(
+                &protocol_selection,
+                Some(negotiated_protocol_version),
+            );
+        }
         Ok(McpCatalogDiscoveryOutcome {
             catalog,
             degraded_capabilities,
@@ -2292,6 +2457,7 @@ impl McpServerManager {
             details: format!("SSE worker task failed: {error}"),
         })?;
         self.record_heartbeat_result(server_name, &discovery);
+        self.clear_catalog_if_initialize_failed(server_name, &discovery)?;
         let discovery = discovery?;
         self.update_initialize_catalog(server_name, discovery.initialize_result)?;
         self.update_tool_catalog(server_name, discovery.tools.clone())?;
@@ -2317,6 +2483,7 @@ impl McpServerManager {
             details: format!("SSE worker task failed: {error}"),
         })?;
         self.record_heartbeat_result(server_name, &discovery);
+        self.clear_catalog_if_initialize_failed(server_name, &discovery)?;
         let discovery = discovery?;
         self.update_sse_catalog_from_discovery(server_name, discovery)
     }
@@ -2338,6 +2505,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(server_name, &response);
+            self.clear_catalog_if_initialize_failed(server_name, &response)?;
             let response = response?;
             self.update_initialize_catalog(server_name, response.initialize_result)?;
             self.update_resource_catalog(server_name, response.result.resources.clone())?;
@@ -2473,6 +2641,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(server_name, &response);
+            self.clear_catalog_if_initialize_failed(server_name, &response)?;
             let response = response?;
             self.update_initialize_catalog(server_name, response.initialize_result)?;
             self.update_resource_template_catalog(
@@ -2621,6 +2790,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(server_name, &response);
+            self.clear_catalog_if_initialize_failed(server_name, &response)?;
             let response = response?;
             self.update_initialize_catalog(server_name, response.initialize_result)?;
             return Ok(response.result);
@@ -2716,6 +2886,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(server_name, &response);
+            self.clear_catalog_if_initialize_failed(server_name, &response)?;
             let response = response?;
             self.update_initialize_catalog(server_name, response.initialize_result)?;
             self.update_prompt_catalog(server_name, response.result.prompts.clone())?;
@@ -2856,6 +3027,7 @@ impl McpServerManager {
                 details: format!("SSE worker task failed: {error}"),
             })?;
             self.record_heartbeat_result(server_name, &response);
+            self.clear_catalog_if_initialize_failed(server_name, &response)?;
             let response = response?;
             self.update_initialize_catalog(server_name, response.initialize_result)?;
             return Ok(response.result);
@@ -2939,8 +3111,16 @@ impl McpServerManager {
         let mut process = {
             let server = self.server_mut(server_name)?;
             server.initialized = false;
+            server.catalog.requested_protocol_version = None;
+            server.catalog.negotiated_protocol_version = None;
+            server.catalog.protocol_transport_policy = None;
+            server.catalog.protocol_configured_preferred = false;
             server.process.take()
         };
+
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat.mark_protocol_state(None, None);
+        }
 
         if let Some(process) = process.as_mut() {
             let _ = process.shutdown().await;
@@ -3072,6 +3252,15 @@ impl McpServerManager {
                 })?;
 
             if needs_spawn {
+                let bootstrap = &self
+                    .servers
+                    .get(server_name)
+                    .ok_or_else(|| McpServerManagerError::UnknownServer {
+                        server_name: server_name.to_string(),
+                    })?
+                    .bootstrap;
+                initialize_params_for_bootstrap(bootstrap)
+                    .map_err(|error| protocol_version_error(server_name, "initialize", error))?;
                 let server = self.server_mut(server_name)?;
                 server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
                 server.initialized = false;
@@ -3090,15 +3279,21 @@ impl McpServerManager {
             }
 
             let request_id = self.take_request_id();
-            let initialize_params = initialize_params_for_bootstrap(
-                &self
-                    .servers
-                    .get(server_name)
-                    .ok_or_else(|| McpServerManagerError::UnknownServer {
-                        server_name: server_name.to_string(),
-                    })?
-                    .bootstrap,
-            );
+            let bootstrap = &self
+                .servers
+                .get(server_name)
+                .ok_or_else(|| McpServerManagerError::UnknownServer {
+                    server_name: server_name.to_string(),
+                })?
+                .bootstrap;
+            let initialize_params = match initialize_params_for_bootstrap(bootstrap) {
+                Ok(params) => params,
+                Err(error) => {
+                    let error = protocol_version_error(server_name, "initialize", error);
+                    self.reset_server(server_name).await?;
+                    return Err(error);
+                }
+            };
             let requested_protocol_version = initialize_params.protocol_version.clone();
             let response = {
                 let server = self.server_mut(server_name)?;
@@ -3134,11 +3329,13 @@ impl McpServerManager {
             };
 
             if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
+                let error = McpServerManagerError::JsonRpc {
                     server_name: server_name.to_string(),
                     method: "initialize",
                     error,
-                });
+                };
+                self.reset_server(server_name).await?;
+                return Err(error);
             }
 
             let Some(result) = response.result else {
@@ -3151,29 +3348,19 @@ impl McpServerManager {
                 return Err(error);
             };
 
-            let negotiation = self
-                .servers
-                .get(server_name)
-                .ok_or_else(|| McpServerManagerError::UnknownServer {
-                    server_name: server_name.to_string(),
-                })?
-                .bootstrap
-                .negotiate_protocol(&requested_protocol_version, &result.protocol_version);
-            if !negotiation.compatible {
-                let error = McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "initialize",
-                    details: format!(
-                        "unsupported protocol version `{}` for requested `{}`",
-                        negotiation.server_protocol_version, negotiation.requested_protocol_version
-                    ),
-                };
-                self.reset_server(server_name).await?;
-                return Err(error);
-            }
-
-            let server_info = result.server_info.clone();
-            let capabilities = McpServerCapabilities::from_raw(result.capabilities.clone());
+            let negotiated_protocol_version = negotiate_initialize_protocol_version(
+                server_name,
+                McpProtocolTransportPolicy::Stdio,
+                &requested_protocol_version,
+                &result.protocol_version,
+            );
+            let _negotiated_protocol_version = match negotiated_protocol_version {
+                Ok(version) => version,
+                Err(error) => {
+                    self.reset_server(server_name).await?;
+                    return Err(error);
+                }
+            };
 
             {
                 let server = self.server_mut(server_name)?;
@@ -3197,12 +3384,7 @@ impl McpServerManager {
                 .await?;
             }
 
-            {
-                let server = self.server_mut(server_name)?;
-                server.catalog.server_info = Some(server_info);
-                server.catalog.capabilities = Some(capabilities);
-                server.initialized = true;
-            }
+            self.update_initialize_catalog(server_name, result)?;
             return Ok(());
         }
     }
@@ -4073,9 +4255,20 @@ fn connect_initialized_sse_session(
     request_id: u64,
     timeout_ms: u64,
 ) -> Result<(McpSseSession, McpInitializeResult, McpServerCapabilities), McpServerManagerError> {
+    let protocol_selection = select_mcp_protocol_version(
+        transport.protocol_version.as_deref(),
+        McpProtocolTransportPolicy::LegacySse,
+    )
+    .map_err(|error| protocol_version_error(server_name, "initialize", error))?;
     let mut session = McpSseSession::connect(server_name, transport.clone(), timeout_ms)?;
-    let initialize_result =
-        initialize_sse_session(server_name, transport, &mut session, request_id, timeout_ms)?;
+    let initialize_result = initialize_sse_session(
+        server_name,
+        transport,
+        &mut session,
+        request_id,
+        timeout_ms,
+        &protocol_selection,
+    )?;
     session.notify(
         "notifications/initialized",
         Some(JsonValue::Object(serde_json::Map::new())),
@@ -4934,11 +5127,9 @@ fn initialize_sse_session(
     session: &mut McpSseSession,
     request_id: u64,
     timeout_ms: u64,
+    protocol_selection: &McpProtocolSelection,
 ) -> Result<McpInitializeResult, McpServerManagerError> {
-    let requested_protocol_version = transport
-        .protocol_version
-        .clone()
-        .unwrap_or_else(|| "2024-11-05".to_string());
+    let requested_protocol_version = protocol_selection.requested_protocol_version.clone();
     let initialize = session.request::<_, McpInitializeResult>(
         JsonRpcId::Number(request_id),
         "initialize",
@@ -4966,18 +5157,12 @@ fn initialize_sse_session(
             details: "missing result payload".to_string(),
         });
     };
-    if requested_protocol_version != result.protocol_version
-        || !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&result.protocol_version.as_str())
-    {
-        return Err(McpServerManagerError::InvalidResponse {
-            server_name: server_name.to_string(),
-            method: "initialize",
-            details: format!(
-                "unsupported protocol version `{}` for requested `{}`",
-                result.protocol_version, requested_protocol_version
-            ),
-        });
-    }
+    let _negotiated_protocol_version = negotiate_initialize_protocol_version(
+        server_name,
+        protocol_selection.transport_policy,
+        &requested_protocol_version,
+        &result.protocol_version,
+    )?;
     Ok(result)
 }
 
@@ -5379,7 +5564,7 @@ where
 
 fn default_initialize_params() -> McpInitializeParams {
     McpInitializeParams {
-        protocol_version: "2025-03-26".to_string(),
+        protocol_version: LATEST_STDIO_MCP_PROTOCOL_VERSION.to_string(),
         capabilities: JsonValue::Object(serde_json::Map::new()),
         client_info: McpInitializeClientInfo {
             name: "runtime".to_string(),
@@ -5388,13 +5573,15 @@ fn default_initialize_params() -> McpInitializeParams {
     }
 }
 
-fn initialize_params_for_bootstrap(bootstrap: &McpClientBootstrap) -> McpInitializeParams {
+fn initialize_params_for_bootstrap(
+    bootstrap: &McpClientBootstrap,
+) -> Result<McpInitializeParams, McpProtocolVersionError> {
     let mut params = default_initialize_params();
+    params.protocol_version = bootstrap
+        .select_protocol_version()?
+        .requested_protocol_version;
     match &bootstrap.transport {
         McpClientTransport::Stdio(transport) => {
-            if let Some(protocol_version) = transport.env.get("CLAWD_MCP_PROTOCOL_VERSION") {
-                params.protocol_version = protocol_version.clone();
-            }
             if let Some(capabilities) = transport.env.get("CLAWD_MCP_CAPABILITIES") {
                 if let Ok(value) = serde_json::from_str::<JsonValue>(capabilities) {
                     params.capabilities = value;
@@ -5402,14 +5589,11 @@ fn initialize_params_for_bootstrap(bootstrap: &McpClientBootstrap) -> McpInitial
             }
         }
         McpClientTransport::Sse(transport) => {
-            if let Some(protocol_version) = &transport.protocol_version {
-                params.protocol_version = protocol_version.clone();
-            }
             params.capabilities = transport.capabilities.clone();
         }
         _ => {}
     }
-    params
+    Ok(params)
 }
 
 #[cfg(test)]
@@ -5436,7 +5620,9 @@ mod tests {
         McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
     use crate::mcp::mcp_tool_name;
-    use crate::mcp_client::{McpClientAuth, McpClientBootstrap, McpRemoteTransport};
+    use crate::mcp_client::{
+        McpClientAuth, McpClientBootstrap, McpProtocolTransportPolicy, McpRemoteTransport,
+    };
 
     use super::{
         build_sse_client, build_sse_get_client, build_sse_get_runtime, build_sse_headers,
@@ -5754,6 +5940,10 @@ mod tests {
             "EXIT_AFTER_TOOLS_LIST = os.environ.get('MCP_EXIT_AFTER_TOOLS_LIST') == '1'",
             "FAIL_ONCE_MODE = os.environ.get('MCP_FAIL_ONCE_MODE')",
             "FAIL_ONCE_MARKER = os.environ.get('MCP_FAIL_ONCE_MARKER')",
+            "INITIALIZE_JSONRPC_ERROR = os.environ.get('MCP_INITIALIZE_JSONRPC_ERROR') == '1'",
+            "INITIALIZE_JSONRPC_ERROR_ONCE = os.environ.get('MCP_INITIALIZE_JSONRPC_ERROR_ONCE') == '1'",
+            "OMIT_PROTOCOL_VERSION = os.environ.get('MCP_OMIT_PROTOCOL_VERSION') == '1'",
+            "PROTOCOL_VERSION_SET = 'MCP_PROTOCOL_VERSION' in os.environ",
             "PROTOCOL_VERSION = os.environ.get('MCP_PROTOCOL_VERSION')",
             "initialize_count = 0",
             "",
@@ -5795,16 +5985,21 @@ mod tests {
             "            log('initialize-hang')",
             "            while True:",
             "                time.sleep(1)",
+            "        if INITIALIZE_JSONRPC_ERROR or (INITIALIZE_JSONRPC_ERROR_ONCE and should_fail_once()):",
+            "            send_message({",
+            "                'jsonrpc': '2.0',",
+            "                'id': request['id'],",
+            "                'error': {'code': -32002, 'message': 'initialize rejected'}",
+            "            })",
+            "            continue",
             "        initialize_count += 1",
-            "        send_message({",
-            "            'jsonrpc': '2.0',",
-            "            'id': request['id'],",
-            "            'result': {",
-            "                'protocolVersion': PROTOCOL_VERSION or request['params']['protocolVersion'],",
-            "                'capabilities': {'tools': {}},",
-            "                'serverInfo': {'name': LABEL, 'version': '1.0.0'}",
-            "            }",
-            "        })",
+            "        result = {",
+            "            'capabilities': {'tools': {}},",
+            "            'serverInfo': {'name': LABEL, 'version': '1.0.0'}",
+            "        }",
+            "        if not OMIT_PROTOCOL_VERSION:",
+            "            result['protocolVersion'] = PROTOCOL_VERSION if PROTOCOL_VERSION_SET else request['params']['protocolVersion']",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': result})",
             "    elif method == 'tools/list':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -6111,6 +6306,26 @@ mod tests {
         let frame = format!(
             "event: message\ndata: {}\r\n\r\n",
             json!({"jsonrpc": "2.0", "id": id, "result": result})
+        );
+        write_sse_event(sse, &frame);
+    }
+
+    fn write_sse_jsonrpc_error(
+        sse: &mut TcpStream,
+        id: serde_json::Value,
+        code: i64,
+        message: &str,
+    ) {
+        let frame = format!(
+            "event: message\ndata: {}\r\n\r\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": code,
+                    "message": message
+                }
+            })
         );
         write_sse_event(sse, &frame);
     }
@@ -6831,7 +7046,277 @@ mod tests {
 
             assert!(error
                 .to_string()
-                .contains("unsupported protocol version `unsupported-version`"));
+                .contains("malformed protocolVersion `unsupported-version`"));
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_rejects_missing_malformed_oversize_and_known_unsupported_protocol_versions() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let variants = [
+                (
+                    "missing",
+                    BTreeMap::from([("MCP_OMIT_PROTOCOL_VERSION".to_string(), "1".to_string())]),
+                    "protocolVersion",
+                ),
+                (
+                    "empty",
+                    BTreeMap::from([("MCP_PROTOCOL_VERSION".to_string(), String::new())]),
+                    "missing protocolVersion",
+                ),
+                (
+                    "oversize",
+                    BTreeMap::from([("MCP_PROTOCOL_VERSION".to_string(), "1".repeat(33))]),
+                    "exceeds maximum",
+                ),
+                (
+                    "malformed",
+                    BTreeMap::from([(
+                        "MCP_PROTOCOL_VERSION".to_string(),
+                        "2025/06/18".to_string(),
+                    )]),
+                    "malformed protocolVersion",
+                ),
+                (
+                    "unsupported-2025-06-18",
+                    BTreeMap::from([(
+                        "MCP_PROTOCOL_VERSION".to_string(),
+                        "2025-06-18".to_string(),
+                    )]),
+                    "unsupported protocolVersion `2025-06-18`",
+                ),
+                (
+                    "unsupported-2025-11-25",
+                    BTreeMap::from([(
+                        "MCP_PROTOCOL_VERSION".to_string(),
+                        "2025-11-25".to_string(),
+                    )]),
+                    "unsupported protocolVersion `2025-11-25`",
+                ),
+            ];
+
+            for (label, env, expected_error) in variants {
+                let log_path = root.join(format!("{label}.log"));
+                let servers = BTreeMap::from([(
+                    "alpha".to_string(),
+                    manager_server_config_with_env(&script_path, "alpha", &log_path, env),
+                )]);
+                let mut manager = McpServerManager::from_servers(&servers);
+
+                let error = manager
+                    .discover_tools()
+                    .await
+                    .expect_err("invalid protocol version must fail closed");
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "{label}: {error}"
+                );
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                assert_eq!(
+                    log.lines().collect::<Vec<_>>(),
+                    vec!["initialize"],
+                    "{label}"
+                );
+                let catalog = manager.server_catalogs().pop().expect("catalog");
+                assert!(catalog.requested_protocol_version.is_none(), "{label}");
+                assert!(catalog.negotiated_protocol_version.is_none(), "{label}");
+                assert!(catalog.protocol_transport_policy.is_none(), "{label}");
+                let server = manager.servers.get("alpha").expect("managed server");
+                assert!(server.process.is_none(), "{label}");
+                manager.shutdown().await.expect("shutdown");
+            }
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_accepts_stdio_server_downgrade_and_records_protocol_state() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("protocol-downgrade.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([(
+                        "MCP_PROTOCOL_VERSION".to_string(),
+                        "2024-11-05".to_string(),
+                    )]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("stdio server downgrade should be accepted");
+
+            assert_eq!(tools.len(), 1);
+            let catalog = manager
+                .server_catalogs()
+                .into_iter()
+                .find(|catalog| catalog.server_name == "alpha")
+                .expect("catalog");
+            assert_eq!(
+                catalog.requested_protocol_version.as_deref(),
+                Some("2025-03-26")
+            );
+            assert_eq!(
+                catalog.negotiated_protocol_version.as_deref(),
+                Some("2024-11-05")
+            );
+            assert_eq!(
+                catalog.protocol_transport_policy,
+                Some(McpProtocolTransportPolicy::Stdio)
+            );
+            assert!(!catalog.protocol_configured_preferred);
+
+            let heartbeat = manager
+                .heartbeat_report()
+                .into_iter()
+                .find(|entry| entry.server_name == "alpha")
+                .expect("heartbeat");
+            assert_eq!(
+                heartbeat.requested_protocol_version.as_deref(),
+                Some("2025-03-26")
+            );
+            assert_eq!(
+                heartbeat.negotiated_protocol_version.as_deref(),
+                Some("2024-11-05")
+            );
+            assert_eq!(
+                heartbeat.protocol_transport_policy,
+                Some(McpProtocolTransportPolicy::Stdio)
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn stdio_configured_protocol_version_is_preferred_not_pinned() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("protocol-preferred.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([
+                        (
+                            "CLAWD_MCP_PROTOCOL_VERSION".to_string(),
+                            "2024-11-05".to_string(),
+                        ),
+                        ("MCP_PROTOCOL_VERSION".to_string(), "2025-03-26".to_string()),
+                    ]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("server may choose any locally supported stdio version");
+            assert_eq!(tools.len(), 1);
+            let catalog = manager.server_catalogs().pop().expect("catalog");
+            assert_eq!(
+                catalog.requested_protocol_version.as_deref(),
+                Some("2024-11-05")
+            );
+            assert_eq!(
+                catalog.negotiated_protocol_version.as_deref(),
+                Some("2025-03-26")
+            );
+            assert_eq!(
+                catalog.protocol_transport_policy,
+                Some(McpProtocolTransportPolicy::Stdio)
+            );
+            assert!(catalog.protocol_configured_preferred);
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_resets_stdio_child_after_initialize_jsonrpc_error() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("initialize-error.log");
+            let marker_path = root.join("initialize-error.marker");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([
+                        (
+                            "MCP_INITIALIZE_JSONRPC_ERROR_ONCE".to_string(),
+                            "1".to_string(),
+                        ),
+                        (
+                            "MCP_FAIL_ONCE_MODE".to_string(),
+                            "initialize_jsonrpc_error".to_string(),
+                        ),
+                        (
+                            "MCP_FAIL_ONCE_MARKER".to_string(),
+                            marker_path.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let error = manager
+                .discover_tools()
+                .await
+                .expect_err("first initialize should return JSON-RPC error");
+            assert!(error.to_string().contains("initialize rejected"));
+            assert!(manager
+                .server_catalogs()
+                .into_iter()
+                .all(|catalog| catalog.negotiated_protocol_version.is_none()));
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("second discovery should spawn and initialize again");
+            assert_eq!(tools.len(), 1);
+
+            let log = fs::read_to_string(&log_path).expect("log");
+            assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 2);
+            assert!(log.contains("notifications/initialized"));
+
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
         });
@@ -7783,7 +8268,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": initialize_request["id"].clone(),
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2024-11-05",
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "fixture", "version": "1.0.0" }
                     }
@@ -7842,7 +8327,7 @@ mod tests {
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
                     heartbeat_timeout_ms: Some(1_000),
-                    protocol_version: Some("2025-03-26".to_string()),
+                    protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
                 }),
             },
@@ -7861,6 +8346,207 @@ mod tests {
         assert_eq!(heartbeat[0].server_name, "remote");
         assert_eq!(heartbeat[0].status, McpHeartbeatStatus::Healthy);
         assert!(heartbeat[0].last_success_at_ms.is_some());
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn legacy_sse_configured_newer_protocol_fails_before_network_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("fixture nonblocking");
+        let addr = listener.local_addr().expect("fixture addr");
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2025-03-26".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let report = runtime.block_on(manager.discover_catalogs_best_effort());
+
+        assert!(report.catalogs.is_empty());
+        assert_eq!(report.failed_servers.len(), 1);
+        assert!(report.failed_servers[0].error.contains("legacy_sse"));
+        assert!(report.failed_servers[0].error.contains("2025-03-26"));
+        let heartbeat = report
+            .heartbeat
+            .iter()
+            .find(|entry| entry.server_name == "remote")
+            .expect("heartbeat");
+        assert_eq!(heartbeat.status, McpHeartbeatStatus::Failed);
+        assert!(heartbeat
+            .last_failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("legacy_sse")));
+        match listener.accept() {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => panic!("legacy SSE protocol validation unexpectedly opened {peer}"),
+            Err(error) => panic!("fixture accept failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn legacy_sse_initialize_error_after_success_clears_stale_catalog_and_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let fixture_methods = Arc::clone(&methods);
+        let handle = thread::spawn(move || {
+            let capabilities = json!({ "tools": {} });
+
+            let mut first_sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(
+                &listener,
+                &fixture_methods,
+                &mut first_sse,
+                capabilities.clone(),
+            );
+            let (mut first_tools, first_tools_request) =
+                accept_sse_post(&listener, &fixture_methods, &mut first_sse);
+            write_sse_post_ack(&mut first_tools);
+            write_sse_jsonrpc_result(
+                &mut first_sse,
+                first_tools_request["id"].clone(),
+                json!({
+                    "tools": [{
+                        "name": "inspect",
+                        "description": "Inspect fixture",
+                        "inputSchema": { "type": "object" }
+                    }]
+                }),
+            );
+
+            let mut error_sse = accept_sse_stream(&listener);
+            let (mut initialize, initialize_request) =
+                accept_sse_post(&listener, &fixture_methods, &mut error_sse);
+            write_sse_post_ack(&mut initialize);
+            write_sse_jsonrpc_error(
+                &mut error_sse,
+                initialize_request["id"].clone(),
+                -32002,
+                "initialize rejected",
+            );
+
+            let mut third_sse = accept_sse_stream(&listener);
+            complete_sse_initialize_and_ping(
+                &listener,
+                &fixture_methods,
+                &mut third_sse,
+                capabilities,
+            );
+            let (mut third_tools, third_tools_request) =
+                accept_sse_post(&listener, &fixture_methods, &mut third_sse);
+            write_sse_post_ack(&mut third_tools);
+            write_sse_jsonrpc_result(
+                &mut third_sse,
+                third_tools_request["id"].clone(),
+                json!({
+                    "tools": [{
+                        "name": "inspect",
+                        "description": "Inspect fixture",
+                        "inputSchema": { "type": "object" }
+                    }]
+                }),
+            );
+        });
+
+        let servers = BTreeMap::from([(
+            "remote".to_string(),
+            ScopedMcpServerConfig {
+                required: true,
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: format!("http://{addr}/sse"),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                    tool_call_timeout_ms: Some(1_000),
+                    heartbeat_timeout_ms: Some(1_000),
+                    protocol_version: Some("2024-11-05".to_string()),
+                    capabilities: crate::JsonValue::Object(BTreeMap::new()),
+                }),
+            },
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let first_tools = runtime
+            .block_on(manager.discover_tools())
+            .expect("first discovery should work");
+        assert_eq!(first_tools.len(), 1);
+        let first_catalog = manager.server_catalogs().pop().expect("catalog");
+        assert_eq!(
+            first_catalog.negotiated_protocol_version.as_deref(),
+            Some("2024-11-05")
+        );
+
+        let report = runtime.block_on(manager.discover_catalogs_best_effort());
+        assert!(report.catalogs.is_empty());
+        assert_eq!(report.failed_servers.len(), 1);
+        assert_eq!(
+            report.failed_servers[0].phase,
+            McpLifecyclePhase::InitializeHandshake
+        );
+        assert!(report.failed_servers[0]
+            .error
+            .contains("initialize rejected"));
+        let failed_catalog = manager.server_catalogs().pop().expect("catalog");
+        assert!(failed_catalog.tools.is_empty());
+        assert!(failed_catalog.requested_protocol_version.is_none());
+        assert!(failed_catalog.negotiated_protocol_version.is_none());
+        assert!(failed_catalog.protocol_transport_policy.is_none());
+        let heartbeat = manager
+            .heartbeat_report()
+            .into_iter()
+            .find(|entry| entry.server_name == "remote")
+            .expect("heartbeat");
+        assert_eq!(heartbeat.status, McpHeartbeatStatus::Failed);
+        assert!(heartbeat.requested_protocol_version.is_none());
+        assert!(heartbeat.negotiated_protocol_version.is_none());
+
+        let third_tools = runtime
+            .block_on(manager.discover_tools())
+            .expect("third discovery should reconnect and renegotiate");
+        assert_eq!(third_tools.len(), 1);
+        let third_catalog = manager.server_catalogs().pop().expect("catalog");
+        assert_eq!(
+            third_catalog.negotiated_protocol_version.as_deref(),
+            Some("2024-11-05")
+        );
+
+        let methods = methods.lock().expect("methods").clone();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize".to_string(),
+                "notifications/initialized".to_string(),
+                "ping".to_string(),
+                "tools/list".to_string(),
+                "initialize".to_string(),
+                "initialize".to_string(),
+                "notifications/initialized".to_string(),
+                "ping".to_string(),
+                "tools/list".to_string()
+            ]
+        );
         handle.join().expect("fixture thread");
     }
 
@@ -8625,7 +9311,7 @@ mod tests {
                         "jsonrpc": "2.0",
                         "id": initialize_request["id"].clone(),
                         "result": {
-                            "protocolVersion": "2025-03-26",
+                            "protocolVersion": "2024-11-05",
                             "capabilities": capabilities,
                             "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
                         }
@@ -8649,7 +9335,7 @@ mod tests {
                         oauth: None,
                         tool_call_timeout_ms: Some(1_000),
                         heartbeat_timeout_ms: Some(1_000),
-                        protocol_version: Some("2025-03-26".to_string()),
+                        protocol_version: Some("2024-11-05".to_string()),
                         capabilities: crate::JsonValue::Object(BTreeMap::new()),
                     }),
                 },
@@ -8704,7 +9390,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": initialize_request["id"].clone(),
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2024-11-05",
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
                     }
@@ -8767,7 +9453,7 @@ mod tests {
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
                     heartbeat_timeout_ms: Some(1_000),
-                    protocol_version: Some("2025-03-26".to_string()),
+                    protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
                 }),
             },
@@ -8817,7 +9503,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": initialize_request["id"].clone(),
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2024-11-05",
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "legacy-sse", "version": "1.0.0" }
                     }
@@ -8870,7 +9556,7 @@ mod tests {
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
                     heartbeat_timeout_ms: Some(1_000),
-                    protocol_version: Some("2025-03-26".to_string()),
+                    protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
                 }),
             },
@@ -8918,7 +9604,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": initialize_request["id"].clone(),
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2024-11-05",
                         "capabilities": {
                             "tools": {},
                             "resources": {},
@@ -8974,7 +9660,7 @@ mod tests {
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
                     heartbeat_timeout_ms: Some(1_000),
-                    protocol_version: Some("2025-03-26".to_string()),
+                    protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
                 }),
             },

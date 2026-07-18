@@ -106,8 +106,89 @@ pub struct McpServerState {
     pub resource_templates: Vec<McpResourceTemplateInfo>,
     pub prompts: Vec<McpPromptInfo>,
     pub server_info: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_transport_policy: Option<String>,
+    #[serde(default)]
+    pub protocol_configured_preferred: bool,
     pub error_message: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpProtocolStateSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(default, rename = "configuredPreferred")]
+    pub configured_preferred: bool,
+}
+
+impl From<&McpServerState> for McpProtocolStateSnapshot {
+    fn from(state: &McpServerState) -> Self {
+        Self {
+            requested: state.requested_protocol_version.clone(),
+            negotiated: state.negotiated_protocol_version.clone(),
+            policy: state.protocol_transport_policy.clone(),
+            configured_preferred: state.protocol_configured_preferred,
+        }
+    }
+}
+
+impl McpProtocolStateSnapshot {
+    fn from_manager_catalog(manager: &McpServerManager, server_name: &str) -> Self {
+        manager
+            .server_catalogs()
+            .into_iter()
+            .find(|catalog| catalog.server_name == server_name)
+            .map_or_else(Self::default, |catalog| Self {
+                requested: catalog.requested_protocol_version,
+                negotiated: catalog.negotiated_protocol_version,
+                policy: catalog
+                    .protocol_transport_policy
+                    .map(|policy| policy.as_str().to_string()),
+                configured_preferred: catalog.protocol_configured_preferred,
+            })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolCallOutput {
+    pub result: serde_json::Value,
+    pub protocol: McpProtocolStateSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolCallError {
+    pub message: String,
+    pub protocol: McpProtocolStateSnapshot,
+}
+
+impl McpToolCallError {
+    fn new(message: impl Into<String>, protocol: McpProtocolStateSnapshot) -> Self {
+        Self {
+            message: message.into(),
+            protocol,
+        }
+    }
+
+    fn without_protocol(message: impl Into<String>) -> Self {
+        Self::new(message, McpProtocolStateSnapshot::default())
+    }
+}
+
+impl std::fmt::Display for McpToolCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for McpToolCallError {}
 
 #[derive(Debug, Clone, Default)]
 pub struct McpToolRegistry {
@@ -187,19 +268,68 @@ impl McpToolRegistry {
                 resource_templates,
                 prompts,
                 server_info,
+                requested_protocol_version: None,
+                negotiated_protocol_version: None,
+                protocol_transport_policy: None,
+                protocol_configured_preferred: false,
                 error_message: None,
             },
         );
     }
 
+    pub fn set_negotiated_protocol_version(
+        &self,
+        server_name: &str,
+        requested_protocol_version: Option<String>,
+        negotiated_protocol_version: Option<String>,
+        protocol_transport_policy: Option<String>,
+        protocol_configured_preferred: bool,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let state = inner
+            .get_mut(server_name)
+            .ok_or_else(|| format!("server '{}' not found", server_name))?;
+        state.requested_protocol_version = requested_protocol_version;
+        state.negotiated_protocol_version = negotiated_protocol_version;
+        state.protocol_transport_policy = protocol_transport_policy;
+        state.protocol_configured_preferred = protocol_configured_preferred;
+        Ok(())
+    }
+
     pub fn get_server(&self, server_name: &str) -> Option<McpServerState> {
+        self.refresh_protocol_state_from_manager();
         let inner = self.inner.lock().expect("mcp registry lock poisoned");
         inner.get(server_name).cloned()
     }
 
     pub fn list_servers(&self) -> Vec<McpServerState> {
+        self.refresh_protocol_state_from_manager();
         let inner = self.inner.lock().expect("mcp registry lock poisoned");
         inner.values().cloned().collect()
+    }
+
+    fn refresh_protocol_state_from_manager(&self) {
+        let Some(manager) = self.manager.get().cloned() else {
+            return;
+        };
+        let Ok(manager) = manager.lock() else {
+            return;
+        };
+        let catalogs = manager.server_catalogs();
+        drop(manager);
+
+        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        for catalog in catalogs {
+            let Some(state) = inner.get_mut(&catalog.server_name) else {
+                continue;
+            };
+            state.requested_protocol_version = catalog.requested_protocol_version;
+            state.negotiated_protocol_version = catalog.negotiated_protocol_version;
+            state.protocol_transport_policy = catalog
+                .protocol_transport_policy
+                .map(|policy| policy.as_str().to_string());
+            state.protocol_configured_preferred = catalog.protocol_configured_preferred;
+        }
     }
 
     pub fn server_names(&self) -> Vec<String> {
@@ -576,26 +706,32 @@ impl McpToolRegistry {
 
     fn spawn_tool_call(
         manager: Arc<Mutex<McpServerManager>>,
+        server_name: String,
         qualified_tool_name: String,
         arguments: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<McpToolCallOutput, McpToolCallError> {
         let join_handle = std::thread::Builder::new()
             .name(format!("mcp-tool-call-{qualified_tool_name}"))
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|error| format!("failed to create MCP tool runtime: {error}"))?;
+                    .map_err(|error| {
+                        McpToolCallError::without_protocol(format!(
+                            "failed to create MCP tool runtime: {error}"
+                        ))
+                    })?;
 
                 runtime.block_on(async move {
-                    let response = {
-                        let mut manager = manager
-                            .lock()
-                            .map_err(|_| "mcp server manager lock poisoned".to_string())?;
-                        manager
-                            .discover_tools()
-                            .await
-                            .map_err(|error| error.to_string())?;
+                    let (response, protocol) = {
+                        let mut manager = manager.lock().map_err(|_| {
+                            McpToolCallError::without_protocol("mcp server manager lock poisoned")
+                        })?;
+                        manager.discover_tools().await.map_err(|error| {
+                            McpToolCallError::without_protocol(error.to_string())
+                        })?;
+                        let protocol =
+                            McpProtocolStateSnapshot::from_manager_catalog(&manager, &server_name);
                         let response = manager
                             .call_tool(&qualified_tool_name, arguments)
                             .await
@@ -603,38 +739,98 @@ impl McpToolRegistry {
                         let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
 
                         match (response, shutdown) {
-                            (Ok(response), Ok(())) => Ok(response),
-                            (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
-                            (Ok(_), Err(error)) => Err(error),
+                            (Ok(response), Ok(())) => Ok((response, protocol)),
+                            (Err(error), Ok(())) | (Err(error), Err(_)) => {
+                                Err(McpToolCallError::new(error, protocol))
+                            }
+                            (Ok(_), Err(error)) => Err(McpToolCallError::new(error, protocol)),
                         }
                     }?;
 
                     if let Some(error) = response.error {
-                        return Err(format!(
-                            "MCP server returned JSON-RPC error for tools/call: {} ({})",
-                            error.message, error.code
+                        return Err(McpToolCallError::new(
+                            format!(
+                                "MCP server returned JSON-RPC error for tools/call: {} ({})",
+                                error.message, error.code
+                            ),
+                            protocol,
                         ));
                     }
 
                     let result = response.result.ok_or_else(|| {
-                        "MCP server returned no result for tools/call".to_string()
+                        McpToolCallError::new(
+                            "MCP server returned no result for tools/call",
+                            protocol.clone(),
+                        )
                     })?;
 
-                    serde_json::to_value(result)
-                        .map_err(|error| format!("failed to serialize MCP tool result: {error}"))
+                    let result = serde_json::to_value(result).map_err(|error| {
+                        McpToolCallError::new(
+                            format!("failed to serialize MCP tool result: {error}"),
+                            protocol.clone(),
+                        )
+                    })?;
+                    Ok(McpToolCallOutput { result, protocol })
                 })
             })
-            .map_err(|error| format!("failed to spawn MCP tool call thread: {error}"))?;
+            .map_err(|error| {
+                McpToolCallError::without_protocol(format!(
+                    "failed to spawn MCP tool call thread: {error}"
+                ))
+            })?;
 
         join_handle.join().map_err(|panic_payload| {
             if let Some(message) = panic_payload.downcast_ref::<&str>() {
-                format!("MCP tool call thread panicked: {message}")
+                McpToolCallError::without_protocol(format!(
+                    "MCP tool call thread panicked: {message}"
+                ))
             } else if let Some(message) = panic_payload.downcast_ref::<String>() {
-                format!("MCP tool call thread panicked: {message}")
+                McpToolCallError::without_protocol(format!(
+                    "MCP tool call thread panicked: {message}"
+                ))
             } else {
-                "MCP tool call thread panicked".to_string()
+                McpToolCallError::without_protocol("MCP tool call thread panicked")
             }
         })?
+    }
+
+    pub fn call_tool_with_protocol(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<McpToolCallOutput, McpToolCallError> {
+        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let state = inner.get(server_name).ok_or_else(|| {
+            McpToolCallError::without_protocol(format!("server '{}' not found", server_name))
+        })?;
+
+        if state.status != McpConnectionStatus::Connected {
+            return Err(McpToolCallError::without_protocol(format!(
+                "server '{}' is not connected (status: {})",
+                server_name, state.status
+            )));
+        }
+
+        if !state.tools.iter().any(|t| t.name == tool_name) {
+            return Err(McpToolCallError::without_protocol(format!(
+                "tool '{}' not found on server '{}'",
+                tool_name, server_name
+            )));
+        }
+
+        drop(inner);
+
+        let manager = self.manager.get().cloned().ok_or_else(|| {
+            McpToolCallError::without_protocol("MCP server manager is not configured")
+        })?;
+
+        Self::spawn_tool_call(
+            manager,
+            server_name.to_string(),
+            mcp_tool_name(server_name, tool_name),
+            (!arguments.is_null()).then(|| arguments.clone()),
+        )
     }
 
     pub fn call_tool(
@@ -643,38 +839,9 @@ impl McpToolRegistry {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
-        let state = inner
-            .get(server_name)
-            .ok_or_else(|| format!("server '{}' not found", server_name))?;
-
-        if state.status != McpConnectionStatus::Connected {
-            return Err(format!(
-                "server '{}' is not connected (status: {})",
-                server_name, state.status
-            ));
-        }
-
-        if !state.tools.iter().any(|t| t.name == tool_name) {
-            return Err(format!(
-                "tool '{}' not found on server '{}'",
-                tool_name, server_name
-            ));
-        }
-
-        drop(inner);
-
-        let manager = self
-            .manager
-            .get()
-            .cloned()
-            .ok_or_else(|| "MCP server manager is not configured".to_string())?;
-
-        Self::spawn_tool_call(
-            manager,
-            mcp_tool_name(server_name, tool_name),
-            (!arguments.is_null()).then(|| arguments.clone()),
-        )
+        self.call_tool_with_protocol(server_name, tool_name, arguments)
+            .map(|output| output.result)
+            .map_err(|error| error.message)
     }
 
     /// Set auth status for a server.
@@ -1028,6 +1195,59 @@ mod tests {
     }
 
     #[test]
+    fn get_server_refreshes_protocol_state_from_manager_catalog() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("protocol-state.log");
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config(&script_path, "alpha", &log_path),
+        )]);
+        let manager = Arc::new(Mutex::new(McpServerManager::from_servers(&servers)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        {
+            let mut manager_guard = manager.lock().expect("manager lock");
+            runtime
+                .block_on(manager_guard.discover_tools())
+                .expect("discover tools");
+        }
+
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            McpConnectionStatus::Connected,
+            vec![],
+            vec![],
+            Some("bridge test server".into()),
+        );
+        registry
+            .set_manager(Arc::clone(&manager))
+            .expect("manager should only be set once");
+
+        let state = registry.get_server("alpha").expect("server state");
+        assert_eq!(
+            state.requested_protocol_version.as_deref(),
+            Some("2025-03-26")
+        );
+        assert_eq!(
+            state.negotiated_protocol_version.as_deref(),
+            Some("2025-03-26")
+        );
+        assert_eq!(state.protocol_transport_policy.as_deref(), Some("stdio"));
+        assert!(!state.protocol_configured_preferred);
+
+        let mut manager_guard = manager.lock().expect("manager lock");
+        runtime
+            .block_on(manager_guard.shutdown())
+            .expect("shutdown");
+        drop(manager_guard);
+        cleanup_script(&script_path);
+    }
+
+    #[test]
     fn read_resource_with_manager_returns_live_contents_for_concrete_template_uri() {
         let script_path = write_bridge_mcp_server_script();
         let root = script_path.parent().expect("script parent");
@@ -1174,21 +1394,30 @@ mod tests {
             .expect("manager should only be set once");
 
         let result = registry
-            .call_tool("alpha", "echo", &serde_json::json!({"text": "hello"}))
+            .call_tool_with_protocol("alpha", "echo", &serde_json::json!({"text": "hello"}))
             .expect("should return live MCP result");
 
         assert_eq!(
-            result["structuredContent"]["server"],
+            result.result["structuredContent"]["server"],
             serde_json::json!("alpha")
         );
         assert_eq!(
-            result["structuredContent"]["echoed"],
+            result.result["structuredContent"]["echoed"],
             serde_json::json!("hello")
         );
         assert_eq!(
-            result["content"][0]["text"],
+            result.result["content"][0]["text"],
             serde_json::json!("alpha:hello")
         );
+        assert_eq!(result.protocol.requested.as_deref(), Some("2025-03-26"));
+        assert_eq!(result.protocol.negotiated.as_deref(), Some("2025-03-26"));
+        assert_eq!(result.protocol.policy.as_deref(), Some("stdio"));
+        assert!(!result.protocol.configured_preferred);
+
+        let state_after_shutdown = registry.get_server("alpha").expect("server state");
+        assert!(state_after_shutdown.requested_protocol_version.is_none());
+        assert!(state_after_shutdown.negotiated_protocol_version.is_none());
+        assert!(state_after_shutdown.protocol_transport_policy.is_none());
 
         let log = fs::read_to_string(&log_path).expect("read log");
         assert_eq!(
