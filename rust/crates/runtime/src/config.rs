@@ -19,6 +19,10 @@ fn emit_config_warning_once(warning: &str) {
 }
 
 use crate::json::JsonValue;
+use crate::mcp_client::{
+    MAX_MCP_HEARTBEAT_INTERVAL_MS, MAX_MCP_TIMEOUT_MS, MIN_MCP_HEARTBEAT_INTERVAL_MS,
+    MIN_MCP_TIMEOUT_MS,
+};
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
@@ -167,6 +171,8 @@ pub struct McpStdioServerConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    pub heartbeat_interval_ms: Option<u64>,
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 /// Configuration for an MCP server reached over HTTP or SSE.
@@ -177,6 +183,7 @@ pub struct McpRemoteServerConfig {
     pub headers_helper: Option<String>,
     pub oauth: Option<McpOAuthConfig>,
     pub tool_call_timeout_ms: Option<u64>,
+    pub heartbeat_interval_ms: Option<u64>,
     pub heartbeat_timeout_ms: Option<u64>,
     pub protocol_version: Option<String>,
     pub capabilities: JsonValue,
@@ -1335,7 +1342,13 @@ fn parse_mcp_server_config(
             command: expect_string(object, "command", context)?.to_string(),
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
-            tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            tool_call_timeout_ms: optional_mcp_timeout_ms(object, "toolCallTimeoutMs", context)?,
+            heartbeat_interval_ms: optional_mcp_heartbeat_interval_ms(
+                object,
+                "heartbeatIntervalMs",
+                context,
+            )?,
+            heartbeat_timeout_ms: optional_mcp_timeout_ms(object, "heartbeatTimeoutMs", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -1378,8 +1391,13 @@ fn parse_mcp_remote_server_config(
         headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
         headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
         oauth: parse_optional_mcp_oauth_config(object, context)?,
-        tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
-        heartbeat_timeout_ms: optional_u64(object, "heartbeatTimeoutMs", context)?,
+        tool_call_timeout_ms: optional_mcp_timeout_ms(object, "toolCallTimeoutMs", context)?,
+        heartbeat_interval_ms: optional_mcp_heartbeat_interval_ms(
+            object,
+            "heartbeatIntervalMs",
+            context,
+        )?,
+        heartbeat_timeout_ms: optional_mcp_timeout_ms(object, "heartbeatTimeoutMs", context)?,
         protocol_version: optional_string(object, "protocolVersion", context)?.map(str::to_string),
         capabilities: object
             .get("capabilities")
@@ -1514,6 +1532,51 @@ fn optional_u64(
         }
         None => Ok(None),
     }
+}
+
+fn optional_mcp_timeout_ms(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    optional_u64(object, key, context)?
+        .map(|value| {
+            validate_mcp_u64_bound(context, key, value, MIN_MCP_TIMEOUT_MS, MAX_MCP_TIMEOUT_MS)
+        })
+        .transpose()
+}
+
+fn optional_mcp_heartbeat_interval_ms(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    optional_u64(object, key, context)?
+        .map(|value| {
+            validate_mcp_u64_bound(
+                context,
+                key,
+                value,
+                MIN_MCP_HEARTBEAT_INTERVAL_MS,
+                MAX_MCP_HEARTBEAT_INTERVAL_MS,
+            )
+        })
+        .transpose()
+}
+
+fn validate_mcp_u64_bound(
+    context: &str,
+    key: &str,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    if !(min..=max).contains(&value) {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be between {min} and {max} milliseconds"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_usize(
@@ -2183,6 +2246,110 @@ mod tests {
             }
             other => panic!("expected http config, got {other:?}"),
         }
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_mcp_operation_and_heartbeat_timeouts() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "local": {
+                  "type": "stdio",
+                  "command": "python3",
+                  "toolCallTimeoutMs": 1200,
+                  "heartbeatIntervalMs": 3400,
+                  "heartbeatTimeoutMs": 560
+                },
+                "remote": {
+                  "type": "sse",
+                  "url": "http://127.0.0.1:3000/sse",
+                  "toolCallTimeoutMs": 2200,
+                  "heartbeatIntervalMs": 4400,
+                  "heartbeatTimeoutMs": 660
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        match &loaded.mcp().get("local").expect("local").config {
+            McpServerConfig::Stdio(config) => {
+                assert_eq!(config.tool_call_timeout_ms, Some(1200));
+                assert_eq!(config.heartbeat_interval_ms, Some(3400));
+                assert_eq!(config.heartbeat_timeout_ms, Some(560));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+        match &loaded.mcp().get("remote").expect("remote").config {
+            McpServerConfig::Sse(config) => {
+                assert_eq!(config.tool_call_timeout_ms, Some(2200));
+                assert_eq!(config.heartbeat_interval_ms, Some(4400));
+                assert_eq!(config.heartbeat_timeout_ms, Some(660));
+            }
+            other => panic!("expected sse config, got {other:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_zero_and_huge_mcp_timeout_bounds() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "zero": {
+                  "type": "stdio",
+                  "command": "python3",
+                  "heartbeatTimeoutMs": 0
+                }
+              }
+            }"#,
+        )
+        .expect("write zero settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("zero timeout should fail");
+        assert!(error.to_string().contains("heartbeatTimeoutMs"));
+        assert!(error.to_string().contains("must be between"));
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "huge": {
+                  "type": "sse",
+                  "url": "http://127.0.0.1:3000/sse",
+                  "heartbeatIntervalMs": 3600001
+                }
+              }
+            }"#,
+        )
+        .expect("write huge settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("huge interval should fail");
+        assert!(error.to_string().contains("heartbeatIntervalMs"));
+        assert!(error.to_string().contains("must be between"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

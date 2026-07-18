@@ -7,7 +7,12 @@ use crate::json::JsonValue as RuntimeJsonValue;
 use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_MCP_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS: u64 = 5_000;
+pub const MIN_MCP_TIMEOUT_MS: u64 = 1;
+pub const MAX_MCP_TIMEOUT_MS: u64 = 300_000;
+pub const MIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 1;
+pub const MAX_MCP_HEARTBEAT_INTERVAL_MS: u64 = 3_600_000;
 pub const LATEST_STDIO_MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const LEGACY_SSE_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const STDIO_SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
@@ -33,6 +38,8 @@ pub struct McpStdioTransport {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    pub heartbeat_interval_ms: Option<u64>,
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +49,7 @@ pub struct McpRemoteTransport {
     pub headers_helper: Option<String>,
     pub auth: McpClientAuth,
     pub tool_call_timeout_ms: Option<u64>,
+    pub heartbeat_interval_ms: Option<u64>,
     pub heartbeat_timeout_ms: Option<u64>,
     pub protocol_version: Option<String>,
     pub capabilities: serde_json::Value,
@@ -318,7 +326,7 @@ impl McpClientBootstrap {
             McpClientTransport::Stdio(transport) => McpTransportHealthcheck {
                 server_name: self.server_name.clone(),
                 status: McpTransportHealthStatus::Healthy,
-                heartbeat_timeout_ms: transport.resolved_tool_call_timeout_ms(),
+                heartbeat_timeout_ms: transport.resolved_heartbeat_timeout_ms(),
                 message: "stdio MCP transport is handled by the local process manager".to_string(),
             },
             McpClientTransport::Sse(transport) => McpTransportHealthcheck {
@@ -372,6 +380,8 @@ impl McpClientTransport {
                 args: config.args.clone(),
                 env: config.env.clone(),
                 tool_call_timeout_ms: config.tool_call_timeout_ms,
+                heartbeat_interval_ms: config.heartbeat_interval_ms,
+                heartbeat_timeout_ms: config.heartbeat_timeout_ms,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -379,6 +389,7 @@ impl McpClientTransport {
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::from_oauth(config.oauth.clone()),
                 tool_call_timeout_ms: config.tool_call_timeout_ms,
+                heartbeat_interval_ms: config.heartbeat_interval_ms,
                 heartbeat_timeout_ms: config.heartbeat_timeout_ms,
                 protocol_version: config.protocol_version.clone(),
                 capabilities: runtime_json_to_serde(&config.capabilities),
@@ -389,6 +400,7 @@ impl McpClientTransport {
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::from_oauth(config.oauth.clone()),
                 tool_call_timeout_ms: config.tool_call_timeout_ms,
+                heartbeat_interval_ms: config.heartbeat_interval_ms,
                 heartbeat_timeout_ms: config.heartbeat_timeout_ms,
                 protocol_version: config.protocol_version.clone(),
                 capabilities: runtime_json_to_serde(&config.capabilities),
@@ -399,6 +411,7 @@ impl McpClientTransport {
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::None,
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: None,
                 protocol_version: None,
                 capabilities: serde_json::json!({}),
@@ -438,6 +451,48 @@ impl McpStdioTransport {
         self.tool_call_timeout_ms
             .unwrap_or(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
     }
+
+    #[must_use]
+    pub fn resolved_heartbeat_interval_ms(&self) -> u64 {
+        self.heartbeat_interval_ms
+            .or_else(|| {
+                self.env
+                    .get("CLAWD_MCP_HEARTBEAT_INTERVAL_MS")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(DEFAULT_MCP_HEARTBEAT_INTERVAL_MS)
+    }
+
+    #[must_use]
+    pub fn resolved_heartbeat_timeout_ms(&self) -> u64 {
+        self.heartbeat_timeout_ms
+            .or_else(|| {
+                self.env
+                    .get("CLAWD_MCP_HEARTBEAT_TIMEOUT_MS")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS)
+    }
+}
+
+impl McpRemoteTransport {
+    #[must_use]
+    pub fn resolved_tool_call_timeout_ms(&self) -> u64 {
+        self.tool_call_timeout_ms
+            .unwrap_or(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
+    }
+
+    #[must_use]
+    pub fn resolved_heartbeat_interval_ms(&self) -> u64 {
+        self.heartbeat_interval_ms
+            .unwrap_or(DEFAULT_MCP_HEARTBEAT_INTERVAL_MS)
+    }
+
+    #[must_use]
+    pub fn resolved_heartbeat_timeout_ms(&self) -> u64 {
+        self.heartbeat_timeout_ms
+            .unwrap_or(DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS)
+    }
 }
 
 impl McpClientAuth {
@@ -473,6 +528,8 @@ mod tests {
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 tool_call_timeout_ms: Some(15_000),
+                heartbeat_interval_ms: Some(20_000),
+                heartbeat_timeout_ms: Some(2_500),
             }),
         };
 
@@ -492,6 +549,8 @@ mod tests {
                     Some("secret")
                 );
                 assert_eq!(transport.tool_call_timeout_ms, Some(15_000));
+                assert_eq!(transport.resolved_heartbeat_interval_ms(), 20_000);
+                assert_eq!(transport.resolved_heartbeat_timeout_ms(), 2_500);
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
@@ -515,6 +574,7 @@ mod tests {
                     xaa: Some(true),
                 }),
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: None,
                 protocol_version: None,
                 capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -550,6 +610,7 @@ mod tests {
                 headers_helper: None,
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
+                heartbeat_interval_ms: Some(9_000),
                 heartbeat_timeout_ms: Some(2_500),
                 protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
@@ -559,6 +620,7 @@ mod tests {
         let bootstrap = McpClientBootstrap::from_scoped_config("remote sse", &config);
         let health = bootstrap.healthcheck_model();
         assert_eq!(health.status, McpTransportHealthStatus::Degraded);
+        assert_eq!(health.heartbeat_timeout_ms, 2_500);
         assert!(health.message.contains("SSE MCP endpoint"));
 
         let new_sse_negotiation = bootstrap.negotiate_protocol("2025-03-26", "2025-03-26");
@@ -581,6 +643,7 @@ mod tests {
                 headers_helper: None,
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: Some(2_500),
                 protocol_version: Some("2025-03-26".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
@@ -605,6 +668,7 @@ mod tests {
                 headers_helper: None,
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: Some(2_500),
                 protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),
@@ -629,6 +693,7 @@ mod tests {
                 headers_helper: None,
                 oauth: None,
                 tool_call_timeout_ms: Some(15_000),
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: Some(2_500),
                 protocol_version: Some("2024-11-05".to_string()),
                 capabilities: crate::JsonValue::parse(r#"{"tools":{}}"#).expect("json"),

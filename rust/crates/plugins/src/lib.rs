@@ -29,6 +29,10 @@ const BUILTIN_OPS_EXECUTOR_COMMAND: &str = "__claw_builtin_ops_executor__";
 const PLUGIN_TOOL_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_CHILD_POLL_MS: u64 = 25;
+const MIN_PLUGIN_MCP_TIMEOUT_MS: u64 = 1;
+const MAX_PLUGIN_MCP_TIMEOUT_MS: u64 = 300_000;
+const MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 1;
+const MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -338,7 +342,7 @@ impl Default for PluginMcpHeartbeat {
 }
 
 fn default_mcp_heartbeat_interval_ms() -> u64 {
-    30_000
+    PLUGIN_TOOL_TIMEOUT_MS
 }
 
 fn default_mcp_heartbeat_timeout_ms() -> u64 {
@@ -4434,6 +4438,7 @@ fn build_manifest_mcp_servers(
                 detail: "plugin MCP servers are limited to read-only until an OS sandboxed runner is available".to_string(),
             });
         }
+        validate_manifest_mcp_heartbeat(server_name, server, errors);
         match server.transport {
             PluginMcpTransport::Stdio => {
                 if server
@@ -4500,6 +4505,33 @@ fn build_manifest_mcp_servers(
         }
     }
     mcp_servers
+}
+
+fn validate_manifest_mcp_heartbeat(
+    server_name: &str,
+    server: &PluginMcpServerManifest,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if server.heartbeat.interval_ms < MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS
+        || server.heartbeat.interval_ms > MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS
+    {
+        errors.push(PluginManifestValidationError::InvalidMcpServerConfig {
+            server_name: server_name.to_string(),
+            detail: format!(
+                "heartbeat.intervalMs must be between {MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS} and {MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS}"
+            ),
+        });
+    }
+    if server.heartbeat.timeout_ms < MIN_PLUGIN_MCP_TIMEOUT_MS
+        || server.heartbeat.timeout_ms > MAX_PLUGIN_MCP_TIMEOUT_MS
+    {
+        errors.push(PluginManifestValidationError::InvalidMcpServerConfig {
+            server_name: server_name.to_string(),
+            detail: format!(
+                "heartbeat.timeoutMs must be between {MIN_PLUGIN_MCP_TIMEOUT_MS} and {MAX_PLUGIN_MCP_TIMEOUT_MS}"
+            ),
+        });
+    }
 }
 
 fn build_manifest_dependencies(
@@ -6897,6 +6929,74 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_invalid_mcp_heartbeat_bounds_and_types() {
+        let cases = [
+            (
+                "zero-interval",
+                r#""heartbeat": { "intervalMs": 0, "timeoutMs": 5000 }"#,
+                "heartbeat.intervalMs",
+            ),
+            (
+                "oversize-timeout",
+                r#""heartbeat": { "intervalMs": 30000, "timeoutMs": 300001 }"#,
+                "heartbeat.timeoutMs",
+            ),
+            (
+                "malformed-interval",
+                r#""heartbeat": { "intervalMs": "bad", "timeoutMs": 5000 }"#,
+                "invalid type",
+            ),
+        ];
+
+        for (label, heartbeat, expected) in cases {
+            let _guard = env_guard();
+            let root = temp_dir(&format!("manifest-mcp-heartbeat-{label}"));
+            write_file(
+                root.join("tools").join("inspect.sh").as_path(),
+                "#!/bin/sh\ncat\n",
+            );
+            write_file(
+                root.join(MANIFEST_FILE_NAME).as_path(),
+                format!(
+                    r#"{{
+  "name": "mcp-heartbeat-{label}",
+  "version": "1.0.0",
+  "description": "MCP heartbeat bounds",
+  "permissions": ["read"],
+  "mcpServers": {{
+    "triage": {{
+      "transport": "stdio",
+      "requiredPermission": "read-only",
+      "command": "./tools/inspect.sh",
+      {heartbeat},
+      "capabilities": {{
+        "tools": [
+          {{
+            "name": "inspect",
+            "description": "Inspect input",
+            "inputSchema": {{ "type": "object" }}
+          }}
+        ]
+      }}
+    }}
+  }}
+}}"#
+                )
+                .as_str(),
+            );
+
+            let error =
+                load_plugin_from_directory(&root).expect_err("invalid heartbeat should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "{label} error did not contain {expected}: {error}"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

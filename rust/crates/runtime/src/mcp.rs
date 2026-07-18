@@ -249,6 +249,8 @@ mod tests {
             args: vec!["mcp-server".to_string()],
             env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
             tool_call_timeout_ms: None,
+            heartbeat_interval_ms: None,
+            heartbeat_timeout_ms: None,
         });
         assert_eq!(
             mcp_server_signature(&stdio),
@@ -274,6 +276,7 @@ mod tests {
             headers_helper: Some("helper.sh".to_string()),
             oauth: None,
             tool_call_timeout_ms: None,
+            heartbeat_interval_ms: None,
             heartbeat_timeout_ms: None,
             protocol_version: None,
             capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -302,6 +305,7 @@ mod tests {
                 headers_helper: None,
                 oauth: None,
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
                 heartbeat_timeout_ms: None,
                 protocol_version: None,
                 capabilities: crate::JsonValue::Object(BTreeMap::new()),

@@ -5092,6 +5092,10 @@ struct RuntimeMcpState {
 }
 
 const CLI_MCP_TOOL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MIN_PLUGIN_MCP_TIMEOUT_MS: u64 = 1;
+const MAX_PLUGIN_MCP_TIMEOUT_MS: u64 = 300_000;
+const MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 1;
+const MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 3_600_000;
 
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
@@ -5346,8 +5350,47 @@ impl RuntimeMcpState {
         self.degraded_report.clone()
     }
 
+    fn refresh_due_heartbeat_for_server(&mut self, server_name: &str) -> Result<(), ToolError> {
+        self.runtime
+            .block_on(
+                self.manager
+                    .refresh_due_heartbeat_for_server(server_name, Instant::now()),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn refresh_due_heartbeat_for_qualified_tool(
+        &mut self,
+        qualified_tool_name: &str,
+    ) -> Result<(), ToolError> {
+        if let Some(server_name) = self.server_name_for_qualified_tool(qualified_tool_name) {
+            self.refresh_due_heartbeat_for_server(&server_name)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_due_heartbeats(&mut self) -> Result<(), ToolError> {
+        self.runtime
+            .block_on(self.manager.refresh_due_heartbeats(Instant::now()))
+            .map(|_| ())
+            .map_err(|error| ToolError::new(error.to_string()))
+    }
+
     fn server_names(&self) -> Vec<String> {
         self.manager.server_names()
+    }
+
+    fn server_name_for_qualified_tool(&self, qualified_tool_name: &str) -> Option<String> {
+        self.manager
+            .server_catalogs()
+            .into_iter()
+            .find_map(|catalog| {
+                catalog
+                    .tools
+                    .iter()
+                    .any(|tool| tool.qualified_name == qualified_tool_name)
+                    .then_some(catalog.server_name)
+            })
     }
 
     fn protocol_state_for_server(&self, server_name: &str) -> serde_json::Value {
@@ -5367,6 +5410,39 @@ impl RuntimeMcpState {
                         "configuredPreferred": catalog.protocol_configured_preferred,
                     })
                 },
+            )
+    }
+
+    fn heartbeat_state_for_server(&self, server_name: &str) -> serde_json::Value {
+        self.manager
+            .heartbeat_report()
+            .into_iter()
+            .find(|heartbeat| heartbeat.server_name == server_name)
+            .map_or_else(
+                || json!(null),
+                |heartbeat| {
+                    json!({
+                        "status": heartbeat.status,
+                        "intervalMs": heartbeat.interval_ms,
+                        "timeoutMs": heartbeat.timeout_ms,
+                        "latencyMs": heartbeat.latency_ms,
+                        "consecutiveFailures": heartbeat.consecutive_failures,
+                        "nextDueAtMs": heartbeat.next_due_at_ms,
+                        "freshness": heartbeat.freshness,
+                        "lastAttemptAtMs": heartbeat.last_attempt_at_ms,
+                        "lastSuccessAtMs": heartbeat.last_success_at_ms,
+                        "lastFailureAtMs": heartbeat.last_failure_at_ms,
+                        "lastFailureReason": heartbeat.last_failure_reason,
+                    })
+                },
+            )
+    }
+
+    fn heartbeat_state_for_qualified_tool(&self, qualified_tool_name: &str) -> serde_json::Value {
+        self.server_name_for_qualified_tool(qualified_tool_name)
+            .map_or_else(
+                || json!(null),
+                |server_name| self.heartbeat_state_for_server(&server_name),
             )
     }
 
@@ -5407,24 +5483,39 @@ impl RuntimeMcpState {
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_qualified_tool(qualified_tool_name) {
+            let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+            let heartbeat = self.heartbeat_state_for_qualified_tool(qualified_tool_name);
+            return bounded_mcp_tool_json(&json!({
+                "status": "error",
+                "protocol": protocol,
+                "heartbeat": heartbeat,
+                "error": error.to_string(),
+            }));
+        }
         let response = match self
             .runtime
             .block_on(self.manager.call_tool(qualified_tool_name, arguments))
         {
             Ok(response) => response,
             Err(error) => {
+                let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+                let heartbeat = self.heartbeat_state_for_qualified_tool(qualified_tool_name);
                 return bounded_mcp_tool_json(&json!({
                     "status": "error",
                     "protocol": protocol,
+                    "heartbeat": heartbeat,
                     "error": error.to_string(),
                 }));
             }
         };
         if let Some(error) = response.error {
+            let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+            let heartbeat = self.heartbeat_state_for_qualified_tool(qualified_tool_name);
             return bounded_mcp_tool_json(&json!({
                 "status": "error",
                 "protocol": protocol,
+                "heartbeat": heartbeat,
                 "error": format!(
                     "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
                     error.message, error.code
@@ -5433,32 +5524,55 @@ impl RuntimeMcpState {
         }
 
         let Some(result) = response.result else {
+            let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
+            let heartbeat = self.heartbeat_state_for_qualified_tool(qualified_tool_name);
             return bounded_mcp_tool_json(&json!({
                 "status": "error",
                 "protocol": protocol,
+                "heartbeat": heartbeat,
                 "error": format!("MCP tool `{qualified_tool_name}` returned no result payload"),
             }));
         };
         let value = serde_json::to_value(result).map_err(|error| {
             ToolError::new(format!("failed to serialize MCP tool result: {error}"))
         })?;
-        bounded_mcp_tool_json(&Self::value_with_protocol(value, protocol))
+        let mut value = Self::value_with_protocol(
+            value,
+            self.protocol_state_for_qualified_tool(qualified_tool_name),
+        );
+        if let serde_json::Value::Object(object) = &mut value {
+            object.insert(
+                "heartbeat".to_string(),
+                self.heartbeat_state_for_qualified_tool(qualified_tool_name),
+            );
+        }
+        bounded_mcp_tool_json(&value)
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_server(server_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_server(server_name) {
+            return bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
+                "resources": [],
+                "error": error.to_string(),
+            }));
+        }
         match self
             .runtime
             .block_on(self.manager.list_resources(server_name))
         {
             Ok(result) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "resources": result.resources,
             })),
             Err(error) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "resources": [],
                 "error": error.to_string(),
             })),
@@ -5466,6 +5580,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
+        let _ = self.refresh_due_heartbeats();
         bounded_multi_server_mcp_list_json(
             "resources",
             self.server_names(),
@@ -5477,11 +5592,13 @@ impl RuntimeMcpState {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "resources": result.resources,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "resources": [],
                     "error": error.to_string(),
                 })),
@@ -5493,19 +5610,29 @@ impl RuntimeMcpState {
         &mut self,
         server_name: &str,
     ) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_server(server_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_server(server_name) {
+            return bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
+                "resource_templates": [],
+                "error": error.to_string(),
+            }));
+        }
         match self
             .runtime
             .block_on(self.manager.list_resource_templates(server_name))
         {
             Ok(result) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "resource_templates": result.resource_templates,
             })),
             Err(error) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "resource_templates": [],
                 "error": error.to_string(),
             })),
@@ -5513,6 +5640,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resource_templates_for_all_servers(&mut self) -> Result<String, ToolError> {
+        let _ = self.refresh_due_heartbeats();
         bounded_multi_server_mcp_list_json(
             "resource_templates",
             self.server_names(),
@@ -5524,11 +5652,13 @@ impl RuntimeMcpState {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "resource_templates": result.resource_templates,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "resource_templates": [],
                     "error": error.to_string(),
                 })),
@@ -5537,19 +5667,29 @@ impl RuntimeMcpState {
     }
 
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_server(server_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_server(server_name) {
+            return bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
+                "uri": uri,
+                "error": error.to_string(),
+            }));
+        }
         match self
             .runtime
             .block_on(self.manager.read_resource(server_name, uri))
         {
             Ok(result) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "contents": result.contents,
             })),
             Err(error) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "uri": uri,
                 "error": error.to_string(),
             })),
@@ -5557,19 +5697,29 @@ impl RuntimeMcpState {
     }
 
     fn list_prompts_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_server(server_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_server(server_name) {
+            return bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
+                "prompts": [],
+                "error": error.to_string(),
+            }));
+        }
         match self
             .runtime
             .block_on(self.manager.list_prompts(server_name))
         {
             Ok(result) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "prompts": result.prompts,
             })),
             Err(error) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "prompts": [],
                 "error": error.to_string(),
             })),
@@ -5577,6 +5727,7 @@ impl RuntimeMcpState {
     }
 
     fn list_prompts_for_all_servers(&mut self) -> Result<String, ToolError> {
+        let _ = self.refresh_due_heartbeats();
         bounded_multi_server_mcp_list_json(
             "prompts",
             self.server_names(),
@@ -5588,11 +5739,13 @@ impl RuntimeMcpState {
                 Ok(result) => McpAggregateEntry::item(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "prompts": result.prompts,
                 })),
                 Err(error) => McpAggregateEntry::failure(json!({
                     "server": server_name,
                     "protocol": self.protocol_state_for_server(server_name),
+                    "heartbeat": self.heartbeat_state_for_server(server_name),
                     "prompts": [],
                     "error": error.to_string(),
                 })),
@@ -5606,19 +5759,29 @@ impl RuntimeMcpState {
         name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let protocol = self.protocol_state_for_server(server_name);
+        if let Err(error) = self.refresh_due_heartbeat_for_server(server_name) {
+            return bounded_mcp_tool_json(&json!({
+                "server": server_name,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
+                "name": name,
+                "error": error.to_string(),
+            }));
+        }
         match self
             .runtime
             .block_on(self.manager.get_prompt(server_name, name, arguments))
         {
             Ok(result) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "prompt": result,
             })),
             Err(error) => bounded_mcp_tool_json(&json!({
                 "server": server_name,
-                "protocol": protocol,
+                "protocol": self.protocol_state_for_server(server_name),
+                "heartbeat": self.heartbeat_state_for_server(server_name),
                 "name": name,
                 "error": error.to_string(),
             })),
@@ -5776,6 +5939,7 @@ fn merged_runtime_mcp_servers(
     let mut servers = runtime_config.mcp().servers().clone();
 
     for (server_name, manifest) in plugin_servers {
+        validate_plugin_mcp_heartbeat_for_merge(&server_name, &manifest)?;
         let external_plugin = server_name
             .split_once("::")
             .is_some_and(|(plugin_id, _)| plugin_id.ends_with("@external"));
@@ -5811,12 +5975,18 @@ fn merged_runtime_mcp_servers(
                             manifest.heartbeat.timeout_ms.to_string(),
                         );
                         env.insert(
+                            "CLAWD_MCP_HEARTBEAT_INTERVAL_MS".to_string(),
+                            manifest.heartbeat.interval_ms.to_string(),
+                        );
+                        env.insert(
                             "CLAWD_MCP_CAPABILITIES".to_string(),
                             serde_json::to_string(&manifest.capabilities)?,
                         );
                         env
                     },
                     tool_call_timeout_ms: manifest.tool_call_timeout_ms,
+                    heartbeat_interval_ms: Some(manifest.heartbeat.interval_ms),
+                    heartbeat_timeout_ms: Some(manifest.heartbeat.timeout_ms),
                 })
             }
             PluginMcpTransport::Sse => {
@@ -5828,6 +5998,7 @@ fn merged_runtime_mcp_servers(
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: manifest.tool_call_timeout_ms,
+                    heartbeat_interval_ms: Some(manifest.heartbeat.interval_ms),
                     heartbeat_timeout_ms: Some(manifest.heartbeat.timeout_ms),
                     protocol_version: manifest.protocol_version,
                     capabilities: serde_to_runtime_json(serde_json::to_value(
@@ -5847,6 +6018,29 @@ fn merged_runtime_mcp_servers(
     }
 
     Ok(servers)
+}
+
+fn validate_plugin_mcp_heartbeat_for_merge(
+    server_name: &str,
+    manifest: &PluginMcpServerManifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if manifest.heartbeat.interval_ms < MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS
+        || manifest.heartbeat.interval_ms > MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS
+    {
+        return Err(format!(
+            "plugin MCP server `{server_name}` heartbeat.intervalMs must be between {MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS} and {MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS}"
+        )
+        .into());
+    }
+    if manifest.heartbeat.timeout_ms < MIN_PLUGIN_MCP_TIMEOUT_MS
+        || manifest.heartbeat.timeout_ms > MAX_PLUGIN_MCP_TIMEOUT_MS
+    {
+        return Err(format!(
+            "plugin MCP server `{server_name}` heartbeat.timeoutMs must be between {MIN_PLUGIN_MCP_TIMEOUT_MS} and {MAX_PLUGIN_MCP_TIMEOUT_MS}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn serde_to_runtime_json(value: Value) -> RuntimeJsonValue {
@@ -12146,22 +12340,23 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
-        AnthropicRuntimeClient, CliAction, CliLogSummaryGenerator, CliOutputFormat,
-        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        CLI_LOG_SUMMARY_MAX_TOKENS, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        merge_prompt_with_stdin, merged_runtime_mcp_servers, normalize_permission_mode, parse_args,
+        parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, AnthropicRuntimeClient, CliAction,
+        CliLogSummaryGenerator, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
+        StatusUsage, TmuxPaneSnapshot, CLI_LOG_SUMMARY_MAX_TOKENS, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{
         AnthropicClient, ApiError, MessageResponse, OutputContentBlock,
@@ -12174,7 +12369,8 @@ mod tests {
         LogSummaryTimeRange,
     };
     use plugins::{
-        PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
+        PluginManager, PluginManagerConfig, PluginMcpServerManifest, PluginTool,
+        PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
@@ -12182,6 +12378,7 @@ mod tests {
         Session, ToolExecutor,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -12743,7 +12940,11 @@ mod tests {
                 "embedded": {
                     "transport": "stdio",
                     "command": script_path.to_string_lossy(),
-                    "requiredPermission": "read-only"
+                    "requiredPermission": "read-only",
+                    "heartbeat": {
+                        "intervalMs": 12345,
+                        "timeoutMs": 678
+                    }
                 }
             }
         });
@@ -17271,6 +17472,110 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn merged_plugin_mcp_servers_preserve_manifest_heartbeat_interval_and_timeout() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        let manifest: PluginMcpServerManifest = serde_json::from_value(json!({
+            "transport": "stdio",
+            "command": "python3",
+            "heartbeat": {
+                "intervalMs": 12345,
+                "timeoutMs": 678
+            }
+        }))
+        .expect("plugin mcp manifest");
+
+        let servers = merged_runtime_mcp_servers(
+            &runtime_config,
+            BTreeMap::from([("plugin-mcp-runtime@builtin::embedded".to_string(), manifest)]),
+        )
+        .expect("merge plugin MCP servers");
+
+        let server = servers
+            .get("plugin-mcp-runtime@builtin::embedded")
+            .expect("merged server");
+        match &server.config {
+            runtime::McpServerConfig::Stdio(config) => {
+                assert_eq!(config.heartbeat_interval_ms, Some(12345));
+                assert_eq!(config.heartbeat_timeout_ms, Some(678));
+                assert_eq!(
+                    config.env.get("CLAWD_MCP_HEARTBEAT_INTERVAL_MS"),
+                    Some(&"12345".to_string())
+                );
+                assert_eq!(
+                    config.env.get("CLAWD_MCP_HEARTBEAT_TIMEOUT_MS"),
+                    Some(&"678".to_string())
+                );
+            }
+            other => panic!("expected stdio plugin MCP config, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn merged_plugin_mcp_servers_reject_invalid_manifest_heartbeat_bounds() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        let cases = [
+            (
+                "zero-interval",
+                json!({
+                    "transport": "stdio",
+                    "command": "python3",
+                    "heartbeat": { "intervalMs": 0, "timeoutMs": 500 }
+                }),
+                "heartbeat.intervalMs",
+            ),
+            (
+                "oversize-timeout",
+                json!({
+                    "transport": "sse",
+                    "url": "http://127.0.0.1:1/sse",
+                    "heartbeat": { "intervalMs": 30_000, "timeoutMs": 300_001 }
+                }),
+                "heartbeat.timeoutMs",
+            ),
+        ];
+
+        for (label, manifest_value, expected) in cases {
+            let manifest: PluginMcpServerManifest =
+                serde_json::from_value(manifest_value).expect("plugin mcp manifest");
+            let error = merged_runtime_mcp_servers(
+                &runtime_config,
+                BTreeMap::from([(format!("plugin-mcp-{label}@builtin::embedded"), manifest)]),
+            )
+            .expect_err("invalid heartbeat should fail merge");
+            assert!(
+                error.to_string().contains(expected),
+                "{label} error did not contain {expected}: {error}"
+            );
+        }
+
+        let malformed = serde_json::from_value::<PluginMcpServerManifest>(json!({
+            "transport": "stdio",
+            "command": "python3",
+            "heartbeat": { "intervalMs": "bad", "timeoutMs": 500 }
+        }))
+        .expect_err("malformed heartbeat should fail before merge");
+        assert!(malformed.to_string().contains("invalid type"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
         let config_home = temp_dir();
         let workspace = temp_dir();
@@ -17494,6 +17799,8 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "                'serverInfo': {'name': 'fixture', 'version': '1.0.0'}",
             "            }",
             "        })",
+            "    elif method == 'ping':",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})",
             "    elif method == 'tools/list':",
             "        send_message({",
             "            'jsonrpc': '2.0',",

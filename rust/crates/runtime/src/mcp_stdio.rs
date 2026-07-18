@@ -24,7 +24,10 @@ use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{
     negotiate_mcp_protocol_version, select_mcp_protocol_version, McpClientBootstrap,
     McpClientTransport, McpProtocolSelection, McpProtocolTransportPolicy, McpProtocolVersionError,
-    McpRemoteTransport, McpStdioTransport, LATEST_STDIO_MCP_PROTOCOL_VERSION,
+    McpRemoteTransport, McpStdioTransport, DEFAULT_MCP_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS, LATEST_STDIO_MCP_PROTOCOL_VERSION,
+    MAX_MCP_HEARTBEAT_INTERVAL_MS, MAX_MCP_TIMEOUT_MS, MIN_MCP_HEARTBEAT_INTERVAL_MS,
+    MIN_MCP_TIMEOUT_MS,
 };
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
@@ -36,11 +39,6 @@ const MCP_INITIALIZE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
-#[cfg(test)]
-const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
-#[cfg(not(test))]
-const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
-
 const MCP_MAX_JSONRPC_FRAME_BYTES: usize = 1024 * 1024;
 const MCP_MAX_PAGINATION_PAGES: usize = 64;
 const MCP_MAX_PAGINATION_ITEMS: usize = 1024;
@@ -49,6 +47,7 @@ const MCP_MAX_CATALOG_ITEM_JSON_BYTES: usize = 64 * 1024;
 const MCP_MAX_RESULT_JSON_BYTES: usize = 1024 * 1024;
 const MCP_MAX_RESOURCE_CONTENTS: usize = 64;
 const MCP_MAX_PROMPT_MESSAGES: usize = 128;
+const MCP_MAX_HEARTBEAT_FAILURE_REASON_CHARS: usize = 512;
 const MCP_SSE_MAX_OPERATION_TIMEOUT_MS: u64 = u32::MAX as u64;
 const MCP_SSE_MAX_URL_BYTES: usize = 8 * 1024;
 const MCP_SSE_MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -576,7 +575,9 @@ pub enum McpHeartbeatStatus {
     NotConfigured,
     Unknown,
     Healthy,
+    Degraded,
     Failed,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,13 +594,33 @@ pub struct McpServerHeartbeat {
     #[serde(default)]
     pub protocol_configured_preferred: bool,
     pub last_checked_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at_ms: Option<u64>,
     pub last_success_at_ms: Option<u64>,
     pub last_failure_at_ms: Option<u64>,
     pub last_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
 }
 
 impl McpServerHeartbeat {
-    fn new(server_name: impl Into<String>, status: McpHeartbeatStatus) -> Self {
+    fn new(
+        server_name: impl Into<String>,
+        status: McpHeartbeatStatus,
+        interval_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        next_due_at_ms: Option<u64>,
+    ) -> Self {
         Self {
             server_name: server_name.into(),
             status,
@@ -608,18 +629,33 @@ impl McpServerHeartbeat {
             protocol_transport_policy: None,
             protocol_configured_preferred: false,
             last_checked_at_ms: None,
+            last_attempt_at_ms: None,
             last_success_at_ms: None,
             last_failure_at_ms: None,
             last_failure_reason: None,
+            interval_ms,
+            timeout_ms,
+            latency_ms: None,
+            consecutive_failures: 0,
+            next_due_at_ms,
+            freshness: Some("unknown".to_string()),
         }
     }
 
-    fn mark_success(&mut self) {
-        let now = unix_time_ms();
+    fn mark_attempt(&mut self, now_ms: u64) {
+        self.last_checked_at_ms = Some(now_ms);
+        self.last_attempt_at_ms = Some(now_ms);
+    }
+
+    fn mark_success(&mut self, now_ms: u64, latency_ms: Option<u64>, next_due_at_ms: Option<u64>) {
         self.status = McpHeartbeatStatus::Healthy;
-        self.last_checked_at_ms = Some(now);
-        self.last_success_at_ms = Some(now);
+        self.last_checked_at_ms = Some(now_ms);
+        self.last_success_at_ms = Some(now_ms);
         self.last_failure_reason = None;
+        self.latency_ms = latency_ms;
+        self.consecutive_failures = 0;
+        self.next_due_at_ms = next_due_at_ms;
+        self.freshness = Some("fresh".to_string());
     }
 
     fn mark_success_with_protocol_version(
@@ -627,7 +663,7 @@ impl McpServerHeartbeat {
         protocol_selection: &McpProtocolSelection,
         negotiated_protocol_version: Option<String>,
     ) {
-        self.mark_success();
+        self.mark_success(unix_time_ms(), None, self.next_due_at_ms);
         self.mark_protocol_state(Some(protocol_selection), negotiated_protocol_version);
     }
 
@@ -649,12 +685,39 @@ impl McpServerHeartbeat {
         self.negotiated_protocol_version = negotiated_protocol_version;
     }
 
-    fn mark_failure(&mut self, reason: impl Into<String>) {
-        let now = unix_time_ms();
-        self.status = McpHeartbeatStatus::Failed;
-        self.last_checked_at_ms = Some(now);
-        self.last_failure_at_ms = Some(now);
-        self.last_failure_reason = Some(reason.into());
+    fn mark_failure(
+        &mut self,
+        now_ms: u64,
+        reason: impl Into<String>,
+        latency_ms: Option<u64>,
+        next_due_at_ms: Option<u64>,
+    ) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.status = if self.consecutive_failures >= 3 {
+            McpHeartbeatStatus::Failed
+        } else {
+            McpHeartbeatStatus::Degraded
+        };
+        self.last_checked_at_ms = Some(now_ms);
+        self.last_failure_at_ms = Some(now_ms);
+        self.last_failure_reason = Some(sanitize_heartbeat_failure_reason(&reason.into()));
+        self.latency_ms = latency_ms;
+        self.next_due_at_ms = next_due_at_ms;
+        self.freshness = Some("degraded".to_string());
+    }
+
+    fn mark_shutdown(&mut self, status: McpHeartbeatStatus) {
+        self.status = status;
+        self.next_due_at_ms = None;
+        self.freshness = Some(
+            match status {
+                McpHeartbeatStatus::NotConfigured => "not_configured",
+                _ => "unknown",
+            }
+            .to_string(),
+        );
+        self.latency_ms = None;
+        self.mark_protocol_state(None, None);
     }
 }
 
@@ -665,6 +728,204 @@ fn unix_time_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn validate_mcp_timeout_ms(
+    server_name: &str,
+    method: &'static str,
+    timeout_ms: u64,
+) -> Result<u64, McpServerManagerError> {
+    if timeout_ms < MIN_MCP_TIMEOUT_MS || timeout_ms > MAX_MCP_TIMEOUT_MS {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!(
+                "timeout {timeout_ms} ms is outside supported range {MIN_MCP_TIMEOUT_MS}..={MAX_MCP_TIMEOUT_MS}"
+            ),
+        });
+    }
+    Ok(timeout_ms)
+}
+
+fn validate_mcp_heartbeat_interval_ms(
+    server_name: &str,
+    method: &'static str,
+    interval_ms: u64,
+) -> Result<u64, McpServerManagerError> {
+    if interval_ms < MIN_MCP_HEARTBEAT_INTERVAL_MS || interval_ms > MAX_MCP_HEARTBEAT_INTERVAL_MS {
+        return Err(McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method,
+            details: format!(
+                "heartbeat interval {interval_ms} ms is outside supported range {MIN_MCP_HEARTBEAT_INTERVAL_MS}..={MAX_MCP_HEARTBEAT_INTERVAL_MS}"
+            ),
+        });
+    }
+    Ok(interval_ms)
+}
+
+fn heartbeat_config_for_bootstrap(
+    server_name: &str,
+    bootstrap: &McpClientBootstrap,
+) -> Result<Option<(u64, u64)>, McpServerManagerError> {
+    match &bootstrap.transport {
+        McpClientTransport::Stdio(transport) => {
+            let interval_ms = resolve_stdio_heartbeat_env_u64(
+                server_name,
+                "heartbeatIntervalMs",
+                "CLAWD_MCP_HEARTBEAT_INTERVAL_MS",
+                transport.heartbeat_interval_ms,
+                &transport.env,
+                DEFAULT_MCP_HEARTBEAT_INTERVAL_MS,
+            )?;
+            let timeout_ms = resolve_stdio_heartbeat_env_u64(
+                server_name,
+                "heartbeatTimeoutMs",
+                "CLAWD_MCP_HEARTBEAT_TIMEOUT_MS",
+                transport.heartbeat_timeout_ms,
+                &transport.env,
+                DEFAULT_MCP_HEARTBEAT_TIMEOUT_MS,
+            )?;
+            validate_mcp_heartbeat_interval_ms(server_name, "bootstrap", interval_ms)?;
+            validate_mcp_timeout_ms(server_name, "bootstrap", timeout_ms)?;
+            Ok(Some((interval_ms, timeout_ms)))
+        }
+        McpClientTransport::Sse(transport) => {
+            let interval_ms = transport.resolved_heartbeat_interval_ms();
+            let timeout_ms = transport.resolved_heartbeat_timeout_ms();
+            validate_mcp_heartbeat_interval_ms(server_name, "bootstrap", interval_ms)?;
+            validate_mcp_timeout_ms(server_name, "bootstrap", timeout_ms)?;
+            Ok(Some((interval_ms, timeout_ms)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn resolve_stdio_heartbeat_env_u64(
+    server_name: &str,
+    field_name: &'static str,
+    env_name: &'static str,
+    configured_value: Option<u64>,
+    env: &BTreeMap<String, String>,
+    default_value: u64,
+) -> Result<u64, McpServerManagerError> {
+    if let Some(value) = configured_value {
+        return Ok(value);
+    }
+    let Some(raw) = env.get(env_name) else {
+        return Ok(default_value);
+    };
+    raw.parse::<u64>()
+        .map_err(|_| McpServerManagerError::InvalidResponse {
+            server_name: server_name.to_string(),
+            method: "bootstrap",
+            details: format!("field {field_name} from {env_name} must be an integer"),
+        })
+}
+
+fn sanitize_heartbeat_failure_reason(reason: &str) -> String {
+    let mut redacted = redact_sensitive_markers(reason);
+    redacted = redact_url_tokens(&redacted);
+    let char_count = redacted.chars().count();
+    if char_count <= MCP_MAX_HEARTBEAT_FAILURE_REASON_CHARS {
+        return redacted;
+    }
+    let keep = MCP_MAX_HEARTBEAT_FAILURE_REASON_CHARS.saturating_sub("…".chars().count());
+    let mut truncated = redacted.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn redact_sensitive_markers(value: &str) -> String {
+    let mut redacted = value.to_string();
+    for marker in [
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Proxy-Authorization: Bearer ",
+        "proxy-authorization: Bearer ",
+        "Bearer ",
+        "token=",
+        "access_token=",
+        "refresh_token=",
+        "api_key=",
+        "apikey=",
+        "key=",
+    ] {
+        redacted = redact_after_marker_until_delimiter(&redacted, marker);
+    }
+    redacted
+}
+
+fn redact_after_marker_until_delimiter(value: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.find(marker) {
+        let (before, after_before) = rest.split_at(index);
+        output.push_str(before);
+        output.push_str(marker);
+        output.push_str("<redacted>");
+        let after_marker = &after_before[marker.len()..];
+        let secret_end = after_marker
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, '\'' | '"' | ',' | '}' | ']' | '&' | ';'))
+                    .then_some(idx)
+            })
+            .unwrap_or(after_marker.len());
+        rest = &after_marker[secret_end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn redact_url_tokens(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(redact_url_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_url_token(token: &str) -> String {
+    let prefix_len = token
+        .chars()
+        .take_while(|ch| matches!(ch, '"' | '\'' | '(' | '[' | '{'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let suffix_len = token
+        .chars()
+        .rev()
+        .take_while(|ch| matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let end = token.len().saturating_sub(suffix_len);
+    let prefix = &token[..prefix_len.min(token.len())];
+    let core = &token[prefix_len.min(end)..end];
+    let suffix = &token[end..];
+    let Ok(url) = Url::parse(core) else {
+        return token.to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return token.to_string();
+    }
+    let Some(host) = url.host_str() else {
+        return token.to_string();
+    };
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let origin = url.port_or_known_default().map_or_else(
+        || format!("{}://{host}", url.scheme()),
+        |port| format!("{}://{host}:{port}", url.scheme()),
+    );
+    let query = url.query().map(|_| "?<redacted>").unwrap_or("");
+    format!("{prefix}{origin}{}{query}{suffix}", url.path())
 }
 
 #[derive(Debug)]
@@ -689,6 +950,7 @@ pub enum McpServerManagerError {
         server_name: String,
         method: &'static str,
         timeout_ms: u64,
+        elapsed_ms: u64,
     },
     UnknownTool {
         qualified_name: String,
@@ -749,9 +1011,10 @@ impl std::fmt::Display for McpServerManagerError {
                 server_name,
                 method,
                 timeout_ms,
+                elapsed_ms,
             } => write!(
                 f,
-                "MCP server `{server_name}` timed out after {timeout_ms} ms while handling {method}"
+                "MCP server `{server_name}` timed out after {elapsed_ms} ms while handling {method} (limit {timeout_ms} ms)"
             ),
             Self::UnknownTool { qualified_name } => {
                 write!(f, "unknown MCP tool `{qualified_name}`")
@@ -884,10 +1147,13 @@ impl McpServerManagerError {
                 server_name,
                 method,
                 timeout_ms,
+                elapsed_ms,
             } => BTreeMap::from([
                 ("server".to_string(), server_name.clone()),
                 ("method".to_string(), (*method).to_string()),
                 ("timeout_ms".to_string(), timeout_ms.to_string()),
+                ("limit_ms".to_string(), timeout_ms.to_string()),
+                ("elapsed_ms".to_string(), elapsed_ms.to_string()),
             ]),
             Self::UnknownTool { qualified_name } => {
                 BTreeMap::from([("qualified_tool".to_string(), qualified_name.clone())])
@@ -1041,6 +1307,13 @@ struct McpCatalogDiscoveryOutcome {
     degraded_capabilities: Vec<McpCapabilityDegradation>,
 }
 
+#[derive(Debug, Clone)]
+struct McpHeartbeatSchedule {
+    interval_ms: u64,
+    timeout_ms: u64,
+    next_due_at: Instant,
+}
+
 impl ManagedMcpServer {
     fn new(server_name: impl Into<String>, bootstrap: McpClientBootstrap, required: bool) -> Self {
         Self {
@@ -1058,8 +1331,11 @@ pub struct McpServerManager {
     servers: BTreeMap<String, ManagedMcpServer>,
     unsupported_servers: Vec<UnsupportedMcpServer>,
     heartbeat: BTreeMap<String, McpServerHeartbeat>,
+    heartbeat_schedule: BTreeMap<String, McpHeartbeatSchedule>,
     tool_index: BTreeMap<String, ToolRoute>,
     next_request_id: u64,
+    scheduler_origin: Instant,
+    scheduler_origin_epoch_ms: u64,
 }
 
 impl McpServerManager {
@@ -1073,6 +1349,9 @@ impl McpServerManager {
         let mut managed_servers = BTreeMap::new();
         let mut unsupported_servers = Vec::new();
         let mut heartbeat = BTreeMap::new();
+        let mut heartbeat_schedule = BTreeMap::new();
+        let scheduler_origin = Instant::now();
+        let scheduler_origin_epoch_ms = unix_time_ms();
 
         for (server_name, server_config) in servers {
             if matches!(
@@ -1080,17 +1359,50 @@ impl McpServerManager {
                 McpTransport::Stdio | McpTransport::Sse
             ) {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
-                let heartbeat_status = match &bootstrap.transport {
-                    McpClientTransport::Stdio(transport)
-                        if !transport.env.contains_key("CLAWD_MCP_HEARTBEAT_TIMEOUT_MS") =>
-                    {
-                        McpHeartbeatStatus::NotConfigured
+                let heartbeat_config = match heartbeat_config_for_bootstrap(server_name, &bootstrap)
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        unsupported_servers.push(UnsupportedMcpServer {
+                            server_name: server_name.clone(),
+                            transport: server_config.transport(),
+                            required: server_config.required,
+                            reason: error.to_string(),
+                        });
+                        let mut entry = McpServerHeartbeat::new(
+                            server_name.clone(),
+                            McpHeartbeatStatus::Failed,
+                            None,
+                            None,
+                            None,
+                        );
+                        entry.mark_failure(unix_time_ms(), error.to_string(), None, None);
+                        entry.status = McpHeartbeatStatus::Failed;
+                        entry.freshness = Some("failed".to_string());
+                        heartbeat.insert(server_name.clone(), entry);
+                        continue;
                     }
-                    _ => McpHeartbeatStatus::Unknown,
                 };
+                let heartbeat_status = McpHeartbeatStatus::Unknown;
+                if let Some((interval_ms, timeout_ms)) = heartbeat_config {
+                    heartbeat_schedule.insert(
+                        server_name.clone(),
+                        McpHeartbeatSchedule {
+                            interval_ms,
+                            timeout_ms,
+                            next_due_at: scheduler_origin,
+                        },
+                    );
+                }
                 heartbeat.insert(
                     server_name.clone(),
-                    McpServerHeartbeat::new(server_name.clone(), heartbeat_status),
+                    McpServerHeartbeat::new(
+                        server_name.clone(),
+                        heartbeat_status,
+                        heartbeat_config.map(|(interval_ms, _)| interval_ms),
+                        heartbeat_config.map(|(_, timeout_ms)| timeout_ms),
+                        heartbeat_config.map(|_| scheduler_origin_epoch_ms),
+                    ),
                 );
                 managed_servers.insert(
                     server_name.clone(),
@@ -1115,7 +1427,13 @@ impl McpServerManager {
                 });
                 heartbeat.insert(
                     server_name.clone(),
-                    McpServerHeartbeat::new(server_name.clone(), McpHeartbeatStatus::NotConfigured),
+                    McpServerHeartbeat::new(
+                        server_name.clone(),
+                        McpHeartbeatStatus::NotConfigured,
+                        None,
+                        None,
+                        None,
+                    ),
                 );
             }
         }
@@ -1124,8 +1442,11 @@ impl McpServerManager {
             servers: managed_servers,
             unsupported_servers,
             heartbeat,
+            heartbeat_schedule,
             tool_index: BTreeMap::new(),
             next_request_id: 1,
+            scheduler_origin,
+            scheduler_origin_epoch_ms,
         }
     }
 
@@ -1141,7 +1462,156 @@ impl McpServerManager {
 
     #[must_use]
     pub fn heartbeat_report(&self) -> Vec<McpServerHeartbeat> {
-        self.heartbeat.values().cloned().collect()
+        self.heartbeat_report_at(Instant::now())
+    }
+
+    fn heartbeat_report_at(&self, now: Instant) -> Vec<McpServerHeartbeat> {
+        self.heartbeat
+            .values()
+            .cloned()
+            .map(|mut heartbeat| {
+                if heartbeat.status == McpHeartbeatStatus::Healthy
+                    && self
+                        .heartbeat_schedule
+                        .get(&heartbeat.server_name)
+                        .is_some_and(|schedule| now >= schedule.next_due_at)
+                {
+                    heartbeat.status = McpHeartbeatStatus::Stale;
+                    heartbeat.freshness = Some("stale".to_string());
+                }
+                heartbeat
+            })
+            .collect()
+    }
+
+    pub async fn run_heartbeats(
+        &mut self,
+    ) -> Result<Vec<McpServerHeartbeat>, McpServerManagerError> {
+        self.refresh_due_heartbeats(Instant::now()).await
+    }
+
+    pub async fn run_due_heartbeats(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<McpServerHeartbeat>, McpServerManagerError> {
+        self.refresh_due_heartbeats(now).await
+    }
+
+    pub async fn refresh_due_heartbeats(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<McpServerHeartbeat>, McpServerManagerError> {
+        let due_servers = self
+            .heartbeat_schedule
+            .iter()
+            .filter_map(|(server_name, schedule)| {
+                (now >= schedule.next_due_at).then(|| server_name.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for server_name in due_servers {
+            match self
+                .check_server_heartbeat_at(&server_name, Instant::now())
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if Self::is_heartbeat_validation_error(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+
+        Ok(self.heartbeat_report())
+    }
+
+    pub async fn refresh_due_heartbeat_for_server(
+        &mut self,
+        server_name: &str,
+        now: Instant,
+    ) -> Result<(), McpServerManagerError> {
+        let Some(schedule) = self.heartbeat_schedule.get(server_name) else {
+            return Ok(());
+        };
+        if now < schedule.next_due_at {
+            return Ok(());
+        }
+        match self
+            .check_server_heartbeat_at(server_name, Instant::now())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_heartbeat_validation_error(&error) => Err(error),
+            Err(_) => Ok(()),
+        }
+    }
+
+    pub async fn check_server_heartbeat(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        self.check_server_heartbeat_at(server_name, Instant::now())
+            .await
+    }
+
+    pub async fn check_server_heartbeat_at(
+        &mut self,
+        server_name: &str,
+        now: Instant,
+    ) -> Result<(), McpServerManagerError> {
+        let Some(schedule) = self.heartbeat_schedule.get(server_name).cloned() else {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "ping",
+                details: "heartbeat is not configured for this server".to_string(),
+            });
+        };
+        validate_mcp_heartbeat_interval_ms(server_name, "ping", schedule.interval_ms)?;
+        validate_mcp_timeout_ms(server_name, "ping", schedule.timeout_ms)?;
+
+        let attempt_epoch_ms = self.epoch_ms_for_instant(now);
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat.mark_attempt(attempt_epoch_ms);
+        }
+        let started = Instant::now();
+        let result = self
+            .ping_server_with_timeout(server_name, schedule.timeout_ms)
+            .await;
+        let elapsed_ms = duration_ms_saturating(started.elapsed());
+        let completed_at = Instant::now();
+        let completed_epoch_ms = self.epoch_ms_for_instant(completed_at);
+        let next_due_at = completed_at
+            .checked_add(Duration::from_millis(schedule.interval_ms))
+            .unwrap_or(completed_at);
+        let next_due_epoch_ms = self.epoch_ms_for_instant(next_due_at);
+        if let Some(schedule) = self.heartbeat_schedule.get_mut(server_name) {
+            schedule.next_due_at = next_due_at;
+        }
+
+        match result {
+            Ok(()) => {
+                if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+                    heartbeat.mark_success(
+                        completed_epoch_ms,
+                        Some(elapsed_ms),
+                        Some(next_due_epoch_ms),
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if Self::should_reset_server(&error) {
+                    let _ = self.reset_server(server_name).await;
+                }
+                if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+                    heartbeat.mark_failure(
+                        completed_epoch_ms,
+                        error.to_string(),
+                        Some(elapsed_ms),
+                        Some(next_due_epoch_ms),
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     #[must_use]
@@ -1346,7 +1816,7 @@ impl McpServerManager {
                 method: "tools/call",
                 details: format!("SSE worker task failed: {error}"),
             })?;
-            self.record_heartbeat_result(&route.server_name, &response);
+            self.record_heartbeat_jsonrpc_result(&route.server_name, "tools/call", &response);
             self.clear_catalog_if_initialize_failed(&route.server_name, &response)?;
             if let Ok(response) = &response {
                 Self::validate_json_size(
@@ -1390,6 +1860,7 @@ impl McpServerManager {
                 .await
             };
 
+        self.record_heartbeat_jsonrpc_result(&route.server_name, "tools/call", &response);
         if let Err(error) = &response {
             if Self::should_reset_server(error) {
                 self.reset_server(&route.server_name).await?;
@@ -1542,7 +2013,12 @@ impl McpServerManager {
             server.catalog.protocol_transport_policy = None;
             server.catalog.protocol_configured_preferred = false;
             if let Some(heartbeat) = self.heartbeat.get_mut(&server_name) {
-                heartbeat.mark_protocol_state(None, None);
+                heartbeat.mark_shutdown(McpHeartbeatStatus::Unknown);
+            }
+        }
+        for unsupported in &self.unsupported_servers {
+            if let Some(heartbeat) = self.heartbeat.get_mut(&unsupported.server_name) {
+                heartbeat.mark_shutdown(McpHeartbeatStatus::NotConfigured);
             }
         }
         Ok(())
@@ -1606,16 +2082,41 @@ impl McpServerManager {
                     server_name: server_name.to_string(),
                 })?;
         match &server.bootstrap.transport {
-            McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
-            McpClientTransport::Sse(transport) => Ok(transport
-                .tool_call_timeout_ms
-                .unwrap_or(MCP_LIST_TOOLS_TIMEOUT_MS)),
+            McpClientTransport::Stdio(transport) => validate_mcp_timeout_ms(
+                server_name,
+                "tools/call",
+                transport.resolved_tool_call_timeout_ms(),
+            ),
+            McpClientTransport::Sse(transport) => validate_mcp_timeout_ms(
+                server_name,
+                "tools/call",
+                transport.resolved_tool_call_timeout_ms(),
+            ),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
                 details: format!("unsupported MCP transport for stdio manager: {other:?}"),
             }),
         }
+    }
+
+    fn epoch_ms_for_instant(&self, instant: Instant) -> u64 {
+        if instant >= self.scheduler_origin {
+            self.scheduler_origin_epoch_ms
+                .saturating_add(duration_ms_saturating(
+                    instant.duration_since(self.scheduler_origin),
+                ))
+        } else {
+            self.scheduler_origin_epoch_ms
+        }
+    }
+
+    fn next_due_epoch_after(&self, server_name: &str, now: Instant) -> Option<u64> {
+        let schedule = self.heartbeat_schedule.get(server_name)?;
+        let next_due_at = now
+            .checked_add(Duration::from_millis(schedule.interval_ms))
+            .unwrap_or(now);
+        Some(self.epoch_ms_for_instant(next_due_at))
     }
 
     fn record_heartbeat_result<T>(
@@ -1625,19 +2126,139 @@ impl McpServerManager {
     ) {
         match result {
             Ok(_) => self.record_heartbeat_success(server_name),
-            Err(error) => self.record_heartbeat_failure(server_name, error.to_string()),
+            Err(error) if Self::is_heartbeat_transport_failure(error) => {
+                self.record_heartbeat_failure(server_name, error.to_string());
+            }
+            Err(_) => self.record_heartbeat_success(server_name),
+        }
+    }
+
+    fn record_heartbeat_jsonrpc_result<T>(
+        &mut self,
+        server_name: &str,
+        method: &'static str,
+        result: &Result<JsonRpcResponse<T>, McpServerManagerError>,
+    ) {
+        match result {
+            Ok(response) => {
+                if let Some(error) = &response.error {
+                    if matches!(method, "initialize" | "ping") {
+                        self.record_heartbeat_failure(
+                            server_name,
+                            format!(
+                                "MCP server `{server_name}` returned JSON-RPC error for {method}: {} ({})",
+                                error.message, error.code
+                            ),
+                        );
+                    } else {
+                        self.record_heartbeat_success(server_name);
+                    }
+                } else {
+                    self.record_heartbeat_success(server_name);
+                }
+            }
+            Err(error) if Self::is_heartbeat_transport_failure(error) => {
+                self.record_heartbeat_failure(server_name, error.to_string());
+            }
+            Err(_) => self.record_heartbeat_success(server_name),
+        }
+    }
+
+    fn is_heartbeat_transport_failure(error: &McpServerManagerError) -> bool {
+        match error {
+            McpServerManagerError::JsonRpc { method, .. } => {
+                matches!(*method, "initialize" | "ping")
+            }
+            McpServerManagerError::Transport { .. }
+            | McpServerManagerError::InvalidResponse { .. }
+            | McpServerManagerError::Timeout { .. }
+            | McpServerManagerError::LimitExceeded { .. }
+            | McpServerManagerError::Io(_) => true,
+            McpServerManagerError::UnknownTool { .. }
+            | McpServerManagerError::UnknownResource { .. }
+            | McpServerManagerError::UnknownPrompt { .. }
+            | McpServerManagerError::UnknownServer { .. }
+            | McpServerManagerError::UnsupportedCapability { .. } => false,
+        }
+    }
+
+    fn record_heartbeat_initialize_result<T>(
+        &mut self,
+        server_name: &str,
+        result: &Result<JsonRpcResponse<T>, McpServerManagerError>,
+    ) {
+        match result {
+            Ok(response) => {
+                if let Some(error) = &response.error {
+                    self.record_heartbeat_failure(
+                        server_name,
+                        format!(
+                            "MCP server `{server_name}` returned JSON-RPC error for initialize: {} ({})",
+                            error.message, error.code
+                        ),
+                    );
+                } else {
+                    self.record_heartbeat_success(server_name);
+                }
+            }
+            Err(error) if Self::is_heartbeat_transport_failure(error) => {
+                self.record_heartbeat_failure(server_name, error.to_string());
+            }
+            Err(_) => self.record_heartbeat_success(server_name),
         }
     }
 
     fn record_heartbeat_success(&mut self, server_name: &str) {
+        let now = Instant::now();
+        let now_ms = self.epoch_ms_for_instant(now);
+        let next_due_at_ms = self.next_due_epoch_after(server_name, now);
         if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
-            heartbeat.mark_success();
+            heartbeat.mark_success(now_ms, None, next_due_at_ms);
+        }
+        if let Some(schedule) = self.heartbeat_schedule.get_mut(server_name) {
+            schedule.next_due_at = now
+                .checked_add(Duration::from_millis(schedule.interval_ms))
+                .unwrap_or(now);
+        }
+    }
+
+    fn record_heartbeat_preflight_success(&mut self, server_name: &str) {
+        let now = Instant::now();
+        let now_ms = self.epoch_ms_for_instant(now);
+        let next_due_at_ms = self.next_due_epoch_after(server_name, now);
+        if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
+            heartbeat.last_checked_at_ms = Some(now_ms);
+            heartbeat.last_success_at_ms = Some(now_ms);
+            heartbeat.latency_ms = None;
+            heartbeat.next_due_at_ms = next_due_at_ms;
+            if !matches!(
+                heartbeat.status,
+                McpHeartbeatStatus::Degraded | McpHeartbeatStatus::Failed
+            ) {
+                heartbeat.status = McpHeartbeatStatus::Healthy;
+                heartbeat.consecutive_failures = 0;
+                heartbeat.last_failure_reason = None;
+                heartbeat.freshness = Some("fresh".to_string());
+            }
+        }
+        if let Some(schedule) = self.heartbeat_schedule.get_mut(server_name) {
+            schedule.next_due_at = now
+                .checked_add(Duration::from_millis(schedule.interval_ms))
+                .unwrap_or(now);
         }
     }
 
     fn record_heartbeat_failure(&mut self, server_name: &str, reason: impl Into<String>) {
+        let now = Instant::now();
+        let now_ms = self.epoch_ms_for_instant(now);
+        let next_due_at_ms = self.next_due_epoch_after(server_name, now);
         if let Some(heartbeat) = self.heartbeat.get_mut(server_name) {
-            heartbeat.mark_failure(reason);
+            heartbeat.mark_failure(now_ms, reason, None, next_due_at_ms);
+        }
+        if let Some(schedule) = self.heartbeat_schedule.get_mut(server_name) {
+            schedule.next_due_at = now
+                .checked_add(Duration::from_millis(schedule.interval_ms))
+                .unwrap_or(now);
         }
     }
 
@@ -2298,12 +2919,10 @@ impl McpServerManager {
             match self.discover_tools_for_server_once(server_name).await {
                 Ok(tools) => return Ok(tools),
                 Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
-                    self.record_heartbeat_failure(server_name, error.to_string());
                     self.reset_server(server_name).await?;
                     attempts += 1;
                 }
                 Err(error) => {
-                    self.record_heartbeat_failure(server_name, error.to_string());
                     if Self::should_reset_server(&error) {
                         self.reset_server(server_name).await?;
                     }
@@ -2326,116 +2945,124 @@ impl McpServerManager {
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Tools)?;
         self.ping_if_configured(server_name).await?;
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
 
-        let mut discovered_tools = Vec::new();
-        let mut cursor = None;
-        let mut page_count = 0;
-        let mut total_json_bytes = 0_usize;
-        let mut seen_cursors = BTreeSet::new();
-        let mut seen_names = BTreeSet::new();
-        loop {
-            Self::validate_page_limit(server_name, "tools/list", page_count)?;
-            page_count += 1;
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
+        let operation = async {
+            let mut discovered_tools = Vec::new();
+            let mut cursor = None;
+            let mut page_count = 0;
+            let mut total_json_bytes = 0_usize;
+            let mut seen_cursors = BTreeSet::new();
+            let mut seen_names = BTreeSet::new();
+            loop {
+                Self::validate_page_limit(server_name, "tools/list", page_count)?;
+                page_count += 1;
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "tools/list",
+                            details: "server process missing after initialization".to_string(),
+                        }
+                    })?;
+                    Self::run_process_request(
+                        server_name,
+                        "tools/list",
+                        timeout_ms,
+                        process.list_tools(
+                            request_id,
+                            Some(McpListToolsParams {
+                                cursor: cursor.clone(),
+                            }),
+                        ),
+                    )
+                    .await?
+                };
+
+                if let Some(error) = response.error {
+                    return Err(McpServerManagerError::JsonRpc {
                         server_name: server_name.to_string(),
                         method: "tools/list",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
-                    server_name,
-                    "tools/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_tools(
-                        request_id,
-                        Some(McpListToolsParams {
-                            cursor: cursor.clone(),
-                        }),
-                    ),
-                )
-                .await?
-            };
+                        error,
+                    });
+                }
 
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "tools/list",
-                    error,
-                });
-            }
+                let result =
+                    response
+                        .result
+                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "tools/list",
+                            details: "missing result payload".to_string(),
+                        })?;
 
-            let result = response
-                .result
-                .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "tools/list",
-                    details: "missing result payload".to_string(),
-                })?;
-
-            let page_json = Self::json_size(server_name, "tools/list", &result)?;
-            Self::validate_json_size(
-                server_name,
-                "tools/list",
-                &result,
-                MCP_MAX_RESULT_JSON_BYTES,
-                "tools/list page JSON",
-            )?;
-            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
-            Self::validate_aggregate_json_size(server_name, "tools/list", total_json_bytes)?;
-
-            for tool in &result.tools {
+                let page_json = Self::json_size(server_name, "tools/list", &result)?;
                 Self::validate_json_size(
                     server_name,
                     "tools/list",
-                    tool,
-                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                    "tool catalog item JSON",
+                    &result,
+                    MCP_MAX_RESULT_JSON_BYTES,
+                    "tools/list page JSON",
                 )?;
-                if !seen_names.insert(tool.name.clone()) {
-                    return Err(Self::duplicate_catalog_item(
+                total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+                Self::validate_aggregate_json_size(server_name, "tools/list", total_json_bytes)?;
+
+                for tool in &result.tools {
+                    Self::validate_json_size(
                         server_name,
                         "tools/list",
-                        "tool name",
-                        &tool.name,
-                    ));
+                        tool,
+                        MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                        "tool catalog item JSON",
+                    )?;
+                    if !seen_names.insert(tool.name.clone()) {
+                        return Err(Self::duplicate_catalog_item(
+                            server_name,
+                            "tools/list",
+                            "tool name",
+                            &tool.name,
+                        ));
+                    }
+                }
+
+                for tool in result.tools {
+                    let qualified_name = mcp_tool_name(server_name, &tool.name);
+                    discovered_tools.push(ManagedMcpTool {
+                        server_name: server_name.to_string(),
+                        qualified_name,
+                        raw_name: tool.name.clone(),
+                        tool,
+                    });
+                }
+                Self::validate_total_items(server_name, "tools/list", discovered_tools.len())?;
+
+                match result.next_cursor {
+                    Some(next_cursor) => {
+                        cursor = Some(Self::validate_next_cursor(
+                            server_name,
+                            "tools/list",
+                            next_cursor,
+                            &mut seen_cursors,
+                        )?);
+                    }
+                    None => break,
                 }
             }
 
-            for tool in result.tools {
-                let qualified_name = mcp_tool_name(server_name, &tool.name);
-                discovered_tools.push(ManagedMcpTool {
-                    server_name: server_name.to_string(),
-                    qualified_name,
-                    raw_name: tool.name.clone(),
-                    tool,
-                });
-            }
-            Self::validate_total_items(server_name, "tools/list", discovered_tools.len())?;
-
-            match result.next_cursor {
-                Some(next_cursor) => {
-                    cursor = Some(Self::validate_next_cursor(
-                        server_name,
-                        "tools/list",
-                        next_cursor,
-                        &mut seen_cursors,
-                    )?);
-                }
-                None => break,
-            }
+            Self::validate_json_size(
+                server_name,
+                "tools/list",
+                &discovered_tools,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "tools/list aggregate JSON",
+            )?;
+            Ok(discovered_tools)
         }
-
-        Self::validate_json_size(
-            server_name,
-            "tools/list",
-            &discovered_tools,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "tools/list aggregate JSON",
-        )?;
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        let discovered_tools = operation?;
         self.update_tool_catalog(server_name, discovered_tools.clone())?;
         Ok(discovered_tools)
     }
@@ -2514,112 +3141,125 @@ impl McpServerManager {
 
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
+        self.ping_if_configured(server_name).await?;
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
 
-        let mut resources = Vec::new();
-        let mut cursor = None;
-        let mut page_count = 0;
-        let mut total_json_bytes = 0_usize;
-        let mut seen_cursors = BTreeSet::new();
-        let mut seen_uris = BTreeSet::new();
-        loop {
-            Self::validate_page_limit(server_name, "resources/list", page_count)?;
-            page_count += 1;
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
+        let operation = async {
+            let mut resources = Vec::new();
+            let mut cursor = None;
+            let mut page_count = 0;
+            let mut total_json_bytes = 0_usize;
+            let mut seen_cursors = BTreeSet::new();
+            let mut seen_uris = BTreeSet::new();
+            loop {
+                Self::validate_page_limit(server_name, "resources/list", page_count)?;
+                page_count += 1;
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "resources/list",
+                            details: "server process missing after initialization".to_string(),
+                        }
+                    })?;
+                    Self::run_process_request(
+                        server_name,
+                        "resources/list",
+                        timeout_ms,
+                        process.list_resources(
+                            request_id,
+                            Some(McpListResourcesParams {
+                                cursor: cursor.clone(),
+                            }),
+                        ),
+                    )
+                    .await?
+                };
+
+                if let Some(error) = response.error {
+                    return Err(McpServerManagerError::JsonRpc {
                         server_name: server_name.to_string(),
                         method: "resources/list",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
+                        error,
+                    });
+                }
+
+                let result =
+                    response
+                        .result
+                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "resources/list",
+                            details: "missing result payload".to_string(),
+                        })?;
+
+                let page_json = Self::json_size(server_name, "resources/list", &result)?;
+                Self::validate_json_size(
                     server_name,
                     "resources/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_resources(
-                        request_id,
-                        Some(McpListResourcesParams {
-                            cursor: cursor.clone(),
-                        }),
-                    ),
-                )
-                .await?
-            };
+                    &result,
+                    MCP_MAX_RESULT_JSON_BYTES,
+                    "resources/list page JSON",
+                )?;
+                total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+                Self::validate_aggregate_json_size(
+                    server_name,
+                    "resources/list",
+                    total_json_bytes,
+                )?;
 
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "resources/list",
-                    error,
-                });
+                for resource in &result.resources {
+                    Self::validate_json_size(
+                        server_name,
+                        "resources/list",
+                        resource,
+                        MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                        "resource catalog item JSON",
+                    )?;
+                    if !seen_uris.insert(resource.uri.clone()) {
+                        return Err(Self::duplicate_catalog_item(
+                            server_name,
+                            "resources/list",
+                            "resource uri",
+                            &resource.uri,
+                        ));
+                    }
+                }
+
+                resources.extend(result.resources);
+                Self::validate_total_items(server_name, "resources/list", resources.len())?;
+
+                match result.next_cursor {
+                    Some(next_cursor) => {
+                        cursor = Some(Self::validate_next_cursor(
+                            server_name,
+                            "resources/list",
+                            next_cursor,
+                            &mut seen_cursors,
+                        )?);
+                    }
+                    None => break,
+                }
             }
 
-            let result = response
-                .result
-                .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "resources/list",
-                    details: "missing result payload".to_string(),
-                })?;
-
-            let page_json = Self::json_size(server_name, "resources/list", &result)?;
+            let result = McpListResourcesResult {
+                resources,
+                next_cursor: None,
+            };
             Self::validate_json_size(
                 server_name,
                 "resources/list",
                 &result,
                 MCP_MAX_RESULT_JSON_BYTES,
-                "resources/list page JSON",
+                "resources/list aggregate JSON",
             )?;
-            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
-            Self::validate_aggregate_json_size(server_name, "resources/list", total_json_bytes)?;
-
-            for resource in &result.resources {
-                Self::validate_json_size(
-                    server_name,
-                    "resources/list",
-                    resource,
-                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                    "resource catalog item JSON",
-                )?;
-                if !seen_uris.insert(resource.uri.clone()) {
-                    return Err(Self::duplicate_catalog_item(
-                        server_name,
-                        "resources/list",
-                        "resource uri",
-                        &resource.uri,
-                    ));
-                }
-            }
-
-            resources.extend(result.resources);
-            Self::validate_total_items(server_name, "resources/list", resources.len())?;
-
-            match result.next_cursor {
-                Some(next_cursor) => {
-                    cursor = Some(Self::validate_next_cursor(
-                        server_name,
-                        "resources/list",
-                        next_cursor,
-                        &mut seen_cursors,
-                    )?);
-                }
-                None => break,
-            }
+            Ok(result)
         }
-
-        let result = McpListResourcesResult {
-            resources,
-            next_cursor: None,
-        };
-        Self::validate_json_size(
-            server_name,
-            "resources/list",
-            &result,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "resources/list aggregate JSON",
-        )?;
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        let result = operation?;
         self.update_resource_catalog(server_name, result.resources.clone())?;
         Ok(result)
     }
@@ -2653,120 +3293,129 @@ impl McpServerManager {
 
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::ResourceTemplates)?;
+        self.ping_if_configured(server_name).await?;
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
 
-        let mut resource_templates = Vec::new();
-        let mut cursor = None;
-        let mut page_count = 0;
-        let mut total_json_bytes = 0_usize;
-        let mut seen_cursors = BTreeSet::new();
-        let mut seen_templates = BTreeSet::new();
-        loop {
-            Self::validate_page_limit(server_name, "resources/templates/list", page_count)?;
-            page_count += 1;
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
+        let operation = async {
+            let mut resource_templates = Vec::new();
+            let mut cursor = None;
+            let mut page_count = 0;
+            let mut total_json_bytes = 0_usize;
+            let mut seen_cursors = BTreeSet::new();
+            let mut seen_templates = BTreeSet::new();
+            loop {
+                Self::validate_page_limit(server_name, "resources/templates/list", page_count)?;
+                page_count += 1;
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "resources/templates/list",
+                            details: "server process missing after initialization".to_string(),
+                        }
+                    })?;
+                    Self::run_process_request(
+                        server_name,
+                        "resources/templates/list",
+                        timeout_ms,
+                        process.list_resource_templates(
+                            request_id,
+                            Some(McpListResourceTemplatesParams {
+                                cursor: cursor.clone(),
+                            }),
+                        ),
+                    )
+                    .await?
+                };
+
+                if let Some(error) = response.error {
+                    return Err(McpServerManagerError::JsonRpc {
                         server_name: server_name.to_string(),
                         method: "resources/templates/list",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
+                        error,
+                    });
+                }
+
+                let result =
+                    response
+                        .result
+                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "resources/templates/list",
+                            details: "missing result payload".to_string(),
+                        })?;
+
+                let page_json = Self::json_size(server_name, "resources/templates/list", &result)?;
+                Self::validate_json_size(
                     server_name,
                     "resources/templates/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_resource_templates(
-                        request_id,
-                        Some(McpListResourceTemplatesParams {
-                            cursor: cursor.clone(),
-                        }),
-                    ),
-                )
-                .await?
-            };
+                    &result,
+                    MCP_MAX_RESULT_JSON_BYTES,
+                    "resources/templates/list page JSON",
+                )?;
+                total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+                Self::validate_aggregate_json_size(
+                    server_name,
+                    "resources/templates/list",
+                    total_json_bytes,
+                )?;
 
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "resources/templates/list",
-                    error,
-                });
+                for template in &result.resource_templates {
+                    Self::validate_json_size(
+                        server_name,
+                        "resources/templates/list",
+                        template,
+                        MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                        "resource template catalog item JSON",
+                    )?;
+                    if !seen_templates.insert(template.uri_template.clone()) {
+                        return Err(Self::duplicate_catalog_item(
+                            server_name,
+                            "resources/templates/list",
+                            "resource template uriTemplate",
+                            &template.uri_template,
+                        ));
+                    }
+                }
+
+                resource_templates.extend(result.resource_templates);
+                Self::validate_total_items(
+                    server_name,
+                    "resources/templates/list",
+                    resource_templates.len(),
+                )?;
+
+                match result.next_cursor {
+                    Some(next_cursor) => {
+                        cursor = Some(Self::validate_next_cursor(
+                            server_name,
+                            "resources/templates/list",
+                            next_cursor,
+                            &mut seen_cursors,
+                        )?);
+                    }
+                    None => break,
+                }
             }
 
-            let result = response
-                .result
-                .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "resources/templates/list",
-                    details: "missing result payload".to_string(),
-                })?;
-
-            let page_json = Self::json_size(server_name, "resources/templates/list", &result)?;
+            let result = McpListResourceTemplatesResult {
+                resource_templates,
+                next_cursor: None,
+            };
             Self::validate_json_size(
                 server_name,
                 "resources/templates/list",
                 &result,
                 MCP_MAX_RESULT_JSON_BYTES,
-                "resources/templates/list page JSON",
+                "resources/templates/list aggregate JSON",
             )?;
-            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
-            Self::validate_aggregate_json_size(
-                server_name,
-                "resources/templates/list",
-                total_json_bytes,
-            )?;
-
-            for template in &result.resource_templates {
-                Self::validate_json_size(
-                    server_name,
-                    "resources/templates/list",
-                    template,
-                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                    "resource template catalog item JSON",
-                )?;
-                if !seen_templates.insert(template.uri_template.clone()) {
-                    return Err(Self::duplicate_catalog_item(
-                        server_name,
-                        "resources/templates/list",
-                        "resource template uriTemplate",
-                        &template.uri_template,
-                    ));
-                }
-            }
-
-            resource_templates.extend(result.resource_templates);
-            Self::validate_total_items(
-                server_name,
-                "resources/templates/list",
-                resource_templates.len(),
-            )?;
-
-            match result.next_cursor {
-                Some(next_cursor) => {
-                    cursor = Some(Self::validate_next_cursor(
-                        server_name,
-                        "resources/templates/list",
-                        next_cursor,
-                        &mut seen_cursors,
-                    )?);
-                }
-                None => break,
-            }
+            Ok(result)
         }
-
-        let result = McpListResourceTemplatesResult {
-            resource_templates,
-            next_cursor: None,
-        };
-        Self::validate_json_size(
-            server_name,
-            "resources/templates/list",
-            &result,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "resources/templates/list aggregate JSON",
-        )?;
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        let result = operation?;
         self.update_resource_template_catalog(server_name, result.resource_templates.clone())?;
         Ok(result)
     }
@@ -2798,10 +3447,12 @@ impl McpServerManager {
 
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Resources)?;
+        self.ping_if_configured(server_name).await?;
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
 
-        let request_id = self.take_request_id();
-        let response =
-            {
+        let operation = async {
+            let request_id = self.take_request_id();
+            let response = {
                 let server = self.server_mut(server_name)?;
                 let process = server.process.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
@@ -2813,7 +3464,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "resources/read",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    timeout_ms,
                     process.read_resource(
                         request_id,
                         McpReadResourceParams {
@@ -2824,49 +3475,53 @@ impl McpServerManager {
                 .await?
             };
 
-        if let Some(error) = response.error {
-            return Err(McpServerManagerError::JsonRpc {
-                server_name: server_name.to_string(),
-                method: "resources/read",
-                error,
-            });
-        }
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "resources/read",
+                    error,
+                });
+            }
 
-        let result = response
-            .result
-            .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                server_name: server_name.to_string(),
-                method: "resources/read",
-                details: "missing result payload".to_string(),
-            })?;
-        if result.contents.len() > MCP_MAX_RESOURCE_CONTENTS {
-            return Err(McpServerManagerError::LimitExceeded {
-                server_name: server_name.to_string(),
-                method: "resources/read",
-                limit: MCP_MAX_RESOURCE_CONTENTS,
-                details: format!(
-                    "server returned {} resource contents",
-                    result.contents.len()
-                ),
-            });
-        }
-        Self::validate_json_size(
-            server_name,
-            "resources/read",
-            &result,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "resources/read result JSON",
-        )?;
-        for content in &result.contents {
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/read",
+                    details: "missing result payload".to_string(),
+                })?;
+            if result.contents.len() > MCP_MAX_RESOURCE_CONTENTS {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: server_name.to_string(),
+                    method: "resources/read",
+                    limit: MCP_MAX_RESOURCE_CONTENTS,
+                    details: format!(
+                        "server returned {} resource contents",
+                        result.contents.len()
+                    ),
+                });
+            }
             Self::validate_json_size(
                 server_name,
                 "resources/read",
-                content,
-                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                "resource content JSON",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "resources/read result JSON",
             )?;
+            for content in &result.contents {
+                Self::validate_json_size(
+                    server_name,
+                    "resources/read",
+                    content,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "resource content JSON",
+                )?;
+            }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        operation
     }
 
     async fn list_prompts_once(
@@ -2895,112 +3550,121 @@ impl McpServerManager {
 
         self.ensure_server_ready(server_name).await?;
         self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
+        self.ping_if_configured(server_name).await?;
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
 
-        let mut prompts = Vec::new();
-        let mut cursor = None;
-        let mut page_count = 0;
-        let mut total_json_bytes = 0_usize;
-        let mut seen_cursors = BTreeSet::new();
-        let mut seen_names = BTreeSet::new();
-        loop {
-            Self::validate_page_limit(server_name, "prompts/list", page_count)?;
-            page_count += 1;
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
+        let operation = async {
+            let mut prompts = Vec::new();
+            let mut cursor = None;
+            let mut page_count = 0;
+            let mut total_json_bytes = 0_usize;
+            let mut seen_cursors = BTreeSet::new();
+            let mut seen_names = BTreeSet::new();
+            loop {
+                Self::validate_page_limit(server_name, "prompts/list", page_count)?;
+                page_count += 1;
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "prompts/list",
+                            details: "server process missing after initialization".to_string(),
+                        }
+                    })?;
+                    Self::run_process_request(
+                        server_name,
+                        "prompts/list",
+                        timeout_ms,
+                        process.list_prompts(
+                            request_id,
+                            Some(McpListPromptsParams {
+                                cursor: cursor.clone(),
+                            }),
+                        ),
+                    )
+                    .await?
+                };
+
+                if let Some(error) = response.error {
+                    return Err(McpServerManagerError::JsonRpc {
                         server_name: server_name.to_string(),
                         method: "prompts/list",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
+                        error,
+                    });
+                }
+
+                let result =
+                    response
+                        .result
+                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "prompts/list",
+                            details: "missing result payload".to_string(),
+                        })?;
+
+                let page_json = Self::json_size(server_name, "prompts/list", &result)?;
+                Self::validate_json_size(
                     server_name,
                     "prompts/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_prompts(
-                        request_id,
-                        Some(McpListPromptsParams {
-                            cursor: cursor.clone(),
-                        }),
-                    ),
-                )
-                .await?
-            };
+                    &result,
+                    MCP_MAX_RESULT_JSON_BYTES,
+                    "prompts/list page JSON",
+                )?;
+                total_json_bytes = total_json_bytes.saturating_add(page_json.len());
+                Self::validate_aggregate_json_size(server_name, "prompts/list", total_json_bytes)?;
 
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "prompts/list",
-                    error,
-                });
+                for prompt in &result.prompts {
+                    Self::validate_json_size(
+                        server_name,
+                        "prompts/list",
+                        prompt,
+                        MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                        "prompt catalog item JSON",
+                    )?;
+                    if !seen_names.insert(prompt.name.clone()) {
+                        return Err(Self::duplicate_catalog_item(
+                            server_name,
+                            "prompts/list",
+                            "prompt name",
+                            &prompt.name,
+                        ));
+                    }
+                }
+
+                prompts.extend(result.prompts);
+                Self::validate_total_items(server_name, "prompts/list", prompts.len())?;
+
+                match result.next_cursor {
+                    Some(next_cursor) => {
+                        cursor = Some(Self::validate_next_cursor(
+                            server_name,
+                            "prompts/list",
+                            next_cursor,
+                            &mut seen_cursors,
+                        )?);
+                    }
+                    None => break,
+                }
             }
 
-            let result = response
-                .result
-                .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "prompts/list",
-                    details: "missing result payload".to_string(),
-                })?;
-
-            let page_json = Self::json_size(server_name, "prompts/list", &result)?;
+            let result = McpListPromptsResult {
+                prompts,
+                next_cursor: None,
+            };
             Self::validate_json_size(
                 server_name,
                 "prompts/list",
                 &result,
                 MCP_MAX_RESULT_JSON_BYTES,
-                "prompts/list page JSON",
+                "prompts/list aggregate JSON",
             )?;
-            total_json_bytes = total_json_bytes.saturating_add(page_json.len());
-            Self::validate_aggregate_json_size(server_name, "prompts/list", total_json_bytes)?;
-
-            for prompt in &result.prompts {
-                Self::validate_json_size(
-                    server_name,
-                    "prompts/list",
-                    prompt,
-                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                    "prompt catalog item JSON",
-                )?;
-                if !seen_names.insert(prompt.name.clone()) {
-                    return Err(Self::duplicate_catalog_item(
-                        server_name,
-                        "prompts/list",
-                        "prompt name",
-                        &prompt.name,
-                    ));
-                }
-            }
-
-            prompts.extend(result.prompts);
-            Self::validate_total_items(server_name, "prompts/list", prompts.len())?;
-
-            match result.next_cursor {
-                Some(next_cursor) => {
-                    cursor = Some(Self::validate_next_cursor(
-                        server_name,
-                        "prompts/list",
-                        next_cursor,
-                        &mut seen_cursors,
-                    )?);
-                }
-                None => break,
-            }
+            Ok(result)
         }
-
-        let result = McpListPromptsResult {
-            prompts,
-            next_cursor: None,
-        };
-        Self::validate_json_size(
-            server_name,
-            "prompts/list",
-            &result,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "prompts/list aggregate JSON",
-        )?;
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        let result = operation?;
         self.update_prompt_catalog(server_name, result.prompts.clone())?;
         Ok(result)
     }
@@ -3037,11 +3701,12 @@ impl McpServerManager {
         self.ensure_capability(server_name, McpCapabilityKind::Prompts)?;
         self.ensure_prompt_catalog(server_name).await?;
         self.ensure_prompt_known(server_name, name)?;
+        self.ping_if_configured(server_name).await?;
 
         let request_id = self.take_request_id();
         let timeout_ms = self.tool_call_timeout_ms(server_name)?;
-        let response =
-            {
+        let operation = async {
+            let response = {
                 let server = self.server_mut(server_name)?;
                 let process = server.process.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
@@ -3065,46 +3730,50 @@ impl McpServerManager {
                 .await?
             };
 
-        if let Some(error) = response.error {
-            return Err(McpServerManagerError::JsonRpc {
-                server_name: server_name.to_string(),
-                method: "prompts/get",
-                error,
-            });
-        }
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "prompts/get",
+                    error,
+                });
+            }
 
-        let result = response
-            .result
-            .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                server_name: server_name.to_string(),
-                method: "prompts/get",
-                details: "missing result payload".to_string(),
-            })?;
-        if result.messages.len() > MCP_MAX_PROMPT_MESSAGES {
-            return Err(McpServerManagerError::LimitExceeded {
-                server_name: server_name.to_string(),
-                method: "prompts/get",
-                limit: MCP_MAX_PROMPT_MESSAGES,
-                details: format!("server returned {} prompt messages", result.messages.len()),
-            });
-        }
-        Self::validate_json_size(
-            server_name,
-            "prompts/get",
-            &result,
-            MCP_MAX_RESULT_JSON_BYTES,
-            "prompts/get result JSON",
-        )?;
-        for message in &result.messages {
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "prompts/get",
+                    details: "missing result payload".to_string(),
+                })?;
+            if result.messages.len() > MCP_MAX_PROMPT_MESSAGES {
+                return Err(McpServerManagerError::LimitExceeded {
+                    server_name: server_name.to_string(),
+                    method: "prompts/get",
+                    limit: MCP_MAX_PROMPT_MESSAGES,
+                    details: format!("server returned {} prompt messages", result.messages.len()),
+                });
+            }
             Self::validate_json_size(
                 server_name,
                 "prompts/get",
-                message,
-                MCP_MAX_CATALOG_ITEM_JSON_BYTES,
-                "prompt message JSON",
+                &result,
+                MCP_MAX_RESULT_JSON_BYTES,
+                "prompts/get result JSON",
             )?;
+            for message in &result.messages {
+                Self::validate_json_size(
+                    server_name,
+                    "prompts/get",
+                    message,
+                    MCP_MAX_CATALOG_ITEM_JSON_BYTES,
+                    "prompt message JSON",
+                )?;
+            }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        self.record_heartbeat_result(server_name, &operation);
+        operation
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
@@ -3145,6 +3814,17 @@ impl McpServerManager {
         )
     }
 
+    fn is_heartbeat_validation_error(error: &McpServerManagerError) -> bool {
+        matches!(
+            error,
+            McpServerManagerError::InvalidResponse {
+                method: "ping" | "bootstrap",
+                details,
+                ..
+            } if details.contains("outside supported range") || details.contains("must be an integer")
+        )
+    }
+
     async fn run_process_request<T, F>(
         server_name: &str,
         method: &'static str,
@@ -3154,6 +3834,8 @@ impl McpServerManager {
     where
         F: Future<Output = io::Result<T>>,
     {
+        validate_mcp_timeout_ms(server_name, method, timeout_ms)?;
+        let started = Instant::now();
         match timeout(Duration::from_millis(timeout_ms), future).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
@@ -3172,24 +3854,66 @@ impl McpServerManager {
                 server_name: server_name.to_string(),
                 method,
                 timeout_ms,
+                elapsed_ms: duration_ms_saturating(started.elapsed()).max(timeout_ms),
             }),
         }
     }
 
     async fn ping_if_configured(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
-        let timeout_ms = {
-            let server = self.server_mut(server_name)?;
-            match &server.bootstrap.transport {
-                McpClientTransport::Stdio(transport) => transport
-                    .env
-                    .get("CLAWD_MCP_HEARTBEAT_TIMEOUT_MS")
-                    .and_then(|value| value.parse::<u64>().ok()),
-                _ => None,
-            }
-        };
-        let Some(timeout_ms) = timeout_ms else {
+        let Some(timeout_ms) = self
+            .heartbeat_schedule
+            .get(server_name)
+            .map(|schedule| schedule.timeout_ms)
+        else {
             return Ok(());
         };
+        let result = self.ping_server_with_timeout(server_name, timeout_ms).await;
+        match &result {
+            Ok(()) => self.record_heartbeat_preflight_success(server_name),
+            Err(error) => {
+                self.record_heartbeat_failure(server_name, error.to_string());
+                if Self::should_reset_server(error) {
+                    self.reset_server(server_name).await?;
+                }
+            }
+        }
+        result
+    }
+
+    async fn ping_server_with_timeout(
+        &mut self,
+        server_name: &str,
+        timeout_ms: u64,
+    ) -> Result<(), McpServerManagerError> {
+        validate_mcp_timeout_ms(server_name, "ping", timeout_ms)?;
+        if let Some(transport) = self.sse_transport(server_name)? {
+            let request_id = self.take_request_id_block(2);
+            let server_name_owned = server_name.to_string();
+            return tokio::task::spawn_blocking(move || {
+                let mut session = connect_initialized_sse_session(
+                    &server_name_owned,
+                    &transport,
+                    request_id,
+                    timeout_ms,
+                )
+                .map(|(session, _, _)| session)?;
+                ping_sse_session(
+                    &server_name_owned,
+                    &transport,
+                    &mut session,
+                    request_id + 1,
+                    timeout_ms,
+                )
+            })
+            .await
+            .map_err(|error| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "ping",
+                details: format!("SSE worker task failed: {error}"),
+            })?;
+        }
+
+        self.ensure_server_ready(server_name).await?;
         let request_id = self.take_request_id();
         let response_result =
             {
@@ -3213,23 +3937,14 @@ impl McpServerManager {
                 )
                 .await
             };
-        let response = match response_result {
-            Ok(response) => response,
-            Err(error) => {
-                self.record_heartbeat_failure(server_name, error.to_string());
-                return Err(error);
-            }
-        };
+        let response = response_result?;
         if let Some(error) = response.error {
-            let error = McpServerManagerError::JsonRpc {
+            return Err(McpServerManagerError::JsonRpc {
                 server_name: server_name.to_string(),
                 method: "ping",
                 error,
-            };
-            self.record_heartbeat_failure(server_name, error.to_string());
-            return Err(error);
+            });
         }
-        self.record_heartbeat_success(server_name);
         Ok(())
     }
 
@@ -3313,6 +4028,7 @@ impl McpServerManager {
                 .await
             };
 
+            self.record_heartbeat_initialize_result(server_name, &response);
             let response = match response {
                 Ok(response) => response,
                 Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
@@ -3680,6 +4396,7 @@ impl LimitedSseStream {
                         server_name: self.server_name.clone(),
                         method,
                         timeout_ms,
+                        elapsed_ms: timeout_ms,
                     });
                 }
             };
@@ -3818,6 +4535,7 @@ fn validate_sse_operation_timeout(
             server_name: server_name.to_string(),
             method,
             timeout_ms,
+            elapsed_ms: 0,
         });
     }
     if timeout_ms > MCP_SSE_MAX_OPERATION_TIMEOUT_MS {
@@ -3845,6 +4563,7 @@ fn remaining_sse_operation_time(
             server_name: server_name.to_string(),
             method,
             timeout_ms,
+            elapsed_ms: timeout_ms,
         })
 }
 
@@ -4283,9 +5002,10 @@ fn ping_sse_session(
     transport: &McpRemoteTransport,
     session: &mut McpSseSession,
     request_id: u64,
-    timeout_ms: u64,
+    _operation_timeout_ms: u64,
 ) -> Result<(), McpServerManagerError> {
-    let heartbeat_timeout_ms = transport.heartbeat_timeout_ms.unwrap_or(timeout_ms);
+    let heartbeat_timeout_ms = transport.resolved_heartbeat_timeout_ms();
+    validate_mcp_timeout_ms(server_name, "ping", heartbeat_timeout_ms)?;
     let response = session.request::<_, JsonValue>(
         JsonRpcId::Number(request_id),
         "ping",
@@ -4959,10 +5679,7 @@ impl SseDiscoveryMode {
 }
 
 fn sse_operation_timeout_ms(transport: &McpRemoteTransport) -> u64 {
-    transport
-        .tool_call_timeout_ms
-        .or(transport.heartbeat_timeout_ms)
-        .unwrap_or(MCP_LIST_TOOLS_TIMEOUT_MS)
+    transport.resolved_tool_call_timeout_ms()
 }
 
 fn discover_sse_catalog(
@@ -5598,10 +6315,12 @@ fn initialize_params_for_bootstrap(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::ErrorKind;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -5627,10 +6346,11 @@ mod tests {
     use super::{
         build_sse_client, build_sse_get_client, build_sse_get_runtime, build_sse_headers,
         parse_and_validate_sse_url, read_limited_jsonrpc_line, resolve_sse_endpoint,
-        spawn_mcp_stdio_process, sse_operation_deadline, unsupported_server_failed_server,
-        validate_sse_get_response, validate_sse_response_header_budget, JsonRpcId, JsonRpcRequest,
-        JsonRpcResponse, McpGetPromptParams, McpHeartbeatStatus, McpInitializeClientInfo,
-        McpInitializeParams, McpInitializeResult, McpInitializeServerInfo, McpListPromptsParams,
+        spawn_mcp_stdio_process, sse_operation_deadline, sse_operation_timeout_ms,
+        unsupported_server_failed_server, validate_sse_get_response,
+        validate_sse_response_header_budget, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+        McpGetPromptParams, McpHeartbeatStatus, McpInitializeClientInfo, McpInitializeParams,
+        McpInitializeResult, McpInitializeServerInfo, McpListPromptsParams,
         McpListResourceTemplatesParams, McpListResourcesParams, McpListToolsParams,
         McpReadResourceParams, McpReadResourceResult, McpServerManager, McpServerManagerError,
         McpSseSession, McpStdioProcess, McpToolCallParams, MCP_MAX_JSONRPC_FRAME_BYTES,
@@ -5707,6 +6427,7 @@ mod tests {
             "TOOL_CALL_DELAY_MS = int(os.environ.get('MCP_TOOL_CALL_DELAY_MS', '0'))",
             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
             "OMIT_RESULT_METHOD = os.environ.get('MCP_OMIT_RESULT_METHOD')",
+            "JSONRPC_ERROR_METHOD = os.environ.get('MCP_JSONRPC_ERROR_METHOD')",
             "PAGINATION_LOOP_METHOD = os.environ.get('MCP_PAGINATION_LOOP_METHOD')",
             "EMPTY_CURSOR_METHOD = os.environ.get('MCP_EMPTY_CURSOR_METHOD')",
             "DUPLICATE_LIST_METHOD = os.environ.get('MCP_DUPLICATE_LIST_METHOD')",
@@ -5749,6 +6470,9 @@ mod tests {
             "    if method == OMIT_RESULT_METHOD:",
             "        send_message({'jsonrpc': '2.0', 'id': request['id']})",
             "        continue",
+            "    if method == JSONRPC_ERROR_METHOD:",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32602, 'message': f'{method} rejected'}})",
+            "        continue",
             "    if method == 'initialize':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -5759,6 +6483,8 @@ mod tests {
             "                'serverInfo': {'name': 'fake-mcp', 'version': '0.2.0'}",
             "            }",
             "        })",
+            "    elif method == 'ping':",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})",
             "    elif method == 'tools/list':",
             "        cursor = (request.get('params') or {}).get('cursor')",
             "        if cursor is None:",
@@ -5771,6 +6497,12 @@ mod tests {
             "                    'required': ['text']",
             "                }",
             "            }]",
+            "            if os.environ.get('MCP_INCLUDE_FAIL_TOOL') == '1':",
+            "                tools.append({",
+            "                    'name': 'fail',",
+            "                    'description': 'Fails with a JSON-RPC error',",
+            "                    'inputSchema': {'type': 'object'}",
+            "                })",
             "            next_cursor = 'tools-page-2'",
             "        else:",
             "            tools = [{",
@@ -5942,10 +6674,15 @@ mod tests {
             "FAIL_ONCE_MARKER = os.environ.get('MCP_FAIL_ONCE_MARKER')",
             "INITIALIZE_JSONRPC_ERROR = os.environ.get('MCP_INITIALIZE_JSONRPC_ERROR') == '1'",
             "INITIALIZE_JSONRPC_ERROR_ONCE = os.environ.get('MCP_INITIALIZE_JSONRPC_ERROR_ONCE') == '1'",
+            "PING_JSONRPC_ERROR = os.environ.get('MCP_PING_JSONRPC_ERROR') == '1'",
+            "PING_HANG = os.environ.get('MCP_PING_HANG') == '1'",
+            "PING_DISCONNECT = os.environ.get('MCP_PING_DISCONNECT') == '1'",
+            "PING_DISCONNECT_AFTER_TOOLS_LIST = os.environ.get('MCP_PING_DISCONNECT_AFTER_TOOLS_LIST') == '1'",
             "OMIT_PROTOCOL_VERSION = os.environ.get('MCP_OMIT_PROTOCOL_VERSION') == '1'",
             "PROTOCOL_VERSION_SET = 'MCP_PROTOCOL_VERSION' in os.environ",
             "PROTOCOL_VERSION = os.environ.get('MCP_PROTOCOL_VERSION')",
             "initialize_count = 0",
+            "tools_list_count = 0",
             "",
             "def log(method):",
             "    if LOG_PATH:",
@@ -6000,7 +6737,28 @@ mod tests {
             "        if not OMIT_PROTOCOL_VERSION:",
             "            result['protocolVersion'] = PROTOCOL_VERSION if PROTOCOL_VERSION_SET else request['params']['protocolVersion']",
             "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': result})",
+            "    elif method == 'ping':",
+            "        if PING_DISCONNECT_AFTER_TOOLS_LIST and tools_list_count > 0:",
+            "            log('ping-disconnect-after-tools-list')",
+            "            raise SystemExit(0)",
+            "        if PING_DISCONNECT:",
+            "            raise SystemExit(0)",
+            "        if PING_HANG:",
+            "            while True:",
+            "                time.sleep(1)",
+            "        if PING_JSONRPC_ERROR:",
+            "            send_message({",
+            "                'jsonrpc': '2.0',",
+            "                'id': request['id'],",
+            "                'error': {'code': -32003, 'message': 'ping rejected'}",
+            "            })",
+            "            continue",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})",
             "    elif method == 'tools/list':",
+            "        if FAIL_ONCE_MODE == 'tools_list_disconnect' and should_fail_once():",
+            "            log('tools/list-disconnect')",
+            "            raise SystemExit(0)",
+            "        tools_list_count += 1",
             "        send_message({",
             "            'jsonrpc': '2.0',",
             "            'id': request['id'],",
@@ -6099,6 +6857,8 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
+                heartbeat_timeout_ms: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -6117,6 +6877,8 @@ mod tests {
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
+            heartbeat_interval_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -6283,6 +7045,7 @@ mod tests {
             headers_helper: None,
             auth: McpClientAuth::None,
             tool_call_timeout_ms: Some(timeout_ms),
+            heartbeat_interval_ms: Some(30_000),
             heartbeat_timeout_ms: Some(timeout_ms),
             protocol_version: Some("2024-11-05".to_string()),
             capabilities: json!({}),
@@ -6411,8 +7174,20 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
+                heartbeat_timeout_ms: None,
             }),
         }
+    }
+
+    fn heartbeat_for<'a>(
+        report: &'a [McpServerHeartbeat],
+        server_name: &str,
+    ) -> &'a McpServerHeartbeat {
+        report
+            .iter()
+            .find(|entry| entry.server_name == server_name)
+            .unwrap_or_else(|| panic!("missing heartbeat entry for {server_name}"))
     }
 
     #[test]
@@ -6732,6 +7507,8 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
+                heartbeat_interval_ms: None,
+                heartbeat_timeout_ms: None,
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
@@ -7407,6 +8184,8 @@ mod tests {
                             "200".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(25),
+                        heartbeat_interval_ms: None,
+                        heartbeat_timeout_ms: None,
                     }),
                 },
             )]);
@@ -7426,6 +8205,7 @@ mod tests {
                     server_name,
                     method,
                     timeout_ms,
+                    ..
                 } => {
                     assert_eq!(server_name, "slow");
                     assert_eq!(method, "tools/call");
@@ -7461,6 +8241,8 @@ mod tests {
                             "1".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(1_000),
+                        heartbeat_interval_ms: None,
+                        heartbeat_timeout_ms: None,
                     }),
                 },
             )]);
@@ -7533,7 +8315,7 @@ mod tests {
                     source,
                 } => {
                     assert_eq!(server_name, "alpha");
-                    assert_eq!(method, "tools/call");
+                    assert_eq!(method, "ping");
                     assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
                 }
                 other => panic!("expected transport error, got {other:?}"),
@@ -7561,9 +8343,11 @@ mod tests {
                 vec![
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/list",
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/call",
                 ]
             );
@@ -7619,6 +8403,7 @@ mod tests {
                     "initialize-hang",
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/list",
                 ]
             );
@@ -7704,11 +8489,14 @@ mod tests {
                 vec![
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/list",
+                    "ping",
                     "tools/call",
                     "tools/call-disconnect",
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/call",
                 ]
             );
@@ -8044,6 +8832,8 @@ mod tests {
                             args: Vec::new(),
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
+                            heartbeat_interval_ms: None,
+                            heartbeat_timeout_ms: None,
                         }),
                     },
                 ),
@@ -8055,8 +8845,7 @@ mod tests {
             assert_eq!(report.tools.len(), 1);
             assert_eq!(report.heartbeat.len(), 2);
             assert!(report.heartbeat.iter().any(|heartbeat| {
-                heartbeat.server_name == "alpha"
-                    && heartbeat.status == McpHeartbeatStatus::NotConfigured
+                heartbeat.server_name == "alpha" && heartbeat.status == McpHeartbeatStatus::Healthy
             }));
             assert_eq!(
                 report.tools[0].qualified_name,
@@ -8136,6 +8925,7 @@ mod tests {
                         headers_helper: None,
                         oauth: None,
                         tool_call_timeout_ms: None,
+                        heartbeat_interval_ms: None,
                         heartbeat_timeout_ms: None,
                         protocol_version: None,
                         capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -8153,6 +8943,7 @@ mod tests {
                         headers_helper: None,
                         oauth: None,
                         tool_call_timeout_ms: None,
+                        heartbeat_interval_ms: None,
                         heartbeat_timeout_ms: Some(500),
                         protocol_version: None,
                         capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -8219,10 +9010,13 @@ mod tests {
                     &script_path,
                     "ping-fails",
                     &root.join("ping-fails.log"),
-                    BTreeMap::from([(
-                        "CLAWD_MCP_HEARTBEAT_TIMEOUT_MS".to_string(),
-                        "100".to_string(),
-                    )]),
+                    BTreeMap::from([
+                        (
+                            "CLAWD_MCP_HEARTBEAT_TIMEOUT_MS".to_string(),
+                            "100".to_string(),
+                        ),
+                        ("MCP_PING_JSONRPC_ERROR".to_string(), "1".to_string()),
+                    ]),
                 ),
             )]);
             let mut manager = McpServerManager::from_servers(&servers);
@@ -8236,7 +9030,11 @@ mod tests {
                 .iter()
                 .find(|entry| entry.server_name == "ping-fails")
                 .expect("heartbeat entry");
-            assert_eq!(heartbeat.status, McpHeartbeatStatus::Failed);
+            assert_eq!(heartbeat.status, McpHeartbeatStatus::Degraded);
+            assert_eq!(
+                heartbeat.consecutive_failures, 1,
+                "pre-ping failure during tools discovery must be recorded exactly once"
+            );
             assert!(heartbeat.last_failure_at_ms.is_some());
             assert!(heartbeat
                 .last_failure_reason
@@ -8246,6 +9044,678 @@ mod tests {
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn manager_refresh_due_heartbeats_skips_until_due_then_updates_stdio_status() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("heartbeat-due.log");
+            let mut config = manager_server_config(&script_path, "alpha", &log_path);
+            if let McpServerConfig::Stdio(stdio) = &mut config.config {
+                stdio.heartbeat_interval_ms = Some(100_000);
+                stdio.heartbeat_timeout_ms = Some(500);
+            }
+            let servers = BTreeMap::from([("alpha".to_string(), config)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let _ = manager.discover_tools().await.expect("discover tools");
+            let after_discovery = fs::read_to_string(&log_path).expect("read log");
+            let ping_count_after_discovery = after_discovery
+                .lines()
+                .filter(|line| *line == "ping")
+                .count();
+
+            let report = manager
+                .refresh_due_heartbeats(Instant::now())
+                .await
+                .expect("not-due heartbeat refresh");
+            assert_eq!(
+                report
+                    .iter()
+                    .find(|heartbeat| heartbeat.server_name == "alpha")
+                    .expect("heartbeat")
+                    .status,
+                McpHeartbeatStatus::Healthy
+            );
+            let after_skip = fs::read_to_string(&log_path).expect("read log after skip");
+            assert_eq!(
+                after_skip.lines().filter(|line| *line == "ping").count(),
+                ping_count_after_discovery,
+                "not-due refresh must not send another ping"
+            );
+
+            let report = manager
+                .refresh_due_heartbeats(Instant::now() + Duration::from_millis(100_001))
+                .await
+                .expect("due heartbeat refresh");
+            let heartbeat = report
+                .iter()
+                .find(|heartbeat| heartbeat.server_name == "alpha")
+                .expect("heartbeat");
+            assert_eq!(heartbeat.status, McpHeartbeatStatus::Healthy);
+            assert_eq!(heartbeat.interval_ms, Some(100_000));
+            assert_eq!(heartbeat.timeout_ms, Some(500));
+            assert!(heartbeat.last_attempt_at_ms.is_some());
+            assert!(heartbeat.latency_ms.is_some());
+            assert!(heartbeat.next_due_at_ms.is_some());
+
+            let after_due = fs::read_to_string(&log_path).expect("read log after due");
+            assert_eq!(
+                after_due.lines().filter(|line| *line == "ping").count(),
+                ping_count_after_discovery + 1,
+                "due refresh should send exactly one ping"
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn stdio_tool_call_resets_child_after_pre_ping_transport_failure() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("pre-ping-reset.log");
+            let mut config = manager_server_config_with_env(
+                &script_path,
+                "alpha",
+                &log_path,
+                BTreeMap::from([
+                    (
+                        "MCP_PING_DISCONNECT_AFTER_TOOLS_LIST".to_string(),
+                        "1".to_string(),
+                    ),
+                    (
+                        "CLAWD_MCP_HEARTBEAT_TIMEOUT_MS".to_string(),
+                        "500".to_string(),
+                    ),
+                ]),
+            );
+            if let McpServerConfig::Stdio(stdio) = &mut config.config {
+                stdio.heartbeat_timeout_ms = Some(500);
+            }
+            let servers = BTreeMap::from([("alpha".to_string(), config)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+            let tool_name = mcp_tool_name("alpha", "echo");
+
+            let _ = manager.discover_tools().await.expect("discover tools");
+            let error = manager
+                .call_tool(&tool_name, Some(json!({"text": "first"})))
+                .await
+                .expect_err("pre-ping disconnect should fail the first call");
+            assert!(
+                matches!(
+                    error,
+                    McpServerManagerError::Transport { method: "ping", .. }
+                        | McpServerManagerError::InvalidResponse { method: "ping", .. }
+                ),
+                "unexpected pre-ping error: {error}"
+            );
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Degraded);
+            assert_eq!(
+                alpha.consecutive_failures, 1,
+                "pre-ping transport failure must be recorded exactly once"
+            );
+
+            let response = manager
+                .call_tool(&tool_name, Some(json!({"text": "second"})))
+                .await
+                .expect("child should be respawned after pre-ping failure");
+            let result = response.result.expect("tool result");
+            assert_eq!(
+                result
+                    .structured_content
+                    .and_then(|value| value.get("echoed").cloned())
+                    .and_then(|value| value.as_str().map(str::to_owned)),
+                Some("second".to_string())
+            );
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert!(
+                log.lines().filter(|line| *line == "initialize").count() >= 2,
+                "reset should cause a fresh initialize after ping transport failure: {log}"
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn stdio_tools_list_retry_success_clears_single_recorded_failure() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("tools-list-retry.log");
+            let marker_path = root.join("tools-list-retry.marker");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([
+                        (
+                            "MCP_FAIL_ONCE_MODE".to_string(),
+                            "tools_list_disconnect".to_string(),
+                        ),
+                        (
+                            "MCP_FAIL_ONCE_MARKER".to_string(),
+                            marker_path.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("tools/list retry should recover");
+
+            assert_eq!(tools.len(), 1);
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Healthy);
+            assert_eq!(alpha.consecutive_failures, 0);
+            assert_eq!(alpha.last_failure_reason, None);
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert!(
+                log.lines().any(|line| line == "tools/list-disconnect"),
+                "fixture should fail first tools/list attempt: {log}"
+            );
+            assert_eq!(
+                log.lines().filter(|line| *line == "tools/list").count(),
+                2,
+                "retry should perform tools/list twice: {log}"
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn stdio_env_heartbeat_values_fail_closed_before_bootstrap() {
+        let cases = [
+            (
+                "malformed-interval",
+                "CLAWD_MCP_HEARTBEAT_INTERVAL_MS",
+                "bad",
+                "must be an integer",
+            ),
+            (
+                "zero-timeout",
+                "CLAWD_MCP_HEARTBEAT_TIMEOUT_MS",
+                "0",
+                "outside supported range",
+            ),
+            (
+                "oversize-interval",
+                "CLAWD_MCP_HEARTBEAT_INTERVAL_MS",
+                "3600001",
+                "outside supported range",
+            ),
+        ];
+
+        for (label, env_name, env_value, expected_reason) in cases {
+            let script_path = write_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join(format!("{label}.log"));
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([(env_name.to_string(), env_value.to_string())]),
+                ),
+            )]);
+
+            let manager = McpServerManager::from_servers(&servers);
+
+            assert!(
+                manager.server_names().is_empty(),
+                "{label} should not register a managed server"
+            );
+            let unsupported = manager.unsupported_servers();
+            assert_eq!(unsupported.len(), 1);
+            assert!(
+                unsupported[0].reason.contains(expected_reason),
+                "{label} reason did not contain {expected_reason}: {}",
+                unsupported[0].reason
+            );
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Failed);
+            assert!(alpha.last_failure_reason.is_some());
+            assert!(
+                !log_path.exists(),
+                "{label} should fail before spawning stdio fixture"
+            );
+
+            cleanup_script(&script_path);
+        }
+    }
+
+    #[test]
+    fn stdio_operation_failures_record_heartbeat_after_successful_pre_ping() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("resource-list-failure.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::from([(
+                        "MCP_DUPLICATE_LIST_METHOD".to_string(),
+                        "resources/list".to_string(),
+                    )]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let error = manager
+                .list_resources("alpha")
+                .await
+                .expect_err("duplicate resources should fail");
+            assert!(
+                error.to_string().contains("duplicate resource uri"),
+                "unexpected resources/list error: {error}"
+            );
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Degraded);
+            assert_eq!(alpha.consecutive_failures, 1);
+            assert!(alpha
+                .last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resources/list")));
+
+            for _ in 0..2 {
+                let _ = manager
+                    .list_resources("alpha")
+                    .await
+                    .expect_err("duplicate resources should keep failing");
+            }
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Degraded);
+            assert_eq!(
+                alpha.consecutive_failures, 1,
+                "successful reconnects between reset retries should clear earlier failures"
+            );
+
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert!(
+                log.lines().any(|line| line == "ping"),
+                "pre-ping should have succeeded before operation failure: {log}"
+            );
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn stdio_jsonrpc_error_is_communication_success_but_framing_failures_degrade_heartbeat() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+
+            let tool_log = root.join("tool-jsonrpc-error.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &tool_log,
+                    BTreeMap::from([("MCP_INCLUDE_FAIL_TOOL".to_string(), "1".to_string())]),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+            manager.discover_tools().await.expect("discover tools");
+            let response = manager
+                .call_tool(&mcp_tool_name("alpha", "fail"), Some(json!({})))
+                .await
+                .expect("business JSON-RPC error is a typed tool response");
+            assert!(response.error.is_some());
+            let heartbeat = manager.heartbeat_report();
+            let alpha = heartbeat_for(&heartbeat, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Healthy);
+            assert_eq!(alpha.consecutive_failures, 0);
+            assert_eq!(alpha.last_failure_reason, None);
+            manager.shutdown().await.expect("shutdown");
+
+            let jsonrpc_error_cases = [
+                ("list-resources-jsonrpc", "resources/list", "list_resources"),
+                (
+                    "list-templates-jsonrpc",
+                    "resources/templates/list",
+                    "list_resource_templates",
+                ),
+                ("read-resource-jsonrpc", "resources/read", "read_resource"),
+                ("list-prompts-jsonrpc", "prompts/list", "list_prompts"),
+                ("get-prompt-jsonrpc", "prompts/get", "get_prompt"),
+            ];
+
+            for (label, error_method, operation) in jsonrpc_error_cases {
+                let log_path = root.join(format!("{label}.log"));
+                let servers = BTreeMap::from([(
+                    "alpha".to_string(),
+                    manager_server_config_with_env(
+                        &script_path,
+                        "alpha",
+                        &log_path,
+                        BTreeMap::from([(
+                            "MCP_JSONRPC_ERROR_METHOD".to_string(),
+                            error_method.to_string(),
+                        )]),
+                    ),
+                )]);
+                let mut manager = McpServerManager::from_servers(&servers);
+                let error = match operation {
+                    "list_resources" => manager
+                        .list_resources("alpha")
+                        .await
+                        .map(|_| ())
+                        .expect_err("resources/list JSON-RPC error should reach caller"),
+                    "list_resource_templates" => manager
+                        .list_resource_templates("alpha")
+                        .await
+                        .map(|_| ())
+                        .expect_err("resources/templates/list JSON-RPC error should reach caller"),
+                    "read_resource" => manager
+                        .read_resource("alpha", "file://guide.txt")
+                        .await
+                        .map(|_| ())
+                        .expect_err("resources/read JSON-RPC error should reach caller"),
+                    "list_prompts" => manager
+                        .list_prompts("alpha")
+                        .await
+                        .map(|_| ())
+                        .expect_err("prompts/list JSON-RPC error should reach caller"),
+                    "get_prompt" => manager
+                        .get_prompt("alpha", "triage", None)
+                        .await
+                        .map(|_| ())
+                        .expect_err("prompts/get JSON-RPC error should reach caller"),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    matches!(error, McpServerManagerError::JsonRpc { method, .. } if method == error_method),
+                    "{label} returned unexpected error: {error:?}"
+                );
+                let heartbeat = manager.heartbeat_report();
+                let alpha = heartbeat_for(&heartbeat, "alpha");
+                assert_eq!(
+                    alpha.status,
+                    McpHeartbeatStatus::Healthy,
+                    "{label} JSON-RPC error should count as communication success"
+                );
+                assert_eq!(alpha.consecutive_failures, 0);
+                assert_eq!(alpha.last_failure_reason, None);
+                manager.shutdown().await.expect("shutdown");
+            }
+
+            let cases = [
+                (
+                    "read-resource",
+                    "resources/read",
+                    "read_resource",
+                    "resources/read",
+                ),
+                (
+                    "list-templates",
+                    "resources/templates/list",
+                    "list_resource_templates",
+                    "resources/templates/list",
+                ),
+                (
+                    "list-prompts",
+                    "prompts/list",
+                    "list_prompts",
+                    "prompts/list",
+                ),
+                ("get-prompt", "prompts/get", "get_prompt", "prompts/get"),
+            ];
+
+            for (label, omit_method, operation, expected_reason) in cases {
+                let log_path = root.join(format!("{label}.log"));
+                let servers = BTreeMap::from([(
+                    "alpha".to_string(),
+                    manager_server_config_with_env(
+                        &script_path,
+                        "alpha",
+                        &log_path,
+                        BTreeMap::from([(
+                            "MCP_OMIT_RESULT_METHOD".to_string(),
+                            omit_method.to_string(),
+                        )]),
+                    ),
+                )]);
+                let mut manager = McpServerManager::from_servers(&servers);
+
+                let error = match operation {
+                    "read_resource" => manager
+                        .read_resource("alpha", "file://guide.txt")
+                        .await
+                        .map(|_| ())
+                        .expect_err("resources/read should fail"),
+                    "list_resource_templates" => manager
+                        .list_resource_templates("alpha")
+                        .await
+                        .map(|_| ())
+                        .expect_err("resources/templates/list should fail"),
+                    "list_prompts" => manager
+                        .list_prompts("alpha")
+                        .await
+                        .map(|_| ())
+                        .expect_err("prompts/list should fail"),
+                    "get_prompt" => manager
+                        .get_prompt("alpha", "triage", None)
+                        .await
+                        .map(|_| ())
+                        .expect_err("prompts/get should fail"),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    error.to_string().contains("missing result payload"),
+                    "{label} returned unexpected error: {error}"
+                );
+                let heartbeat = manager.heartbeat_report();
+                let alpha = heartbeat_for(&heartbeat, "alpha");
+                assert_eq!(
+                    alpha.status,
+                    McpHeartbeatStatus::Degraded,
+                    "{label} should degrade heartbeat"
+                );
+                assert!(alpha
+                    .last_failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected_reason)));
+                manager.shutdown().await.expect("shutdown");
+            }
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn target_heartbeat_refresh_does_not_touch_other_due_servers() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let alpha_log = root.join("alpha-hung.log");
+            let beta_log = root.join("beta-target.log");
+            let mut alpha = manager_server_config_with_env(
+                &script_path,
+                "alpha",
+                &alpha_log,
+                BTreeMap::from([("MCP_PING_HANG".to_string(), "1".to_string())]),
+            );
+            let mut beta = manager_server_config(&script_path, "beta", &beta_log);
+            for config in [&mut alpha, &mut beta] {
+                if let McpServerConfig::Stdio(stdio) = &mut config.config {
+                    stdio.heartbeat_interval_ms = Some(1);
+                    stdio.heartbeat_timeout_ms = Some(50);
+                }
+            }
+            let servers =
+                BTreeMap::from([("alpha".to_string(), alpha), ("beta".to_string(), beta)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            manager
+                .refresh_due_heartbeat_for_server(
+                    "beta",
+                    Instant::now() + Duration::from_millis(10),
+                )
+                .await
+                .expect("target beta refresh");
+
+            let beta_log = fs::read_to_string(&beta_log).expect("read beta log");
+            assert!(
+                beta_log.lines().any(|line| line == "ping"),
+                "target refresh should ping beta: {beta_log}"
+            );
+            assert!(
+                !alpha_log.exists(),
+                "target beta refresh must not spawn or ping due alpha"
+            );
+            let heartbeat = manager.heartbeat_report();
+            assert_eq!(
+                heartbeat_for(&heartbeat, "beta").status,
+                McpHeartbeatStatus::Healthy
+            );
+            assert_eq!(
+                heartbeat_for(&heartbeat, "alpha").status,
+                McpHeartbeatStatus::Unknown
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn heartbeat_report_marks_overdue_healthy_entries_stale_and_shutdown_clears_freshness() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let mut config = manager_server_config(&script_path, "alpha", &root.join("stale.log"));
+            if let McpServerConfig::Stdio(stdio) = &mut config.config {
+                stdio.heartbeat_interval_ms = Some(1);
+                stdio.heartbeat_timeout_ms = Some(500);
+            }
+            let servers = BTreeMap::from([("alpha".to_string(), config)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            manager.discover_tools().await.expect("discover tools");
+            std::thread::sleep(Duration::from_millis(20));
+            let report = manager.heartbeat_report();
+            let alpha = heartbeat_for(&report, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Stale);
+            assert_eq!(alpha.freshness.as_deref(), Some("stale"));
+
+            manager.shutdown().await.expect("shutdown");
+            let report = manager.heartbeat_report();
+            let alpha = heartbeat_for(&report, "alpha");
+            assert_eq!(alpha.status, McpHeartbeatStatus::Unknown);
+            assert_eq!(alpha.freshness.as_deref(), Some("unknown"));
+            assert_eq!(alpha.next_due_at_ms, None);
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn heartbeat_failure_reason_is_redacted_and_bounded_before_json_output() {
+        let script_path = write_manager_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config(&script_path, "alpha", &root.join("redaction.log")),
+        )]);
+        let mut manager = McpServerManager::from_servers(&servers);
+        manager.record_heartbeat_failure(
+            "alpha",
+            format!(
+                "failed https://user:secret@example.test/path?token=top-secret&api_key=hidden Authorization: Bearer bearer-secret Proxy-Authorization: Bearer proxy-secret header-token=header-secret {} tail-secret",
+                "x".repeat(700),
+            ),
+        );
+
+        let report = manager.heartbeat_report();
+        let reason = heartbeat_for(&report, "alpha")
+            .last_failure_reason
+            .as_deref()
+            .expect("failure reason");
+        assert!(reason.len() <= MCP_MAX_HEARTBEAT_FAILURE_REASON_CHARS + 3);
+        let json = serde_json::to_string(&report).expect("heartbeat JSON");
+        for secret in [
+            "user:secret",
+            "top-secret",
+            "hidden",
+            "bearer-secret",
+            "proxy-secret",
+            "header-secret",
+            "tail-secret",
+        ] {
+            assert!(
+                !json.contains(secret),
+                "heartbeat JSON leaked secret {secret}: {json}"
+            );
+        }
+        assert!(json.contains("<redacted>"));
+
+        cleanup_script(&script_path);
+    }
+
+    #[test]
+    fn sse_operation_timeout_does_not_fallback_to_heartbeat_timeout() {
+        let mut transport =
+            sse_transport_for_url("http://127.0.0.1:9/sse".to_string(), BTreeMap::new(), 25);
+        transport.tool_call_timeout_ms = None;
+        transport.heartbeat_timeout_ms = Some(25);
+
+        assert_eq!(
+            sse_operation_timeout_ms(&transport),
+            crate::mcp_client::DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -8326,6 +9796,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -8365,6 +9836,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2025-03-26".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -8388,7 +9860,7 @@ mod tests {
             .iter()
             .find(|entry| entry.server_name == "remote")
             .expect("heartbeat");
-        assert_eq!(heartbeat.status, McpHeartbeatStatus::Failed);
+        assert_eq!(heartbeat.status, McpHeartbeatStatus::Degraded);
         assert!(heartbeat
             .last_failure_reason
             .as_deref()
@@ -8476,6 +9948,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -8518,7 +9991,7 @@ mod tests {
             .into_iter()
             .find(|entry| entry.server_name == "remote")
             .expect("heartbeat");
-        assert_eq!(heartbeat.status, McpHeartbeatStatus::Failed);
+        assert_eq!(heartbeat.status, McpHeartbeatStatus::Degraded);
         assert!(heartbeat.requested_protocol_version.is_none());
         assert!(heartbeat.negotiated_protocol_version.is_none());
 
@@ -8690,6 +10163,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -9217,7 +10691,8 @@ mod tests {
             McpServerManagerError::Timeout {
                 server_name,
                 method: "tools/list",
-                timeout_ms: 0
+                timeout_ms: 0,
+                ..
             } if server_name == "remote"
         ));
 
@@ -9256,7 +10731,8 @@ mod tests {
             McpServerManagerError::Timeout {
                 server_name,
                 method: "sse/connect",
-                timeout_ms: 0
+                timeout_ms: 0,
+                ..
             } if server_name == "remote"
         ));
 
@@ -9334,6 +10810,7 @@ mod tests {
                         headers_helper: None,
                         oauth: None,
                         tool_call_timeout_ms: Some(1_000),
+                        heartbeat_interval_ms: None,
                         heartbeat_timeout_ms: Some(1_000),
                         protocol_version: Some("2024-11-05".to_string()),
                         capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -9452,6 +10929,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -9555,6 +11033,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -9659,6 +11138,7 @@ mod tests {
                     headers_helper: None,
                     oauth: None,
                     tool_call_timeout_ms: Some(1_000),
+                    heartbeat_interval_ms: None,
                     heartbeat_timeout_ms: Some(1_000),
                     protocol_version: Some("2024-11-05".to_string()),
                     capabilities: crate::JsonValue::Object(BTreeMap::new()),
@@ -9771,7 +11251,9 @@ mod tests {
                 vec![
                     "initialize",
                     "notifications/initialized",
+                    "ping",
                     "tools/list",
+                    "ping",
                     "tools/call",
                 ]
             );

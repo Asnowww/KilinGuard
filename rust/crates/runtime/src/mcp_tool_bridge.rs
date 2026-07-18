@@ -114,6 +114,28 @@ pub struct McpServerState {
     pub protocol_transport_policy: Option<String>,
     #[serde(default)]
     pub protocol_configured_preferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub heartbeat_consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_next_due_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_freshness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_last_attempt_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_last_success_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_last_failure_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_last_failure_reason: Option<String>,
     pub error_message: Option<String>,
 }
 
@@ -272,6 +294,17 @@ impl McpToolRegistry {
                 negotiated_protocol_version: None,
                 protocol_transport_policy: None,
                 protocol_configured_preferred: false,
+                heartbeat_status: None,
+                heartbeat_interval_ms: None,
+                heartbeat_timeout_ms: None,
+                heartbeat_latency_ms: None,
+                heartbeat_consecutive_failures: 0,
+                heartbeat_next_due_at_ms: None,
+                heartbeat_freshness: None,
+                heartbeat_last_attempt_at_ms: None,
+                heartbeat_last_success_at_ms: None,
+                heartbeat_last_failure_at_ms: None,
+                heartbeat_last_failure_reason: None,
                 error_message: None,
             },
         );
@@ -316,6 +349,7 @@ impl McpToolRegistry {
             return;
         };
         let catalogs = manager.server_catalogs();
+        let heartbeats = manager.heartbeat_report();
         drop(manager);
 
         let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
@@ -329,6 +363,24 @@ impl McpToolRegistry {
                 .protocol_transport_policy
                 .map(|policy| policy.as_str().to_string());
             state.protocol_configured_preferred = catalog.protocol_configured_preferred;
+        }
+        for heartbeat in heartbeats {
+            let Some(state) = inner.get_mut(&heartbeat.server_name) else {
+                continue;
+            };
+            state.heartbeat_status = serde_json::to_value(&heartbeat.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned));
+            state.heartbeat_interval_ms = heartbeat.interval_ms;
+            state.heartbeat_timeout_ms = heartbeat.timeout_ms;
+            state.heartbeat_latency_ms = heartbeat.latency_ms;
+            state.heartbeat_consecutive_failures = heartbeat.consecutive_failures;
+            state.heartbeat_next_due_at_ms = heartbeat.next_due_at_ms;
+            state.heartbeat_freshness = heartbeat.freshness;
+            state.heartbeat_last_attempt_at_ms = heartbeat.last_attempt_at_ms;
+            state.heartbeat_last_success_at_ms = heartbeat.last_success_at_ms;
+            state.heartbeat_last_failure_at_ms = heartbeat.last_failure_at_ms;
+            state.heartbeat_last_failure_reason = heartbeat.last_failure_reason;
         }
     }
 
@@ -952,6 +1004,8 @@ mod tests {
             "                'serverInfo': {'name': LABEL, 'version': '1.0.0'}",
             "            }",
             "        })",
+            "    elif method == 'ping':",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})",
             "    elif method == 'tools/list':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -1055,6 +1109,8 @@ mod tests {
                     ),
                 ]),
                 tool_call_timeout_ms: Some(1_000),
+                heartbeat_interval_ms: None,
+                heartbeat_timeout_ms: None,
             }),
         }
     }
@@ -1287,7 +1343,12 @@ mod tests {
         let log = fs::read_to_string(&log_path).expect("read log");
         assert_eq!(
             log.lines().collect::<Vec<_>>(),
-            vec!["initialize", "notifications/initialized", "resources/read"]
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "ping",
+                "resources/read",
+            ]
         );
 
         cleanup_script(&script_path);
@@ -1329,6 +1390,7 @@ mod tests {
             vec![
                 "initialize",
                 "notifications/initialized",
+                "ping",
                 "resources/templates/list",
             ]
         );
@@ -1425,7 +1487,9 @@ mod tests {
             vec![
                 "initialize",
                 "notifications/initialized",
+                "ping",
                 "tools/list",
+                "ping",
                 "tools/call",
             ]
         );

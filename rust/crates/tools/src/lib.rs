@@ -2552,7 +2552,7 @@ fn run_get_mcp_prompt(input: McpPromptInput) -> Result<String, String> {
 fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
     let registry = global_mcp_registry();
     match registry.get_server(&input.server) {
-        Some(state) => to_pretty_json(json!({
+        Some(state) => to_bounded_mcp_json(json!({
             "server": input.server,
             "status": state.status,
             "server_info": state.server_info,
@@ -2561,6 +2561,19 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
                 "negotiated": state.negotiated_protocol_version,
                 "policy": state.protocol_transport_policy,
                 "configuredPreferred": state.protocol_configured_preferred,
+            },
+            "heartbeat": {
+                "status": state.heartbeat_status,
+                "intervalMs": state.heartbeat_interval_ms,
+                "timeoutMs": state.heartbeat_timeout_ms,
+                "latencyMs": state.heartbeat_latency_ms,
+                "consecutiveFailures": state.heartbeat_consecutive_failures,
+                "nextDueAtMs": state.heartbeat_next_due_at_ms,
+                "freshness": state.heartbeat_freshness,
+                "lastAttemptAtMs": state.heartbeat_last_attempt_at_ms,
+                "lastSuccessAtMs": state.heartbeat_last_success_at_ms,
+                "lastFailureAtMs": state.heartbeat_last_failure_at_ms,
+                "lastFailureReason": state.heartbeat_last_failure_reason,
             },
             "tool_count": state.tools.len(),
             "resource_count": state.resources.len()
@@ -8575,6 +8588,8 @@ mod tests {
             "                'serverInfo': {'name': 'tools-fixture', 'version': '1.0.0'}",
             "            }",
             "        })",
+            "    elif method == 'ping':",
+            "        send_message({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})",
             "    elif method == 'tools/list':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -8635,6 +8650,8 @@ mod tests {
                     args: vec![script_path.to_string_lossy().into_owned()],
                     env,
                     tool_call_timeout_ms: Some(5_000),
+                    heartbeat_interval_ms: None,
+                    heartbeat_timeout_ms: None,
                 }),
             },
         )]);
@@ -8710,6 +8727,8 @@ mod tests {
                     args: vec![script_path.to_string_lossy().into_owned()],
                     env,
                     tool_call_timeout_ms: Some(5_000),
+                    heartbeat_interval_ms: None,
+                    heartbeat_timeout_ms: None,
                 }),
             },
         )]);
