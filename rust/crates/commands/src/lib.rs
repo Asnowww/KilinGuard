@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginScanReport, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     RuntimeConfig, ScopedMcpServerConfig, Session,
@@ -2224,8 +2224,8 @@ pub fn handle_plugins_slash_command(
     manager: &mut PluginManager,
 ) -> Result<PluginsCommandResult, PluginError> {
     match action {
-        None | Some("list") => {
-            let report = manager.installed_plugin_registry_report()?;
+        None | Some("list" | "status") => {
+            let report = manager.plugin_registry_report()?;
             let plugins: Vec<_> = if let Some(filter) = target {
                 let needle = filter.to_lowercase();
                 report
@@ -2238,7 +2238,11 @@ pub fn handle_plugins_slash_command(
             };
             let failures = report.failures();
             Ok(PluginsCommandResult {
-                message: render_plugins_report_with_failures(&plugins, failures),
+                message: render_plugins_report_with_failures(
+                    &plugins,
+                    failures,
+                    report.scan_report(),
+                ),
                 reload_runtime: false,
             })
         }
@@ -2391,9 +2395,9 @@ pub fn handle_plugins_slash_command(
             })
         }
         Some("show" | "info" | "describe") => {
-            // Show a named plugin by filtering the installed registry.
+            // Show a named plugin by filtering the full registry.
             // Without a target, shows all (same as list).
-            let report = manager.installed_plugin_registry_report()?;
+            let report = manager.plugin_registry_report()?;
             let plugins: Vec<_> = if let Some(name) = target {
                 let needle = name.to_lowercase();
                 report
@@ -2406,14 +2410,18 @@ pub fn handle_plugins_slash_command(
             };
             let failures = report.failures();
             Ok(PluginsCommandResult {
-                message: render_plugins_report_with_failures(&plugins, failures),
+                message: render_plugins_report_with_failures(
+                    &plugins,
+                    failures,
+                    report.scan_report(),
+                ),
                 reload_runtime: false,
             })
         }
         // #743/#420: "help" was caught by Some(other) → unknown_plugins_action error with hint:null.
         // agents/mcp/skills all return a help envelope; plugins must match that parity.
         Some("help" | "-h" | "--help") => Ok(PluginsCommandResult {
-            message: "Plugins\n  Usage            /plugins [list|show <id>|install <id>|enable <id>|disable <id>|uninstall <id>|update <id>|versions <id>|rollback <id> <version>|help]\n  Subcommands      list  show  install  enable  disable  uninstall  update  versions  rollback  help"
+            message: "Plugins\n  Usage            /plugins [list|status|show <id>|install <id>|enable <id>|disable <id>|uninstall <id>|update <id>|versions <id>|rollback <id> <version>|help]\n  Subcommands      list  status  show  install  enable  disable  uninstall  update  versions  rollback  help"
                 .to_string(),
             reload_runtime: false,
         }),
@@ -3183,6 +3191,7 @@ pub fn render_plugins_report(plugins: &[PluginSummary]) -> String {
 pub fn render_plugins_report_with_failures(
     plugins: &[PluginSummary],
     failures: &[PluginLoadFailure],
+    scan_report: &PluginScanReport,
 ) -> String {
     let mut lines = vec!["Plugins".to_string()];
 
@@ -3212,12 +3221,61 @@ pub fn render_plugins_report_with_failures(
             lines.push(format!(
                 "  ⚠️  Failed to load {} plugin from `{}`",
                 failure.kind,
-                failure.plugin_root.display()
+                plugins::sanitize_plugin_error(&failure.plugin_root.display().to_string())
             ));
             lines.push(format!(
                 "      Error: {}",
                 plugins::sanitize_plugin_error(&failure.error().to_string())
             ));
+        }
+    }
+
+    if !scan_report.roots.is_empty()
+        || scan_report.failure_count > 0
+        || scan_report.omitted_count > 0
+        || scan_report.truncated
+    {
+        let status = if scan_report.failure_count > 0
+            || scan_report.omitted_count > 0
+            || scan_report.truncated
+        {
+            "degraded"
+        } else {
+            "ok"
+        };
+        lines.push(String::new());
+        lines.push("Scan".to_string());
+        lines.push(format!("  Status           {status}"));
+        lines.push(format!("  Roots            {}", scan_report.roots.len()));
+        lines.push(format!("  Plugins          {}", scan_report.plugin_count));
+        lines.push(format!("  Failures         {}", scan_report.failure_count));
+        lines.push(format!("  Omitted          {}", scan_report.omitted_count));
+        lines.push(format!("  Truncated        {}", scan_report.truncated));
+        lines.push(format!("  Duration ms      {}", scan_report.duration_ms));
+        for root in &scan_report.roots {
+            let root_status = if root.failure_count > 0 || root.omitted_count > 0 || root.truncated
+            {
+                "degraded"
+            } else {
+                "ok"
+            };
+            lines.push(format!(
+                "  Root             {} priority={} status={} plugins={} failures={} omitted={} truncated={} path={}",
+                root.source,
+                root.priority,
+                root_status,
+                root.plugin_count,
+                root.failure_count,
+                root.omitted_count,
+                root.truncated,
+                root.path
+            ));
+            for warning in &root.warnings {
+                lines.push(format!("    Warning        {warning}"));
+            }
+        }
+        for warning in &scan_report.warnings {
+            lines.push(format!("  Warning          {warning}"));
         }
     }
 
@@ -4722,7 +4780,7 @@ mod tests {
     use plugins::{
         PluginActualSurfaces, PluginCapabilities, PluginError, PluginKind, PluginLifecycle,
         PluginLoadFailure, PluginManager, PluginManagerConfig, PluginManifestMetadata,
-        PluginMetadata, PluginSummary,
+        PluginMetadata, PluginScanReport, PluginSummary,
     };
     use runtime::{
         CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
@@ -5627,6 +5685,12 @@ mod tests {
                     "hook path `hooks/pre.sh` does not exist TOKEN={secret} Secret={secret} API_KEY={secret}"
                 )),
             )],
+            &PluginScanReport {
+                failure_count: 1,
+                omitted_count: 2,
+                truncated: true,
+                ..PluginScanReport::default()
+            },
         );
 
         assert!(rendered.contains("Warnings:"));
@@ -5637,6 +5701,10 @@ mod tests {
         assert!(!rendered.contains("TOKEN=SECRET"));
         assert!(!rendered.contains("Secret=SECRET"));
         assert!(!rendered.contains("API_KEY=SECRET"));
+        assert!(rendered.contains("Scan"));
+        assert!(rendered.contains("Status           degraded"));
+        assert!(rendered.contains("Omitted          2"));
+        assert!(rendered.contains("Truncated        true"));
     }
 
     #[test]
@@ -6399,6 +6467,11 @@ mod tests {
         assert!(list.message.contains("demo"));
         assert!(list.message.contains("v1.0.0"));
         assert!(list.message.contains("enabled"));
+
+        let status = handle_plugins_slash_command(Some("status"), None, &mut manager)
+            .expect("status command should succeed");
+        assert!(!status.reload_runtime);
+        assert!(status.message.contains("demo"));
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);

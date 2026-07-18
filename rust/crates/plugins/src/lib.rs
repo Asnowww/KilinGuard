@@ -2,7 +2,7 @@ mod hooks;
 #[cfg(test)]
 pub mod test_isolation;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Write as _;
@@ -49,6 +49,13 @@ const PLUGIN_ERROR_SURFACE_MAX_CHARS: usize = 2048;
 const PLUGIN_CHILD_OUTPUT_LIMIT: usize = 1024 * 1024;
 const PLUGIN_LOCK_TIMEOUT_MS: u64 = 5_000;
 const PLUGIN_LOCK_POLL_MS: u64 = 25;
+const PLUGIN_SCAN_MAX_DEPTH: usize = 4;
+const PLUGIN_SCAN_MAX_ENTRIES: usize = 1024;
+const PLUGIN_SCAN_MAX_ROOTS: usize = 64;
+const PLUGIN_SCAN_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const PLUGIN_SCAN_MAX_DURATION_MS: u128 = 5_000;
+const PLUGIN_SCAN_MAX_WARNINGS: usize = 64;
+const PLUGIN_SCAN_WARNING_MAX_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2655,10 +2662,115 @@ impl Display for PluginLoadFailure {
             f,
             "failed to load {} plugin from `{}` (source: {}): {}",
             self.kind,
-            self.plugin_root.display(),
+            sanitize_plugin_error(&self.plugin_root.display().to_string()),
             sanitize_plugin_error(&self.source),
             sanitize_plugin_error(&self.error().to_string())
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginScanRootSource {
+    Installed,
+    Bundled,
+    System,
+    UserConfig,
+    UserData,
+    Project,
+    ExplicitConfig,
+}
+
+impl Display for PluginScanRootSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Installed => write!(f, "installed"),
+            Self::Bundled => write!(f, "bundled"),
+            Self::System => write!(f, "system"),
+            Self::UserConfig => write!(f, "userConfig"),
+            Self::UserData => write!(f, "userData"),
+            Self::Project => write!(f, "project"),
+            Self::ExplicitConfig => write!(f, "explicitConfig"),
+        }
+    }
+}
+
+impl PluginScanRootSource {
+    #[must_use]
+    fn priority(self) -> u8 {
+        match self {
+            Self::Installed => 80,
+            Self::Bundled => 70,
+            Self::System => 10,
+            Self::UserConfig => 20,
+            Self::UserData => 30,
+            Self::Project => 40,
+            Self::ExplicitConfig => 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginScanRoot {
+    pub path: PathBuf,
+    pub source: PluginScanRootSource,
+    pub priority: u8,
+}
+
+impl PluginScanRoot {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, source: PluginScanRootSource) -> Self {
+        Self {
+            path: path.into(),
+            source,
+            priority: source.priority(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginScanRootReport {
+    pub path: String,
+    pub source: String,
+    pub priority: u8,
+    pub manifest_count: usize,
+    pub plugin_count: usize,
+    pub failure_count: usize,
+    pub skipped_count: usize,
+    pub omitted_count: usize,
+    pub truncated: bool,
+    pub duration_ms: u128,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginScanReport {
+    pub roots: Vec<PluginScanRootReport>,
+    pub plugin_count: usize,
+    pub failure_count: usize,
+    pub skipped_count: usize,
+    pub omitted_count: usize,
+    pub truncated: bool,
+    pub duration_ms: u128,
+    pub warnings: Vec<String>,
+}
+
+impl PluginScanReport {
+    fn push_root(&mut self, root: PluginScanRootReport) {
+        self.plugin_count += root.plugin_count;
+        self.failure_count += root.failure_count;
+        self.skipped_count += root.skipped_count;
+        self.omitted_count += root.omitted_count;
+        self.truncated |= root.truncated;
+        for warning in &root.warnings {
+            if !push_scan_warning(&mut self.warnings, warning) {
+                self.truncated = true;
+                self.omitted_count += 1;
+            }
+        }
+        self.roots.push(root);
     }
 }
 
@@ -2666,12 +2778,30 @@ impl Display for PluginLoadFailure {
 pub struct PluginRegistryReport {
     registry: PluginRegistry,
     failures: Vec<PluginLoadFailure>,
+    scan_report: PluginScanReport,
 }
 
 impl PluginRegistryReport {
     #[must_use]
     pub fn new(registry: PluginRegistry, failures: Vec<PluginLoadFailure>) -> Self {
-        Self { registry, failures }
+        Self {
+            registry,
+            failures,
+            scan_report: PluginScanReport::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_scan_report(
+        registry: PluginRegistry,
+        failures: Vec<PluginLoadFailure>,
+        scan_report: PluginScanReport,
+    ) -> Self {
+        Self {
+            registry,
+            failures,
+            scan_report,
+        }
     }
 
     #[must_use]
@@ -2680,8 +2810,18 @@ impl PluginRegistryReport {
     }
 
     #[must_use]
+    pub fn healthy_registry(&self) -> PluginRegistry {
+        self.registry.clone()
+    }
+
+    #[must_use]
     pub fn failures(&self) -> &[PluginLoadFailure] {
         &self.failures
+    }
+
+    #[must_use]
+    pub fn scan_report(&self) -> &PluginScanReport {
+        &self.scan_report
     }
 
     #[must_use]
@@ -2696,6 +2836,14 @@ impl PluginRegistryReport {
 
     pub fn into_registry(self) -> Result<PluginRegistry, PluginError> {
         if self.failures.is_empty() {
+            if self.scan_report.failure_count > 0 || self.scan_report.truncated {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin discovery scan degraded: failures={}, omitted={}, truncated={}",
+                    self.scan_report.failure_count,
+                    self.scan_report.omitted_count,
+                    self.scan_report.truncated
+                )));
+            }
             self.registry.validate_registration_conflicts()?;
             Ok(self.registry)
         } else {
@@ -2708,6 +2856,7 @@ impl PluginRegistryReport {
 struct PluginDiscovery {
     plugins: Vec<PluginDefinition>,
     failures: Vec<PluginLoadFailure>,
+    scan_report: PluginScanReport,
 }
 
 impl PluginDiscovery {
@@ -2722,6 +2871,16 @@ impl PluginDiscovery {
     fn extend(&mut self, other: Self) {
         self.plugins.extend(other.plugins);
         self.failures.extend(other.failures);
+        self.scan_report.roots.extend(other.scan_report.roots);
+        self.scan_report.plugin_count += other.scan_report.plugin_count;
+        self.scan_report.failure_count += other.scan_report.failure_count;
+        self.scan_report.skipped_count += other.scan_report.skipped_count;
+        self.scan_report.omitted_count += other.scan_report.omitted_count;
+        self.scan_report.truncated |= other.scan_report.truncated;
+        self.scan_report.duration_ms += other.scan_report.duration_ms;
+        for warning in other.scan_report.warnings {
+            record_scan_warning(&mut self.scan_report, &warning);
+        }
     }
 }
 
@@ -2936,6 +3095,7 @@ pub struct PluginManagerConfig {
     pub config_home: PathBuf,
     pub enabled_plugins: BTreeMap<String, bool>,
     pub external_dirs: Vec<PathBuf>,
+    pub discovery_roots: Vec<PluginScanRoot>,
     pub install_root: Option<PathBuf>,
     pub registry_path: Option<PathBuf>,
     pub bundled_root: Option<PathBuf>,
@@ -2948,10 +3108,20 @@ impl PluginManagerConfig {
             config_home: config_home.into(),
             enabled_plugins: BTreeMap::new(),
             external_dirs: Vec::new(),
+            discovery_roots: Vec::new(),
             install_root: None,
             registry_path: None,
             bundled_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn default_discovery_roots(project_root: Option<&Path>) -> Vec<PluginScanRoot> {
+        default_plugin_discovery_roots(project_root)
+    }
+
+    pub fn enable_default_discovery(&mut self, project_root: Option<&Path>) {
+        self.discovery_roots = Self::default_discovery_roots(project_root);
     }
 }
 
@@ -3251,10 +3421,9 @@ impl PluginManager {
     }
 
     pub fn plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
-        self.sync_bundled_plugins()?;
-
         let mut discovery = PluginDiscovery::default();
         discovery.plugins.extend(builtin_plugins());
+        discovery.extend(self.sync_bundled_plugins()?);
 
         let installed = self.discover_installed_plugins_with_failures()?;
         discovery.extend(installed);
@@ -3552,11 +3721,17 @@ impl PluginManager {
         let mut seen_paths = BTreeSet::<PathBuf>::new();
         let mut stale_registry_ids = Vec::new();
 
-        for install_path in discover_plugin_dirs(&self.install_root())? {
-            let matched_record = registry
-                .plugins
-                .values()
-                .find(|record| record.install_path == install_path);
+        let install_scan_root =
+            PluginScanRoot::new(self.install_root(), PluginScanRootSource::Installed);
+        let (install_paths, root_report) = discover_plugin_dirs_bounded(&install_scan_root);
+        add_scan_root_report(&mut discovery.scan_report, root_report);
+
+        for install_path in install_paths {
+            let install_seen_path = canonical_seen_path(&install_path);
+            let matched_record = registry.plugins.values().find(|record| {
+                record.install_path == install_path
+                    || canonical_seen_path(&record.install_path) == install_seen_path
+            });
             let kind = matched_record.map_or(PluginKind::External, |record| record.kind);
             let source = matched_record.map_or_else(
                 || install_path.display().to_string(),
@@ -3566,8 +3741,20 @@ impl PluginManager {
                 Ok(mut plugin) => {
                     append_manifest_warnings(&mut plugin, &registry.migration_warnings);
                     if seen_ids.insert(plugin.metadata().id.clone()) {
-                        seen_paths.insert(install_path);
+                        seen_paths.insert(install_seen_path.clone());
                         discovery.push_plugin(plugin);
+                    } else if seen_paths.contains(&install_seen_path) {
+                        continue;
+                    } else {
+                        discovery.push_failure(PluginLoadFailure::new(
+                            install_path.clone(),
+                            kind,
+                            source.clone(),
+                            PluginError::InvalidManifest(format!(
+                                "installed plugin `{}` is duplicated",
+                                plugin.metadata().id
+                            )),
+                        ));
                     }
                 }
                 Err(error) => {
@@ -3582,7 +3769,8 @@ impl PluginManager {
         }
 
         for record in registry.plugins.values() {
-            if seen_paths.contains(&record.install_path) {
+            let record_seen_path = canonical_seen_path(&record.install_path);
+            if seen_paths.contains(&record_seen_path) {
                 continue;
             }
             if !record.install_path.exists() || plugin_manifest_path(&record.install_path).is_err()
@@ -3590,27 +3778,66 @@ impl PluginManager {
                 stale_registry_ids.push(record.id.clone());
                 continue;
             }
-            let source = describe_install_source(&record.source);
-            match load_plugin_definition(
-                &record.install_path,
-                record.kind,
-                source.clone(),
-                record.kind.marketplace(),
-            ) {
-                Ok(mut plugin) => {
-                    append_manifest_warnings(&mut plugin, &registry.migration_warnings);
-                    if seen_ids.insert(plugin.metadata().id.clone()) {
-                        seen_paths.insert(record.install_path.clone());
-                        discovery.push_plugin(plugin);
-                    }
-                }
-                Err(error) => {
+            let record_scan_root =
+                PluginScanRoot::new(record.install_path.clone(), PluginScanRootSource::Installed);
+            let (record_roots, root_report) = discover_plugin_dirs_bounded(&record_scan_root);
+            add_scan_root_report(&mut discovery.scan_report, root_report);
+            if record_roots.is_empty() {
+                if self
+                    .config
+                    .enabled_plugins
+                    .get(&record.id)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     discovery.push_failure(PluginLoadFailure::new(
                         record.install_path.clone(),
                         record.kind,
-                        source,
-                        error,
+                        describe_install_source(&record.source),
+                        PluginError::InvalidManifest(format!(
+                            "enabled installed plugin `{}` failed bounded scan trust checks",
+                            record.id
+                        )),
                     ));
+                }
+                continue;
+            }
+            let source = describe_install_source(&record.source);
+            for record_root in record_roots {
+                let record_root_seen_path = canonical_seen_path(&record_root);
+                match load_plugin_definition(
+                    &record_root,
+                    record.kind,
+                    source.clone(),
+                    record.kind.marketplace(),
+                ) {
+                    Ok(mut plugin) => {
+                        append_manifest_warnings(&mut plugin, &registry.migration_warnings);
+                        if seen_ids.insert(plugin.metadata().id.clone()) {
+                            seen_paths.insert(record_root_seen_path.clone());
+                            discovery.push_plugin(plugin);
+                        } else if seen_paths.contains(&record_root_seen_path) {
+                            continue;
+                        } else {
+                            discovery.push_failure(PluginLoadFailure::new(
+                                record_root,
+                                record.kind,
+                                source.clone(),
+                                PluginError::InvalidManifest(format!(
+                                    "installed plugin `{}` is duplicated",
+                                    record.id
+                                )),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        discovery.push_failure(PluginLoadFailure::new(
+                            record_root,
+                            record.kind,
+                            source.clone(),
+                            error,
+                        ));
+                    }
                 }
             }
         }
@@ -3627,26 +3854,98 @@ impl PluginManager {
         existing_plugins: &[PluginDefinition],
     ) -> Result<PluginDiscovery, PluginError> {
         let mut discovery = PluginDiscovery::default();
+        let mut scan_roots = self.config.discovery_roots.clone();
+        scan_roots.extend(
+            self.config
+                .external_dirs
+                .iter()
+                .cloned()
+                .map(|path| PluginScanRoot::new(path, PluginScanRootSource::ExplicitConfig)),
+        );
+        stable_dedup_scan_roots(&mut scan_roots);
+        if scan_roots.len() > PLUGIN_SCAN_MAX_ROOTS {
+            record_scan_warning(
+                &mut discovery.scan_report,
+                &format!(
+                    "plugin discovery roots exceed {PLUGIN_SCAN_MAX_ROOTS}; extra roots were skipped"
+                ),
+            );
+            discovery.scan_report.omitted_count += scan_roots.len() - PLUGIN_SCAN_MAX_ROOTS;
+            discovery.scan_report.truncated = true;
+            scan_roots.truncate(PLUGIN_SCAN_MAX_ROOTS);
+        }
 
-        for directory in &self.config.external_dirs {
-            for root in discover_plugin_dirs(directory)? {
+        let mut selected = BTreeMap::<String, ScannedPluginCandidate>::new();
+        for scan_root in &scan_roots {
+            let (roots, root_report) = discover_plugin_dirs_bounded(scan_root);
+            add_scan_root_report(&mut discovery.scan_report, root_report);
+            for root in roots {
                 let source = root.display().to_string();
                 match load_plugin_definition(
                     &root,
                     PluginKind::External,
-                    source.clone(),
+                    discovered_plugin_source(scan_root, &root),
                     EXTERNAL_MARKETPLACE,
                 ) {
                     Ok(plugin) => {
-                        if existing_plugins
-                            .iter()
-                            .chain(discovery.plugins.iter())
-                            .all(|existing| existing.metadata().id != plugin.metadata().id)
-                        {
-                            discovery.push_plugin(plugin);
+                        let id = plugin.metadata().id.clone();
+                        let candidate = ScannedPluginCandidate {
+                            plugin,
+                            root: root.clone(),
+                            source,
+                            priority: scan_root.priority,
+                        };
+                        match selected.get(&id) {
+                            Some(existing) if existing.priority > candidate.priority => {
+                                discovery.scan_report.skipped_count += 1;
+                                record_scan_warning(
+                                    &mut discovery.scan_report,
+                                    &format!(
+                                        "plugin `{id}` duplicate resolved: winner priority {} `{}`, loser priority {} `{}` from {} root",
+                                        existing.priority,
+                                        existing.root.display(),
+                                        candidate.priority,
+                                        root.display(),
+                                        scan_root.source,
+                                    ),
+                                );
+                            }
+                            Some(existing) if existing.priority == candidate.priority => {
+                                discovery.scan_report.failure_count += 1;
+                                discovery.push_failure(PluginLoadFailure::new(
+                                    root,
+                                    PluginKind::External,
+                                    candidate.source,
+                                    PluginError::InvalidManifest(format!(
+                                        "plugin `{id}` is duplicated in equal-priority discovery roots at priority {}: `{}` and `{}`",
+                                        candidate.priority,
+                                        existing.root.display(),
+                                        candidate.root.display()
+                                    )),
+                                ));
+                            }
+                            Some(existing) => {
+                                discovery.scan_report.skipped_count += 1;
+                                record_scan_warning(
+                                    &mut discovery.scan_report,
+                                    &format!(
+                                        "plugin `{id}` duplicate resolved: winner priority {} `{}`, loser priority {} `{}` from {} root",
+                                        candidate.priority,
+                                        root.display(),
+                                        existing.priority,
+                                        existing.root.display(),
+                                        scan_root.source,
+                                    ),
+                                );
+                                selected.insert(id, candidate);
+                            }
+                            None => {
+                                selected.insert(id, candidate);
+                            }
                         }
                     }
                     Err(error) => {
+                        discovery.scan_report.failure_count += 1;
                         discovery.push_failure(PluginLoadFailure::new(
                             root,
                             PluginKind::External,
@@ -3658,41 +3957,83 @@ impl PluginManager {
             }
         }
 
+        for (_, candidate) in selected {
+            if let Some(existing) = existing_plugins
+                .iter()
+                .find(|existing| existing.metadata().id == candidate.plugin.metadata().id)
+            {
+                discovery.scan_report.failure_count += 1;
+                discovery.push_failure(PluginLoadFailure::new(
+                    candidate.root,
+                    PluginKind::External,
+                    candidate.source,
+                    PluginError::InvalidManifest(format!(
+                        "discovered plugin `{}` conflicts with existing plugin `{}`",
+                        candidate.plugin.metadata().id,
+                        existing.metadata().id
+                    )),
+                ));
+                continue;
+            }
+            if let Some(existing) = existing_plugins
+                .iter()
+                .find(|existing| existing.metadata().name == candidate.plugin.metadata().name)
+            {
+                discovery.scan_report.failure_count += 1;
+                discovery.push_failure(PluginLoadFailure::new(
+                    candidate.root,
+                    PluginKind::External,
+                    candidate.source,
+                    PluginError::InvalidManifest(format!(
+                        "discovered plugin name `{}` conflicts with existing plugin `{}`",
+                        candidate.plugin.metadata().name,
+                        existing.metadata().id
+                    )),
+                ));
+                continue;
+            }
+            discovery.push_plugin(candidate.plugin);
+        }
+
         Ok(discovery)
     }
 
     pub fn installed_plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
-        self.sync_bundled_plugins()?;
-        Ok(self.build_registry_report(self.discover_installed_plugins_with_failures()?))
+        let mut discovery = self.sync_bundled_plugins()?;
+        discovery.extend(self.discover_installed_plugins_with_failures()?);
+        Ok(self.build_registry_report(discovery))
     }
 
-    fn sync_bundled_plugins(&self) -> Result<(), PluginError> {
+    fn sync_bundled_plugins(&self) -> Result<PluginDiscovery, PluginError> {
         let _mutation_locks = self.acquire_mutation_locks()?;
-        let explicit_root = self.config.bundled_root.is_some();
+        let mut discovery = PluginDiscovery::default();
         let bundled_root = self
             .config
             .bundled_root
             .clone()
             .unwrap_or_else(Self::bundled_root);
-        let bundled_plugins = match discover_plugin_dirs(&bundled_root) {
-            Ok(plugins) => plugins,
-            // When the bundled root is the auto-detected default and the directory is
-            // inaccessible (e.g. a root-owned source tree), treat it as empty rather
-            // than fatally failing.  An explicit config override still surfaces errors.
-            Err(PluginError::Io(ref error))
-                if !explicit_root && error.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                Vec::new()
-            }
-            Err(error) => return Err(error),
-        };
+        let scan_root = PluginScanRoot::new(&bundled_root, PluginScanRootSource::Bundled);
+        let (bundled_plugins, root_report) = discover_plugin_dirs_bounded(&scan_root);
+        let bundled_scan_truncated = root_report.truncated;
+        add_scan_root_report(&mut discovery.scan_report, root_report);
         let mut registry = self.load_registry_under_exclusive_lock()?;
         let mut changed = false;
         let install_root = self.install_root();
         let mut active_bundled_ids = BTreeSet::new();
 
         for source_root in bundled_plugins {
-            let manifest = load_plugin_from_directory(&source_root)?;
+            let manifest = match load_plugin_from_directory(&source_root) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    discovery.push_failure(PluginLoadFailure::new(
+                        source_root.clone(),
+                        PluginKind::Bundled,
+                        source_root.display().to_string(),
+                        error,
+                    ));
+                    continue;
+                }
+            };
             let plugin_id = plugin_id(&manifest.name, BUNDLED_MARKETPLACE);
             active_bundled_ids.insert(plugin_id.clone());
             let install_path = install_root.join(sanitize_plugin_id(&plugin_id));
@@ -3717,7 +4058,15 @@ impl PluginManager {
             if install_path.exists() {
                 fs::remove_dir_all(&install_path)?;
             }
-            copy_dir_all(&source_root, &install_path)?;
+            if let Err(error) = copy_dir_all(&source_root, &install_path) {
+                discovery.push_failure(PluginLoadFailure::new(
+                    source_root.clone(),
+                    PluginKind::Bundled,
+                    source_root.display().to_string(),
+                    error,
+                ));
+                continue;
+            }
 
             let installed_at_unix_ms =
                 existing_record.map_or(now, |record| record.installed_at_unix_ms);
@@ -3743,8 +4092,10 @@ impl PluginManager {
             .plugins
             .iter()
             .filter_map(|(plugin_id, record)| {
-                (record.kind == PluginKind::Bundled && !active_bundled_ids.contains(plugin_id))
-                    .then_some(plugin_id.clone())
+                (!bundled_scan_truncated
+                    && record.kind == PluginKind::Bundled
+                    && !active_bundled_ids.contains(plugin_id))
+                .then_some(plugin_id.clone())
             })
             .collect::<Vec<_>>();
 
@@ -3761,7 +4112,7 @@ impl PluginManager {
             self.store_registry_under_registry_lock(&registry)?;
         }
 
-        Ok(())
+        Ok(discovery)
     }
 
     fn is_enabled(&self, metadata: &PluginMetadata) -> bool {
@@ -3959,7 +4310,7 @@ impl PluginManager {
     }
 
     fn build_registry_report(&self, discovery: PluginDiscovery) -> PluginRegistryReport {
-        PluginRegistryReport::new(
+        PluginRegistryReport::with_scan_report(
             PluginRegistry::new(
                 discovery
                     .plugins
@@ -3971,6 +4322,7 @@ impl PluginManager {
                     .collect(),
             ),
             discovery.failures,
+            discovery.scan_report,
         )
     }
 }
@@ -6444,27 +6796,654 @@ fn materialize_source(
                     sanitize_plugin_error(String::from_utf8_lossy(&output.stderr).trim())
                 )));
             }
+            let git_metadata_path = destination.join(".git");
+            match fs::symlink_metadata(&git_metadata_path) {
+                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&git_metadata_path)?,
+                Ok(_) => fs::remove_file(&git_metadata_path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(PluginError::Io(error)),
+            }
             Ok(destination)
         }
     }
 }
 
-fn discover_plugin_dirs(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
-    match fs::read_dir(root) {
-        Ok(entries) => {
-            let mut paths = Vec::new();
-            for entry in entries {
-                let path = entry?.path();
-                if path.is_dir() && plugin_manifest_path(&path).is_ok() {
-                    paths.push(path);
+#[derive(Debug, Clone)]
+struct ScanBudget {
+    started: Instant,
+    files: usize,
+    dirs: usize,
+    total_bytes: u64,
+}
+
+impl ScanBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            files: 0,
+            dirs: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    // Cooperative deadline: checked between filesystem calls; it does not
+    // preempt a blocking OS syscall already in progress.
+    fn check_cooperative_deadline(&self, path: &Path) -> Result<(), PluginError> {
+        if self.elapsed_ms() > PLUGIN_SCAN_MAX_DURATION_MS {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin scan cooperative deadline exceeded {PLUGIN_SCAN_MAX_DURATION_MS} ms while scanning `{}`",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn count_dir(&mut self, path: &Path, depth: usize) -> Result<(), PluginError> {
+        self.check_cooperative_deadline(path)?;
+        if depth > PLUGIN_SCAN_MAX_DEPTH {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin scan budget exceeded depth limit {PLUGIN_SCAN_MAX_DEPTH} at `{}`",
+                path.display()
+            )));
+        }
+        if self.dirs >= PLUGIN_SCAN_MAX_ENTRIES {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin scan budget exceeded {PLUGIN_SCAN_MAX_ENTRIES} directories at `{}`",
+                path.display()
+            )));
+        }
+        self.dirs += 1;
+        Ok(())
+    }
+
+    fn count_file(&mut self, path: &Path, len: u64) -> Result<(), PluginError> {
+        self.check_cooperative_deadline(path)?;
+        if self.files >= PLUGIN_SCAN_MAX_ENTRIES {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin scan budget exceeded {PLUGIN_SCAN_MAX_ENTRIES} files at `{}`",
+                path.display()
+            )));
+        }
+        self.files += 1;
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        if self.total_bytes > PLUGIN_SCAN_MAX_TOTAL_BYTES {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin scan budget exceeded {PLUGIN_SCAN_MAX_TOTAL_BYTES} total bytes at `{}`",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn count_metadata(
+        &mut self,
+        path: &Path,
+        metadata: &fs::Metadata,
+        depth: usize,
+    ) -> Result<(), PluginError> {
+        if metadata.is_dir() {
+            self.count_dir(path, depth)
+        } else if metadata.is_file() {
+            self.count_file(path, metadata.len())
+        } else {
+            Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden special file `{}`",
+                path.display()
+            )))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScannedPluginCandidate {
+    plugin: PluginDefinition,
+    root: PathBuf,
+    source: String,
+    priority: u8,
+}
+
+fn default_plugin_discovery_roots(project_root: Option<&Path>) -> Vec<PluginScanRoot> {
+    let mut roots = Vec::new();
+
+    #[cfg(unix)]
+    {
+        for path in [
+            "/usr/share/kilin/claw/plugins",
+            "/usr/share/claw/plugins",
+            "/etc/kilin/claw/plugins",
+            "/etc/claw/plugins",
+        ] {
+            roots.push(PluginScanRoot::new(path, PluginScanRootSource::System));
+        }
+    }
+
+    if let Some(config_home) =
+        env_path("XDG_CONFIG_HOME").or_else(|| home_dir().map(|home| home.join(".config")))
+    {
+        roots.push(PluginScanRoot::new(
+            config_home.join("claw").join("plugins"),
+            PluginScanRootSource::UserConfig,
+        ));
+    }
+    if let Some(data_home) = env_path("XDG_DATA_HOME")
+        .or_else(|| home_dir().map(|home| home.join(".local").join("share")))
+    {
+        roots.push(PluginScanRoot::new(
+            data_home.join("claw").join("plugins"),
+            PluginScanRootSource::UserData,
+        ));
+    }
+    if let Some(project_root) = project_root {
+        roots.push(PluginScanRoot::new(
+            project_root.join(".claw").join("plugins"),
+            PluginScanRootSource::Project,
+        ));
+    }
+
+    stable_dedup_scan_roots(&mut roots);
+    roots
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env_path("USERPROFILE").or_else(|| {
+            match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+                (Some(drive), Some(path)) if !drive.is_empty() && !path.is_empty() => {
+                    let mut combined = PathBuf::from(drive);
+                    combined.push(path);
+                    Some(combined)
+                }
+                _ => None,
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        env_path("HOME")
+    }
+}
+
+fn stable_dedup_scan_roots(roots: &mut Vec<PluginScanRoot>) {
+    roots.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut seen = BTreeSet::new();
+    roots.retain(|root| seen.insert(root.path.clone()));
+}
+
+fn discovered_plugin_source(scan_root: &PluginScanRoot, plugin_root: &Path) -> String {
+    format!(
+        "discovered:{}:{}",
+        scan_root.source,
+        sanitize_plugin_error(&plugin_root.display().to_string())
+    )
+}
+
+fn canonical_seen_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn discover_plugin_dirs_bounded(
+    scan_root: &PluginScanRoot,
+) -> (Vec<PathBuf>, PluginScanRootReport) {
+    let started = Instant::now();
+    let mut report = PluginScanRootReport {
+        path: sanitize_plugin_error(&scan_root.path.display().to_string()),
+        source: scan_root.source.to_string(),
+        priority: scan_root.priority,
+        ..PluginScanRootReport::default()
+    };
+
+    let metadata = match fs::symlink_metadata(&scan_root.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            record_scan_root_warning(
+                &mut report,
+                &format!(
+                    "plugin discovery root `{}` does not exist",
+                    scan_root.path.display()
+                ),
+            );
+            report.duration_ms = started.elapsed().as_millis();
+            return (Vec::new(), report);
+        }
+        Err(error) => {
+            report.failure_count += 1;
+            record_scan_root_warning(
+                &mut report,
+                &format!(
+                    "plugin discovery root `{}` could not be read: {error}",
+                    scan_root.path.display()
+                ),
+            );
+            report.duration_ms = started.elapsed().as_millis();
+            return (Vec::new(), report);
+        }
+    };
+    if let Err(error) = validate_discovery_entry_metadata(&scan_root.path, &metadata) {
+        report.failure_count += 1;
+        record_scan_root_warning(&mut report, &error.to_string());
+        report.duration_ms = started.elapsed().as_millis();
+        return (Vec::new(), report);
+    }
+    let mut budget = ScanBudget::new();
+    if let Err(error) = budget.count_dir(&scan_root.path, 0) {
+        report.failure_count += 1;
+        report.truncated = true;
+        report.omitted_count += 1;
+        record_scan_root_warning(&mut report, &error.to_string());
+        report.duration_ms = started.elapsed().as_millis();
+        return (Vec::new(), report);
+    }
+    if !metadata.is_dir() {
+        report.failure_count += 1;
+        record_scan_root_warning(
+            &mut report,
+            &format!(
+                "plugin discovery root `{}` must be a directory",
+                scan_root.path.display()
+            ),
+        );
+        report.duration_ms = started.elapsed().as_millis();
+        return (Vec::new(), report);
+    }
+
+    let canonical_root = match scan_root.path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            report.failure_count += 1;
+            record_scan_root_warning(
+                &mut report,
+                &format!(
+                    "plugin discovery root `{}` could not be canonicalized: {error}",
+                    scan_root.path.display()
+                ),
+            );
+            report.duration_ms = started.elapsed().as_millis();
+            return (Vec::new(), report);
+        }
+    };
+    if let Err(error) = validate_discovery_ancestors(&canonical_root) {
+        report.failure_count += 1;
+        record_scan_root_warning(&mut report, &error.to_string());
+        report.duration_ms = started.elapsed().as_millis();
+        return (Vec::new(), report);
+    }
+
+    let mut found = Vec::new();
+    let mut queue = VecDeque::from([(scan_root.path.clone(), 0usize)]);
+    let mut fingerprints = BTreeSet::new();
+    while let Some((directory, depth)) = queue.pop_front() {
+        if let Err(error) = budget.check_cooperative_deadline(&directory) {
+            report.omitted_count += queue.len() + 1;
+            report.truncated = true;
+            record_scan_root_warning(&mut report, &error.to_string());
+            break;
+        }
+
+        let canonical_directory = match directory.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                report.failure_count += 1;
+                record_scan_root_warning(
+                    &mut report,
+                    &format!(
+                        "plugin discovery path `{}` could not be canonicalized: {error}",
+                        directory.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        if !canonical_directory.starts_with(&canonical_root) {
+            report.failure_count += 1;
+            record_scan_root_warning(
+                &mut report,
+                &format!(
+                    "plugin discovery path `{}` escaped root `{}`",
+                    directory.display(),
+                    scan_root.path.display()
+                ),
+            );
+            continue;
+        }
+
+        if let Ok(manifest_path) = plugin_manifest_path(&directory) {
+            report.manifest_count += 1;
+            match fs::symlink_metadata(&manifest_path) {
+                Ok(manifest_metadata)
+                    if manifest_metadata.len() <= PLUGIN_MANIFEST_MAX_BYTES
+                        && validate_discovery_entry_metadata(
+                            &manifest_path,
+                            &manifest_metadata,
+                        )
+                        .is_ok() =>
+                {
+                    if let Err(error) = budget.count_file(&manifest_path, manifest_metadata.len()) {
+                        report.omitted_count += 1;
+                        report.truncated = true;
+                        record_scan_root_warning(&mut report, &error.to_string());
+                        continue;
+                    }
+                    if !fingerprints.insert(plugin_manifest_fingerprint(
+                        &manifest_path,
+                        &manifest_metadata,
+                    )) {
+                        report.omitted_count += 1;
+                        record_scan_root_warning(
+                            &mut report,
+                            &format!(
+                                "plugin manifest `{}` was already seen in this scan",
+                                manifest_path.display()
+                            ),
+                        );
+                        continue;
+                    }
+                    found.push(directory);
+                    report.plugin_count += 1;
+                }
+                Ok(manifest_metadata) if manifest_metadata.len() > PLUGIN_MANIFEST_MAX_BYTES => {
+                    report.failure_count += 1;
+                    record_scan_root_warning(
+                        &mut report,
+                        &format!(
+                            "plugin manifest `{}` exceeds {PLUGIN_MANIFEST_MAX_BYTES} byte limit",
+                            manifest_path.display()
+                        ),
+                    );
+                }
+                Ok(manifest_metadata) => {
+                    report.failure_count += 1;
+                    if let Err(error) =
+                        validate_discovery_entry_metadata(&manifest_path, &manifest_metadata)
+                    {
+                        record_scan_root_warning(&mut report, &error.to_string());
+                    }
+                }
+                Err(error) => {
+                    report.failure_count += 1;
+                    record_scan_root_warning(
+                        &mut report,
+                        &format!(
+                            "plugin manifest `{}` could not be inspected: {error}",
+                            manifest_path.display()
+                        ),
+                    );
                 }
             }
-            paths.sort();
-            Ok(paths)
+            continue;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(PluginError::Io(error)),
+
+        if depth >= PLUGIN_SCAN_MAX_DEPTH {
+            report.omitted_count += 1;
+            report.truncated = true;
+            record_scan_root_warning(
+                &mut report,
+                &format!(
+                    "plugin discovery path `{}` exceeded depth limit {PLUGIN_SCAN_MAX_DEPTH}",
+                    directory.display()
+                ),
+            );
+            continue;
+        }
+
+        let mut children = match fs::read_dir(&directory) {
+            Ok(entries) => {
+                let mut children = Vec::new();
+                for entry in entries {
+                    if let Err(error) = budget.check_cooperative_deadline(&directory) {
+                        report.omitted_count += 1;
+                        report.truncated = true;
+                        record_scan_root_warning(&mut report, &error.to_string());
+                        break;
+                    }
+                    if children.len() > PLUGIN_SCAN_MAX_ENTRIES {
+                        report.omitted_count += 1;
+                        report.truncated = true;
+                        record_scan_root_warning(
+                            &mut report,
+                            &format!(
+                                "plugin discovery directory `{}` exceeded bounded collection limit {PLUGIN_SCAN_MAX_ENTRIES}",
+                                directory.display()
+                            ),
+                        );
+                        break;
+                    }
+                    match entry {
+                        Ok(entry) => children.push(entry.path()),
+                        Err(error) => {
+                            report.failure_count += 1;
+                            record_scan_root_warning(
+                                &mut report,
+                                &format!(
+                                    "plugin discovery directory `{}` contained unreadable entry: {error}",
+                                    directory.display()
+                                ),
+                            );
+                        }
+                    }
+                }
+                children
+            }
+            Err(error) => {
+                report.failure_count += 1;
+                record_scan_root_warning(
+                    &mut report,
+                    &format!(
+                        "plugin discovery directory `{}` could not be read: {error}",
+                        directory.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        children.sort();
+        for child in children {
+            let child_metadata = match fs::symlink_metadata(&child) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    report.failure_count += 1;
+                    record_scan_root_warning(
+                        &mut report,
+                        &format!(
+                            "plugin discovery path `{}` could not be inspected: {error}",
+                            child.display()
+                        ),
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = validate_discovery_entry_metadata(&child, &child_metadata) {
+                report.failure_count += 1;
+                record_scan_root_warning(&mut report, &error.to_string());
+                continue;
+            }
+            if scan_root.source == PluginScanRootSource::Installed
+                && child_metadata.is_dir()
+                && is_installed_scan_manager_dir(&child)
+            {
+                report.skipped_count += 1;
+                continue;
+            }
+            if child_metadata.is_dir() {
+                if let Err(error) = budget.count_dir(&child, depth + 1) {
+                    report.omitted_count += 1;
+                    report.truncated = true;
+                    record_scan_root_warning(&mut report, &error.to_string());
+                    continue;
+                }
+                queue.push_back((child, depth + 1));
+            } else if child_metadata.is_file() {
+                if let Err(error) = budget.count_file(&child, child_metadata.len()) {
+                    report.omitted_count += 1;
+                    report.truncated = true;
+                    record_scan_root_warning(&mut report, &error.to_string());
+                    continue;
+                }
+                report.skipped_count += 1;
+            }
+        }
     }
+
+    found.sort();
+    report.duration_ms = started.elapsed().as_millis();
+    (found, report)
+}
+
+fn is_installed_scan_manager_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".tmp" | ".versions"))
+}
+
+fn validate_discovery_entry_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), PluginError> {
+    validate_plugin_entry_metadata(path, metadata)?;
+    validate_posix_discovery_metadata(path, metadata, false)?;
+    Ok(())
+}
+
+fn validate_discovery_ancestors(canonical_root: &Path) -> Result<(), PluginError> {
+    let _ = canonical_root;
+    #[cfg(target_os = "linux")]
+    {
+        for ancestor in canonical_root.ancestors() {
+            let metadata = fs::symlink_metadata(ancestor)?;
+            validate_posix_discovery_metadata(ancestor, &metadata, true)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_posix_discovery_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    ancestor: bool,
+) -> Result<(), PluginError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let uid = metadata.uid();
+    let current_uid = rustix::process::geteuid().as_raw();
+    if uid != current_uid && uid != 0 {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin discovery path `{}` is owned by uid {uid}, not current uid {current_uid} or root",
+            path.display()
+        )));
+    }
+
+    let mode = metadata.permissions().mode();
+    let group_or_world_writable = mode & 0o022 != 0;
+    let sticky_ancestor = ancestor && mode & 0o1000 != 0;
+    if group_or_world_writable && !sticky_ancestor {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin discovery path `{}` is group/world-writable",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_posix_discovery_metadata(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+    _ancestor: bool,
+) -> Result<(), PluginError> {
+    Ok(())
+}
+
+fn plugin_manifest_fingerprint(path: &Path, metadata: &fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        )
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        format!(
+            "{}:{}:{}",
+            path.display(),
+            metadata.file_size(),
+            metadata.last_write_time()
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("{}:{}", path.display(), metadata.len())
+    }
+}
+
+fn push_scan_warning(warnings: &mut Vec<String>, warning: &str) -> bool {
+    if warnings.len() >= PLUGIN_SCAN_MAX_WARNINGS {
+        return false;
+    }
+    warnings.push(bound_plugin_surface(
+        &sanitize_plugin_error(warning),
+        PLUGIN_SCAN_WARNING_MAX_CHARS,
+    ));
+    true
+}
+
+fn record_scan_warning(report: &mut PluginScanReport, warning: &str) {
+    if !push_scan_warning(&mut report.warnings, warning) {
+        report.truncated = true;
+        report.omitted_count += 1;
+    }
+}
+
+fn add_scan_root_report(report: &mut PluginScanReport, root_report: PluginScanRootReport) {
+    report.duration_ms += root_report.duration_ms;
+    report.push_root(root_report);
+}
+
+fn record_scan_root_warning(report: &mut PluginScanRootReport, warning: &str) {
+    if !push_scan_warning(&mut report.warnings, warning) {
+        report.truncated = true;
+        report.omitted_count += 1;
+    }
+}
+
+fn bound_plugin_surface(value: &str, max_chars: usize) -> String {
+    let mut out = value
+        .chars()
+        .filter(|ch| !matches!(ch, '\0'))
+        .take(max_chars)
+        .collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...[truncated]");
+    }
+    out
 }
 
 fn lifecycle_child_permission(permissions: &[PluginPermission]) -> PluginToolPermission {
@@ -7057,7 +8036,9 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
     }
     fs::create_dir(destination)?;
     let canonical_source_root = source.canonicalize()?;
-    copy_dir_all_inner(source, &canonical_source_root, destination)?;
+    let mut budget = ScanBudget::new();
+    budget.count_dir(source, 0)?;
+    copy_dir_all_inner(source, &canonical_source_root, destination, &mut budget, 0)?;
     fs::set_permissions(destination, source_metadata.permissions())?;
     audit_plugin_tree(destination)?;
     Ok(())
@@ -7067,17 +8048,27 @@ fn copy_dir_all_inner(
     source: &Path,
     canonical_source_root: &Path,
     destination: &Path,
+    budget: &mut ScanBudget,
+    depth: usize,
 ) -> Result<(), PluginError> {
     for entry in fs::read_dir(source)? {
+        budget.check_cooperative_deadline(source)?;
         let entry = entry?;
         let source_path = entry.path();
         let metadata = fs::symlink_metadata(&source_path)?;
         validate_plugin_entry_metadata(&source_path, &metadata)?;
         ensure_source_path_within_root(canonical_source_root, &source_path)?;
+        budget.count_metadata(&source_path, &metadata, depth + 1)?;
         let target = destination.join(entry.file_name());
         if metadata.is_dir() {
             fs::create_dir(&target)?;
-            copy_dir_all_inner(&source_path, canonical_source_root, &target)?;
+            copy_dir_all_inner(
+                &source_path,
+                canonical_source_root,
+                &target,
+                budget,
+                depth + 1,
+            )?;
             fs::set_permissions(&target, metadata.permissions())?;
         } else if metadata.is_file() {
             copy_file_atomic(&source_path, canonical_source_root, &target, &metadata)?;
@@ -7100,17 +8091,25 @@ fn audit_plugin_tree(root: &Path) -> Result<(), PluginError> {
             root.display()
         )));
     }
-    audit_plugin_tree_inner(root)
+    let mut budget = ScanBudget::new();
+    budget.count_dir(root, 0)?;
+    audit_plugin_tree_inner(root, &mut budget, 0)
 }
 
-fn audit_plugin_tree_inner(root: &Path) -> Result<(), PluginError> {
+fn audit_plugin_tree_inner(
+    root: &Path,
+    budget: &mut ScanBudget,
+    depth: usize,
+) -> Result<(), PluginError> {
     for entry in fs::read_dir(root)? {
+        budget.check_cooperative_deadline(root)?;
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         validate_plugin_entry_metadata(&path, &metadata)?;
+        budget.count_metadata(&path, &metadata, depth + 1)?;
         if metadata.is_dir() {
-            audit_plugin_tree_inner(&path)?;
+            audit_plugin_tree_inner(&path, budget, depth + 1)?;
         } else if !metadata.is_file() {
             return Err(PluginError::InvalidManifest(format!(
                 "plugin tree contains forbidden special file `{}`",
@@ -9721,6 +10720,339 @@ mod tests {
     }
 
     #[test]
+    fn plugin_discovery_scan_uses_stable_priority_overrides() {
+        let _guard = env_guard();
+        let config_home = temp_dir("scan-priority-home");
+        let low_root = temp_dir("scan-priority-low");
+        let high_root = temp_dir("scan-priority-high");
+        write_external_plugin(&low_root.join("plugin"), "scan-priority", "1.0.0");
+        write_external_plugin(&high_root.join("plugin"), "scan-priority", "2.0.0");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![
+            PluginScanRoot::new(&high_root, PluginScanRootSource::Project),
+            PluginScanRoot::new(&low_root, PluginScanRootSource::System),
+        ];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("priority override should not fail discovery");
+        let summaries = report.summaries();
+        let plugin = summaries
+            .iter()
+            .find(|plugin| plugin.metadata.id == "scan-priority@external")
+            .expect("plugin should be discovered");
+        assert_eq!(plugin.metadata.version, "2.0.0");
+        assert!(plugin.metadata.source.starts_with("discovered:project:"));
+        let explicit_plugin_count: usize = report
+            .scan_report()
+            .roots
+            .iter()
+            .filter(|root| root.source == "project" || root.source == "system")
+            .map(|root| root.plugin_count)
+            .sum();
+        assert_eq!(explicit_plugin_count, 2);
+        assert!(report.scan_report().skipped_count >= 1);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(low_root);
+        let _ = fs::remove_dir_all(high_root);
+    }
+
+    #[test]
+    fn plugin_discovery_scan_isolates_bad_manifest_and_reports_root_stats() {
+        let _guard = env_guard();
+        let config_home = temp_dir("scan-isolation-home");
+        let scan_root = temp_dir("scan-isolation-root");
+        write_external_plugin(&scan_root.join("valid"), "scan-valid", "1.0.0");
+        write_broken_plugin(&scan_root.join("broken"), "scan-broken");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &scan_root,
+            PluginScanRootSource::UserData,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("report should keep valid plugin alongside bad discovered plugin");
+        assert!(report.registry().contains("scan-valid@external"));
+        assert!(report.failures().iter().any(|failure| {
+            failure.kind == PluginKind::External && failure.plugin_root.ends_with("broken")
+        }));
+        let root_report = report
+            .scan_report()
+            .roots
+            .iter()
+            .find(|root| root.source == "userData")
+            .expect("userData scan root should be reported");
+        assert_eq!(root_report.manifest_count, 2);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(scan_root);
+    }
+
+    #[test]
+    fn plugin_discovery_scan_equal_priority_duplicate_fails_closed() {
+        let _guard = env_guard();
+        let config_home = temp_dir("scan-duplicate-home");
+        let left_root = temp_dir("scan-duplicate-left");
+        let right_root = temp_dir("scan-duplicate-right");
+        write_external_plugin(&left_root.join("plugin"), "scan-duplicate", "1.0.0");
+        write_external_plugin(&right_root.join("plugin"), "scan-duplicate", "1.0.0");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![
+            PluginScanRoot::new(&right_root, PluginScanRootSource::ExplicitConfig),
+            PluginScanRoot::new(&left_root, PluginScanRootSource::ExplicitConfig),
+        ];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("report should carry structured duplicate failure");
+        assert_eq!(report.failures().len(), 1);
+        assert!(report.failures()[0]
+            .error()
+            .to_string()
+            .contains("duplicated"));
+        let error = report
+            .into_registry()
+            .expect_err("strict registry should fail closed on duplicate scan result");
+        assert!(error.to_string().contains("duplicated"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(left_root);
+        let _ = fs::remove_dir_all(right_root);
+    }
+
+    #[test]
+    fn plugin_discovery_scan_bounds_manifest_size_and_redacts_report_paths() {
+        let _guard = env_guard();
+        let secret = "SECRET-scan-value";
+        let config_home = temp_dir("scan-redaction-home");
+        let scan_root = temp_dir(&format!("scan-TOKEN={secret}"));
+        let plugin_root = scan_root.join("oversize");
+        fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("manifest dir");
+        fs::write(
+            plugin_root.join(MANIFEST_RELATIVE_PATH),
+            " ".repeat((PLUGIN_MANIFEST_MAX_BYTES + 1) as usize),
+        )
+        .expect("oversize manifest");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &scan_root,
+            PluginScanRootSource::ExplicitConfig,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("oversize discovered plugin should be isolated");
+        let rendered = serde_json::to_string(report.scan_report()).expect("scan report json");
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("[redacted]"));
+        assert_eq!(report.scan_report().failure_count, 1);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(scan_root);
+    }
+
+    #[test]
+    fn plugin_discovery_scan_reports_omitted_and_truncated_for_depth_limit() {
+        let _guard = env_guard();
+        let config_home = temp_dir("scan-depth-home");
+        let scan_root = temp_dir("scan-depth-root");
+        let deep = scan_root.join("a").join("b").join("c").join("d").join("e");
+        fs::create_dir_all(&deep).expect("deep directory");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &scan_root,
+            PluginScanRootSource::ExplicitConfig,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("depth-limited scan should report truncation");
+        let root_report = report
+            .scan_report()
+            .roots
+            .iter()
+            .find(|root| root.source == "explicitConfig")
+            .expect("explicit scan root should be reported");
+        assert!(root_report.truncated);
+        assert!(root_report.omitted_count > 0);
+        assert!(report.scan_report().truncated);
+        assert!(report.scan_report().omitted_count > 0);
+        assert!(root_report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("depth limit")));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(scan_root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_enforces_scan_budget_depth() {
+        let _guard = env_guard();
+        let root = temp_dir("load-budget-depth");
+        write_external_plugin(&root, "load-budget-depth", "1.0.0");
+        let mut deep = root.clone();
+        for segment in ["a", "b", "c", "d", "e"] {
+            deep = deep.join(segment);
+        }
+        fs::create_dir_all(&deep).expect("deep path");
+
+        let error = load_plugin_from_directory(&root).expect_err("deep tree should fail budget");
+        assert!(error.to_string().contains("scan budget exceeded depth"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_plugin_discovery_roots_include_xdg_and_project_paths() {
+        let _guard = env_guard();
+        let xdg_config = temp_dir("scan-xdg-config");
+        let xdg_data = temp_dir("scan-xdg-data");
+        let project_root = temp_dir("scan-project");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
+        std::env::set_var("XDG_DATA_HOME", &xdg_data);
+
+        let roots = PluginManagerConfig::default_discovery_roots(Some(&project_root));
+
+        assert!(roots.iter().any(|root| {
+            root.source == PluginScanRootSource::UserConfig
+                && root.path == xdg_config.join("claw").join("plugins")
+        }));
+        assert!(roots.iter().any(|root| {
+            root.source == PluginScanRootSource::UserData
+                && root.path == xdg_data.join("claw").join("plugins")
+        }));
+        assert!(roots.iter().any(|root| {
+            root.source == PluginScanRootSource::Project
+                && root.path == project_root.join(".claw").join("plugins")
+        }));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = fs::remove_dir_all(xdg_config);
+        let _ = fs::remove_dir_all(xdg_data);
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_discovery_scan_rejects_symlink_roots() {
+        let _guard = env_guard();
+        use std::os::unix::fs as unix_fs;
+
+        let config_home = temp_dir("scan-symlink-home");
+        let real_root = temp_dir("scan-symlink-real");
+        let symlink_root = temp_dir("scan-symlink-link");
+        fs::create_dir_all(&real_root).expect("real root");
+        unix_fs::symlink(&real_root, &symlink_root).expect("symlink root");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &symlink_root,
+            PluginScanRootSource::ExplicitConfig,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("symlink root should be reported without loading plugins");
+        assert!(report.scan_report().roots[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("forbidden symlink")));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(real_root);
+        let _ = fs::remove_file(symlink_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plugin_discovery_scan_rejects_windows_reparse_roots_when_available() {
+        let _guard = env_guard();
+        use std::os::windows::fs as windows_fs;
+
+        let config_home = temp_dir("scan-windows-reparse-home");
+        let real_root = temp_dir("scan-windows-reparse-real");
+        let symlink_root = temp_dir("scan-windows-reparse-link");
+        fs::create_dir_all(&real_root).expect("real root");
+        if let Err(error) = windows_fs::symlink_dir(&real_root, &symlink_root) {
+            eprintln!("skipping Windows reparse test; symlink_dir unavailable: {error}");
+            let _ = fs::remove_dir_all(config_home);
+            let _ = fs::remove_dir_all(real_root);
+            return;
+        }
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &symlink_root,
+            PluginScanRootSource::ExplicitConfig,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("reparse root should be reported without loading plugins");
+        assert!(report.scan_report().roots[0]
+            .warnings
+            .iter()
+            .any(|warning| {
+                warning.contains("forbidden symlink") || warning.contains("forbidden reparse point")
+            }));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(real_root);
+        let _ = fs::remove_dir_all(symlink_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plugin_discovery_scan_rejects_group_world_writable_roots() {
+        let _guard = env_guard();
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_home = temp_dir("scan-world-writable-home");
+        let scan_root = temp_dir("scan-world-writable-root");
+        fs::create_dir_all(&scan_root).expect("scan root");
+        let mut permissions = fs::metadata(&scan_root).expect("metadata").permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(&scan_root, permissions).expect("chmod");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.discovery_roots = vec![PluginScanRoot::new(
+            &scan_root,
+            PluginScanRootSource::ExplicitConfig,
+        )];
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("unsafe root should degrade without loading");
+        assert!(report.scan_report().roots[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("group/world-writable")));
+
+        let mut permissions = fs::metadata(&scan_root).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&scan_root, permissions).expect("chmod restore");
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(scan_root);
+    }
+
+    #[test]
     fn installed_plugin_registry_report_collects_load_failures_from_install_root() {
         let _guard = env_guard();
         // given
@@ -9757,6 +11089,95 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn bundled_scan_isolates_bad_entries_without_aborting_registry_report() {
+        let _guard = env_guard();
+        let config_home = temp_dir("bundled-scan-isolation-home");
+        let bundled_root = temp_dir("bundled-scan-isolation-root");
+        write_bundled_plugin(
+            &bundled_root.join("valid"),
+            "bundled-valid-scan",
+            "1.0.0",
+            true,
+        );
+        write_broken_plugin(&bundled_root.join("broken"), "bundled-broken-scan");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
+
+        let report = manager
+            .plugin_registry_report()
+            .expect("bad bundled entry should not abort report");
+        assert!(report.registry().contains("bundled-valid-scan@bundled"));
+        assert!(report
+            .failures()
+            .iter()
+            .any(|failure| failure.kind == PluginKind::Bundled));
+        assert!(report
+            .scan_report()
+            .roots
+            .iter()
+            .any(|root| root.source == "bundled" && root.plugin_count >= 2));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabled_untrusted_installed_record_fails_entry_but_report_continues() {
+        let _guard = env_guard();
+        use std::os::unix::fs as unix_fs;
+
+        let config_home = temp_dir("enabled-untrusted-home");
+        let bundled_root = temp_dir("enabled-untrusted-bundled");
+        let real_root = temp_dir("enabled-untrusted-real");
+        let symlink_root = temp_dir("enabled-untrusted-link");
+        write_external_plugin(&real_root, "enabled-untrusted", "1.0.0");
+        unix_fs::symlink(&real_root, &symlink_root).expect("symlink plugin root");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "enabled-untrusted@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "enabled-untrusted@external".to_string(),
+                name: "enabled-untrusted".to_string(),
+                version: "1.0.0".to_string(),
+                description: "enabled untrusted".to_string(),
+                install_path: symlink_root.clone(),
+                source: PluginInstallSource::LocalPath {
+                    path: symlink_root.clone(),
+                },
+                version_policy: PluginVersionPolicy::default(),
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        manager.store_registry(&registry).expect("store registry");
+        manager
+            .write_enabled_state("enabled-untrusted@external", Some(true))
+            .expect("enable untrusted record");
+
+        let report = manager
+            .installed_plugin_registry_report()
+            .expect("untrusted enabled entry should degrade report, not abort");
+        assert!(!report.registry().contains("enabled-untrusted@external"));
+        assert!(report.failures().iter().any(|failure| failure
+            .error()
+            .to_string()
+            .contains("failed bounded scan trust checks")));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(real_root);
+        let _ = fs::remove_file(symlink_root);
     }
 
     #[test]

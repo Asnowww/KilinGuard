@@ -493,12 +493,28 @@ fn plugin_command_json(
         "kind": "plugin",
         "action": action,
         "target": target,
-        "status": if failures.is_empty() { "ok" } else { "degraded" },
+        "status": plugin_json_status(failures, report.scan_report()),
         "message": result.message,
         "reload_runtime": result.reload_runtime,
         "plugins": report.summaries().iter().map(plugin_summary_json).collect::<Vec<_>>(),
         "load_failures": failures.iter().map(plugin_load_failure_json).collect::<Vec<_>>(),
+        "scan": plugin_scan_report_json(report.scan_report()),
     })
+}
+
+fn plugin_json_status(
+    failures: &[plugins::PluginLoadFailure],
+    scan_report: &plugins::PluginScanReport,
+) -> &'static str {
+    if failures.is_empty()
+        && scan_report.failure_count == 0
+        && scan_report.omitted_count == 0
+        && !scan_report.truncated
+    {
+        "ok"
+    } else {
+        "degraded"
+    }
 }
 
 fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
@@ -508,6 +524,7 @@ fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
         "version": &plugin.metadata.version,
         "description": &plugin.metadata.description,
         "kind": plugin.metadata.kind.to_string(),
+        "origin": plugin_origin(plugin),
         "source": plugins::sanitize_plugin_error(&plugin.metadata.source),
         "manifest": &plugin.metadata.manifest,
         "permissions": plugin.permissions.iter().map(|permission| permission.as_str()).collect::<Vec<_>>(),
@@ -517,7 +534,7 @@ fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
         "actual_surfaces": &plugin.actual_surfaces,
         "degraded_reason": &plugin.degraded_reason,
         // #730: path parity with agents (#728) and skills (#729)
-        "path": plugin.metadata.root.as_ref().map(|p| p.display().to_string()),
+        "path": plugin.metadata.root.as_ref().map(|p| plugins::sanitize_plugin_error(&p.display().to_string())),
         "enabled": plugin.enabled,
         "lifecycle_state": plugin.lifecycle_state(),
         "lifecycle": {
@@ -534,13 +551,54 @@ fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
     })
 }
 
+fn plugin_origin(plugin: &plugins::PluginSummary) -> &'static str {
+    if plugin.metadata.source.starts_with("discovered:") {
+        "discovered"
+    } else {
+        match plugin.metadata.kind {
+            plugins::PluginKind::Builtin => "builtin",
+            plugins::PluginKind::Bundled => "bundled",
+            plugins::PluginKind::External => "installed",
+        }
+    }
+}
+
 fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
     json!({
-        "plugin_root": failure.plugin_root.display().to_string(),
+        "plugin_root": plugins::sanitize_plugin_error(&failure.plugin_root.display().to_string()),
         "kind": failure.kind.to_string(),
         "source": plugins::sanitize_plugin_error(&failure.source),
         "lifecycle_state": "load_failed",
         "error": plugins::sanitize_plugin_error(&failure.error().to_string()),
+    })
+}
+
+fn plugin_scan_report_json(report: &plugins::PluginScanReport) -> Value {
+    json!({
+        "roots": report.roots.iter().map(plugin_scan_root_report_json).collect::<Vec<_>>(),
+        "plugin_count": report.plugin_count,
+        "failure_count": report.failure_count,
+        "skipped_count": report.skipped_count,
+        "omitted_count": report.omitted_count,
+        "truncated": report.truncated,
+        "duration_ms": report.duration_ms,
+        "warnings": &report.warnings,
+    })
+}
+
+fn plugin_scan_root_report_json(root: &plugins::PluginScanRootReport) -> Value {
+    json!({
+        "path": &root.path,
+        "source": &root.source,
+        "priority": root.priority,
+        "manifest_count": root.manifest_count,
+        "plugin_count": root.plugin_count,
+        "failure_count": root.failure_count,
+        "skipped_count": root.skipped_count,
+        "omitted_count": root.omitted_count,
+        "truncated": root.truncated,
+        "duration_ms": root.duration_ms,
+        "warnings": &root.warnings,
     })
 }
 
@@ -4748,6 +4806,7 @@ fn run_resume_command(
                 "config_load_error": payload.config_load_error,
                 "plugins": payload.plugins,
                 "load_failures": payload.load_failures,
+                "scan": payload.scan,
             });
             if action_str != "list" {
                 json["target"] = serde_json::json!(target);
@@ -7345,6 +7404,7 @@ impl LiveCli {
                     "config_load_error": payload.config_load_error,
                     "plugins": filtered_plugins,
                     "load_failures": payload.load_failures,
+                    "scan": payload.scan,
                 });
                 // Only include operation-result fields for mutating actions (not list/show)
                 if action_str != "list" && !is_show_action {
@@ -9963,6 +10023,7 @@ struct PluginsCommandPayload {
     config_load_error: Option<String>,
     plugins: Vec<Value>,
     load_failures: Vec<Value>,
+    scan: Value,
 }
 
 fn plugins_command_payload_for(
@@ -9979,7 +10040,7 @@ fn plugins_command_payload_for(
     };
     let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
     let result = handle_plugins_slash_command(action, target, &mut manager)?;
-    let report = manager.installed_plugin_registry_report()?;
+    let report = manager.plugin_registry_report()?;
     Ok(plugins_command_payload_from_result(
         result,
         config_load_error,
@@ -9993,11 +10054,13 @@ fn plugins_command_payload_from_result(
     report: &plugins::PluginRegistryReport,
 ) -> PluginsCommandPayload {
     let failures = report.failures();
-    let status = if config_load_error.is_some() || !failures.is_empty() {
-        "degraded"
-    } else {
-        "ok"
-    };
+    let scan_report = report.scan_report();
+    let status =
+        if config_load_error.is_some() || plugin_json_status(failures, scan_report) == "degraded" {
+            "degraded"
+        } else {
+            "ok"
+        };
     let message = match config_load_error.as_deref() {
         Some(error) => format!(
             "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
@@ -10012,6 +10075,7 @@ fn plugins_command_payload_from_result(
         config_load_error,
         plugins: report.summaries().iter().map(plugin_summary_json).collect(),
         load_failures: failures.iter().map(plugin_load_failure_json).collect(),
+        scan: plugin_scan_report_json(report.scan_report()),
     }
 }
 
@@ -10028,7 +10092,8 @@ fn build_runtime_plugin_state_with_loader(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
-    let plugin_registry = plugin_manager.plugin_registry()?;
+    let plugin_report = plugin_manager.plugin_registry_report()?;
+    let plugin_registry = plugin_report.healthy_registry();
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
     let feature_config = runtime_config
@@ -10054,6 +10119,7 @@ fn build_plugin_manager(
 ) -> PluginManager {
     let plugin_settings = runtime_config.plugins();
     let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enable_default_discovery(Some(cwd));
     plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
     plugin_config.external_dirs = plugin_settings
         .external_directories()
@@ -17300,6 +17366,39 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn build_runtime_plugin_state_isolates_bad_discovered_plugin() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let discovery_root = workspace.join(".claw").join("plugins");
+        let valid_plugin = discovery_root.join("valid");
+        let bad_plugin = discovery_root.join("bad");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_plugin_fixture(&valid_plugin, "runtime-project-valid", false, false);
+        fs::create_dir_all(bad_plugin.join(".claude-plugin")).expect("bad manifest dir");
+        fs::write(
+            bad_plugin.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"runtime-project-bad","version":"1.0.0","description":"bad","hooks":{"PreToolUse":["./missing.sh"]}}"#,
+        )
+        .expect("write bad manifest");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("bad discovered plugin should degrade without blocking runtime");
+
+        assert!(state
+            .plugin_registry
+            .contains("runtime-project-valid@external"));
+        assert!(!state
+            .plugin_registry
+            .contains("runtime-project-bad@external"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

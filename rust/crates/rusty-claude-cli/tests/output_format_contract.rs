@@ -333,11 +333,22 @@ fn inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["kind"], "skills");
     assert_eq!(skills["action"], "list");
 
-    let plugins = assert_json_command(&root, &["--output-format", "json", "plugins"]);
+    let plugins = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "plugins"],
+        &[
+            ("HOME", isolated_home.to_str().expect("utf8 home")),
+            (
+                "CLAW_CONFIG_HOME",
+                isolated_config.to_str().expect("utf8 config home"),
+            ),
+        ],
+    );
     assert_eq!(plugins["kind"], "plugin");
     assert_eq!(plugins["action"], "list");
     assert_eq!(plugins["status"], "ok");
     assert!(plugins["config_load_error"].is_null());
+    assert!(plugins["scan"]["roots"].is_array());
     // reload_runtime and target are operation-result fields; list response omits them (#703)
     assert!(
         !plugins
@@ -500,6 +511,108 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
     assert_eq!(plugin["capabilities"]["tools"], false);
     assert!(plugin["permissionDeclarations"].is_array());
     assert!(plugin["permissionDeclarationStatuses"].is_array());
+}
+
+#[test]
+fn plugins_json_discovers_project_plugin_directory() {
+    let root = unique_temp_dir("plugin-project-discovery-json");
+    let workspace = root.join("workspace");
+    let home = root.join("home");
+    let config_home = root.join("config-home");
+    let plugin_root = workspace
+        .join(".claw")
+        .join("plugins")
+        .join("project-plugin");
+    fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("manifest dir should exist");
+    fs::write(
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+        r#"{
+  "name": "project-discovered",
+  "version": "1.0.0",
+  "description": "project discovered plugin"
+}"#,
+    )
+    .expect("plugin manifest should write");
+
+    let parsed = assert_json_command_with_env(
+        &workspace,
+        &["--output-format", "json", "plugins", "status"],
+        &[
+            ("HOME", home.to_str().expect("home path should be utf8")),
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("config path should be utf8"),
+            ),
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "plugin");
+    assert_eq!(parsed["action"], "status");
+    let plugins = parsed["plugins"].as_array().expect("plugins array");
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin["id"] == "project-discovered@external")
+        .expect("project plugin should be discovered");
+    assert_eq!(plugin["kind"], "external");
+    assert_eq!(plugin["origin"], "discovered");
+    assert!(plugin["source"]
+        .as_str()
+        .expect("source should be a string")
+        .starts_with("discovered:project:"));
+    assert!(parsed["scan"]["roots"]
+        .as_array()
+        .expect("scan roots array")
+        .iter()
+        .any(|root| root["source"] == "project" && root["plugin_count"] == 1));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plugins_json_status_degrades_when_scan_omits_entries() {
+    let root = unique_temp_dir("plugin-scan-omitted-json");
+    let workspace = root.join("workspace");
+    let home = root.join("home");
+    let config_home = root.join("config-home");
+    let deep = workspace
+        .join(".claw")
+        .join("plugins")
+        .join("a")
+        .join("b")
+        .join("c")
+        .join("d")
+        .join("e");
+    fs::create_dir_all(&deep).expect("deep project plugin tree should exist");
+
+    let parsed = assert_json_command_with_env(
+        &workspace,
+        &["--output-format", "json", "plugins", "status"],
+        &[
+            ("HOME", home.to_str().expect("home path should be utf8")),
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("config path should be utf8"),
+            ),
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "plugin");
+    assert_eq!(parsed["action"], "status");
+    assert_eq!(parsed["status"], "degraded");
+    assert!(parsed["scan"]["omitted_count"]
+        .as_u64()
+        .is_some_and(|count| count > 0));
+    assert_eq!(parsed["scan"]["truncated"], true);
+    assert!(parsed["scan"]["roots"]
+        .as_array()
+        .expect("scan roots array")
+        .iter()
+        .any(|root| root["source"] == "project"
+            && root["omitted_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
