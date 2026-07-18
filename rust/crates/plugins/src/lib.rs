@@ -7,11 +7,14 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -33,6 +36,19 @@ const MIN_PLUGIN_MCP_TIMEOUT_MS: u64 = 1;
 const MAX_PLUGIN_MCP_TIMEOUT_MS: u64 = 300_000;
 const MIN_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 1;
 const MAX_PLUGIN_MCP_HEARTBEAT_INTERVAL_MS: u64 = 3_600_000;
+const PLUGIN_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const PLUGIN_MANIFEST_MAX_BYTES: u64 = 256 * 1024;
+const PLUGIN_MANIFEST_NAME_MAX_CHARS: usize = 64;
+const PLUGIN_MANIFEST_ID_MAX_CHARS: usize = 64;
+const PLUGIN_MANIFEST_VERSION_MAX_CHARS: usize = 64;
+const PLUGIN_MANIFEST_DESCRIPTION_MAX_CHARS: usize = 4096;
+const PLUGIN_MANIFEST_SIGNATURE_MAX_CHARS: usize = 4096;
+const PLUGIN_MANIFEST_MAX_DECLARATIONS: usize = 128;
+const PLUGIN_PERMISSION_VALUE_MAX_CHARS: usize = 512;
+const PLUGIN_ERROR_SURFACE_MAX_CHARS: usize = 2048;
+const PLUGIN_CHILD_OUTPUT_LIMIT: usize = 1024 * 1024;
+const PLUGIN_LOCK_TIMEOUT_MS: u64 = 5_000;
+const PLUGIN_LOCK_POLL_MS: u64 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,6 +89,62 @@ pub struct PluginMetadata {
     pub source: String,
     pub default_enabled: bool,
     pub root: Option<PathBuf>,
+    pub manifest: PluginManifestMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifestMetadata {
+    pub schema_version: u64,
+    pub legacy: bool,
+    pub hash: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub signature_verified: bool,
+    #[serde(default)]
+    pub signature_warning: Option<String>,
+    #[serde(default)]
+    pub declared_id: Option<String>,
+    #[serde(default)]
+    pub entrypoint: Option<PluginEntrypoint>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+impl PluginManifestMetadata {
+    #[must_use]
+    pub fn builtin() -> Self {
+        Self {
+            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION,
+            legacy: false,
+            hash: "builtin".to_string(),
+            signature: None,
+            signature_verified: false,
+            signature_warning: None,
+            declared_id: None,
+            entrypoint: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl Default for PluginManifestMetadata {
+    fn default() -> Self {
+        Self {
+            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION,
+            legacy: true,
+            hash: String::new(),
+            signature: None,
+            signature_verified: false,
+            signature_warning: None,
+            declared_id: None,
+            entrypoint: None,
+            warnings: vec![
+                "legacy manifest omitted schemaVersion; normalized to schemaVersion 1".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,10 +198,20 @@ impl PluginLifecycle {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginManifest {
+    #[serde(rename = "schemaVersion", default)]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub version: String,
     pub description: String,
     pub permissions: Vec<PluginPermission>,
+    #[serde(rename = "permissionDeclarations", default)]
+    pub permission_declarations: Vec<PluginPermissionDeclaration>,
+    #[serde(default)]
+    pub entrypoint: Option<PluginEntrypoint>,
+    #[serde(rename = "manifestMetadata", default)]
+    pub manifest_metadata: PluginManifestMetadata,
     #[serde(rename = "defaultEnabled", default)]
     pub default_enabled: bool,
     #[serde(default)]
@@ -160,6 +242,14 @@ pub struct PluginManifest {
     pub prompts: Vec<PluginPromptManifest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginEntrypoint {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginExecutionPolicy {
@@ -175,6 +265,56 @@ pub enum PluginPermission {
     Read,
     Write,
     Execute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginFilesystemPermissionMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum PluginPermissionDeclaration {
+    Legacy {
+        permission: PluginPermission,
+    },
+    Filesystem {
+        paths: Vec<String>,
+        mode: PluginFilesystemPermissionMode,
+    },
+    Network {
+        origins: Vec<String>,
+    },
+    Process {
+        commands: Vec<String>,
+    },
+    Systemd {
+        units: Vec<String>,
+        actions: Vec<String>,
+    },
+    Package {
+        managers: Vec<String>,
+        actions: Vec<String>,
+        packages: Vec<String>,
+    },
+    User {
+        users: Vec<String>,
+        actions: Vec<String>,
+    },
+    Firewall {
+        scopes: Vec<String>,
+        actions: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawPluginPermissionDeclaration {
+    Legacy(String),
+    Structured(PluginPermissionDeclaration),
 }
 
 impl PluginPermission {
@@ -461,11 +601,19 @@ pub struct PluginCommandManifest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RawPluginManifest {
+    #[serde(rename = "schemaVersion", default)]
+    pub schema_version: Option<u64>,
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub version: String,
     pub description: String,
     #[serde(default)]
-    pub permissions: Vec<String>,
+    pub permissions: Vec<RawPluginPermissionDeclaration>,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub entrypoint: Option<PluginEntrypoint>,
     #[serde(rename = "defaultEnabled", default)]
     pub default_enabled: bool,
     #[serde(default)]
@@ -479,7 +627,7 @@ struct RawPluginManifest {
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
     #[serde(default)]
-    pub capabilities: PluginCapabilities,
+    pub capabilities: Option<PluginCapabilities>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: BTreeMap<String, PluginMcpServerManifest>,
     #[serde(default)]
@@ -512,6 +660,15 @@ struct RawPluginToolManifest {
         default = "missing_tool_permission_label"
     )]
     pub required_permission: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestSchemaEnvelope {
+    schema_version: u64,
+    legacy: bool,
+    explicit_capabilities: bool,
+    hash: String,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -615,8 +772,10 @@ impl PluginTool {
             if let Some(output_schema) = &self.definition.output_schema {
                 let value: Value = serde_json::from_str(&stdout).map_err(|error| {
                     PluginError::CommandFailed(format!(
-                        "plugin tool `{}` from `{}` returned non-JSON output for outputSchema validation: {error}",
-                        self.definition.name, self.plugin_id
+                        "plugin tool `{}` from `{}` returned non-JSON output for outputSchema validation{}: {error}",
+                        self.definition.name,
+                        self.plugin_id,
+                        truncated_suffix(output.stdout_truncated)
                     ))
                 })?;
                 validate_json_schema_value(output_schema, &value, "output")?;
@@ -625,10 +784,11 @@ impl PluginTool {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             Err(PluginError::CommandFailed(format!(
-                "plugin tool `{}` from `{}` failed for `{}`: {}",
+                "plugin tool `{}` from `{}` failed for `{}`{}: {}",
                 self.definition.name,
                 self.plugin_id,
                 self.command,
+                truncated_suffix(output.stderr_truncated),
                 if stderr.is_empty() {
                     format!("exit status {}", output.status)
                 } else {
@@ -652,7 +812,17 @@ struct ControlledChildRequest {
     env: BTreeMap<String, String>,
 }
 
-fn run_controlled_child(request: ControlledChildRequest) -> Result<Output, PluginError> {
+struct ControlledChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+fn run_controlled_child(
+    request: ControlledChildRequest,
+) -> Result<ControlledChildOutput, PluginError> {
     if !request.external_subprocess_allowed {
         return Err(PluginError::CommandFailed(format!(
             "external plugin subprocess `{}` was refused: FR-2.13 requires an OS sandbox, and this runner only provides process policy guards; set executionPolicy.allowExternalSubprocess=true only for explicitly trusted plugins",
@@ -707,8 +877,8 @@ fn run_controlled_child(request: ControlledChildRequest) -> Result<Output, Plugi
         .stderr
         .take()
         .ok_or_else(|| PluginError::CommandFailed("controlled child stderr missing".to_string()))?;
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    let stdout_reader = thread::spawn(move || read_pipe_capped(stdout, PLUGIN_CHILD_OUTPUT_LIMIT));
+    let stderr_reader = thread::spawn(move || read_pipe_capped(stderr, PLUGIN_CHILD_OUTPUT_LIMIT));
 
     let deadline = Instant::now() + request.timeout;
     let status = loop {
@@ -718,25 +888,29 @@ fn run_controlled_child(request: ControlledChildRequest) -> Result<Output, Plugi
         if Instant::now() >= deadline {
             terminate_child_tree(&mut child);
             let _ = child.wait();
-            let stdout = join_pipe_reader(stdout_reader)?;
-            let stderr = join_pipe_reader(stderr_reader)?;
+            let (stdout, stdout_truncated) = join_pipe_reader(stdout_reader)?;
+            let (stderr, stderr_truncated) = join_pipe_reader(stderr_reader)?;
             return Err(PluginError::CommandFailed(format!(
-                "command `{}` timed out after {} ms; process was terminated; stdout: {}; stderr: {}",
+                "command `{}` timed out after {} ms; process was terminated; stdout{}: {}; stderr{}: {}",
                 request.command,
                 request.timeout.as_millis(),
+                truncated_suffix(stdout_truncated),
                 String::from_utf8_lossy(&stdout).trim(),
+                truncated_suffix(stderr_truncated),
                 String::from_utf8_lossy(&stderr).trim()
             )));
         }
         thread::sleep(Duration::from_millis(PLUGIN_CHILD_POLL_MS));
     };
 
-    let stdout = join_pipe_reader(stdout_reader)?;
-    let stderr = join_pipe_reader(stderr_reader)?;
-    Ok(Output {
+    let (stdout, stdout_truncated) = join_pipe_reader(stdout_reader)?;
+    let (stderr, stderr_truncated) = join_pipe_reader(stderr_reader)?;
+    Ok(ControlledChildOutput {
         status,
         stdout,
         stderr,
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -878,21 +1052,23 @@ fn copy_allowed_host_env(command: &mut Command) {
     }
 }
 
-fn read_pipe(mut pipe: impl std::io::Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
 fn join_pipe_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>, PluginError> {
+    handle: thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) -> Result<(Vec<u8>, bool), PluginError> {
     handle
         .join()
         .map_err(|_| {
             PluginError::CommandFailed("controlled child pipe reader panicked".to_string())
         })?
         .map_err(PluginError::Io)
+}
+
+fn truncated_suffix(truncated: bool) -> &'static str {
+    if truncated {
+        " [truncated]"
+    } else {
+        ""
+    }
 }
 
 fn terminate_child_tree(child: &mut Child) {
@@ -1792,6 +1968,8 @@ pub struct InstalledPluginRegistry {
     pub plugins: BTreeMap<String, InstalledPluginRecord>,
     #[serde(default)]
     pub versions: BTreeMap<String, Vec<InstalledPluginVersionRecord>>,
+    #[serde(skip)]
+    pub migration_warnings: Vec<String>,
 }
 
 fn default_plugin_kind() -> PluginKind {
@@ -1805,6 +1983,7 @@ pub struct BuiltinPlugin {
     lifecycle: PluginLifecycle,
     execution_policy: PluginExecutionPolicy,
     permissions: Vec<PluginPermission>,
+    permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
@@ -1823,6 +2002,7 @@ pub struct BundledPlugin {
     lifecycle: PluginLifecycle,
     execution_policy: PluginExecutionPolicy,
     permissions: Vec<PluginPermission>,
+    permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
@@ -1841,6 +2021,7 @@ pub struct ExternalPlugin {
     lifecycle: PluginLifecycle,
     execution_policy: PluginExecutionPolicy,
     permissions: Vec<PluginPermission>,
+    permission_declarations: Vec<PluginPermissionDeclaration>,
     tools: Vec<PluginTool>,
     resources: Vec<PluginResourceManifest>,
     prompts: Vec<PluginPromptManifest>,
@@ -1858,6 +2039,7 @@ pub trait Plugin {
     fn lifecycle(&self) -> &PluginLifecycle;
     fn execution_policy(&self) -> &PluginExecutionPolicy;
     fn permissions(&self) -> &[PluginPermission];
+    fn permission_declarations(&self) -> &[PluginPermissionDeclaration];
     fn tools(&self) -> &[PluginTool];
     fn resources(&self) -> &[PluginResourceManifest];
     fn prompts(&self) -> &[PluginPromptManifest];
@@ -1898,6 +2080,10 @@ impl Plugin for BuiltinPlugin {
 
     fn permissions(&self) -> &[PluginPermission] {
         &self.permissions
+    }
+
+    fn permission_declarations(&self) -> &[PluginPermissionDeclaration] {
+        &self.permission_declarations
     }
 
     fn tools(&self) -> &[PluginTool] {
@@ -1968,6 +2154,10 @@ impl Plugin for BundledPlugin {
 
     fn permissions(&self) -> &[PluginPermission] {
         &self.permissions
+    }
+
+    fn permission_declarations(&self) -> &[PluginPermissionDeclaration] {
+        &self.permission_declarations
     }
 
     fn tools(&self) -> &[PluginTool] {
@@ -2056,6 +2246,10 @@ impl Plugin for ExternalPlugin {
         &self.permissions
     }
 
+    fn permission_declarations(&self) -> &[PluginPermissionDeclaration] {
+        &self.permission_declarations
+    }
+
     fn tools(&self) -> &[PluginTool] {
         &self.tools
     }
@@ -2121,6 +2315,16 @@ impl Plugin for ExternalPlugin {
     }
 }
 
+impl PluginDefinition {
+    fn metadata_mut(&mut self) -> &mut PluginMetadata {
+        match self {
+            Self::Builtin(plugin) => &mut plugin.metadata,
+            Self::Bundled(plugin) => &mut plugin.metadata,
+            Self::External(plugin) => &mut plugin.metadata,
+        }
+    }
+}
+
 impl Plugin for PluginDefinition {
     fn metadata(&self) -> &PluginMetadata {
         match self {
@@ -2167,6 +2371,14 @@ impl Plugin for PluginDefinition {
             Self::Builtin(plugin) => plugin.permissions(),
             Self::Bundled(plugin) => plugin.permissions(),
             Self::External(plugin) => plugin.permissions(),
+        }
+    }
+
+    fn permission_declarations(&self) -> &[PluginPermissionDeclaration] {
+        match self {
+            Self::Builtin(plugin) => plugin.permission_declarations(),
+            Self::Bundled(plugin) => plugin.permission_declarations(),
+            Self::External(plugin) => plugin.permission_declarations(),
         }
     }
 
@@ -2352,6 +2564,14 @@ impl RegisteredPlugin {
             metadata: self.metadata().clone(),
             enabled: self.enabled,
             lifecycle: self.definition.lifecycle().clone(),
+            permissions: self.definition.permissions().to_vec(),
+            permission_declarations: self.definition.permission_declarations().to_vec(),
+            permission_declaration_statuses: permission_declaration_statuses_for_plugin(
+                &self.definition,
+            ),
+            capabilities: self.definition.capabilities().clone(),
+            actual_surfaces: actual_surfaces_for_plugin(&self.definition),
+            degraded_reason: degraded_reason_for_plugin(&self.definition),
         }
     }
 }
@@ -2361,6 +2581,12 @@ pub struct PluginSummary {
     pub metadata: PluginMetadata,
     pub enabled: bool,
     pub lifecycle: PluginLifecycle,
+    pub permissions: Vec<PluginPermission>,
+    pub permission_declarations: Vec<PluginPermissionDeclaration>,
+    pub permission_declaration_statuses: Vec<PluginPermissionDeclarationStatus>,
+    pub capabilities: PluginCapabilities,
+    pub actual_surfaces: PluginActualSurfaces,
+    pub degraded_reason: Option<String>,
 }
 
 impl PluginSummary {
@@ -2372,6 +2598,30 @@ impl PluginSummary {
             "disabled"
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginPermissionDeclarationStatus {
+    pub index: usize,
+    pub permission_type: String,
+    pub enforced: bool,
+    pub declaration_only: bool,
+    #[serde(default)]
+    pub enforced_permission: Option<PluginPermission>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginActualSurfaces {
+    pub tools: usize,
+    pub resources: usize,
+    pub prompts: usize,
+    pub mcp_servers: usize,
+    pub mcp_tools: usize,
+    pub mcp_resources: usize,
+    pub mcp_prompts: usize,
+    pub ops_permissions: usize,
 }
 
 #[derive(Debug)]
@@ -2406,8 +2656,8 @@ impl Display for PluginLoadFailure {
             "failed to load {} plugin from `{}` (source: {}): {}",
             self.kind,
             self.plugin_root.display(),
-            self.source,
-            self.error()
+            sanitize_plugin_error(&self.source),
+            sanitize_plugin_error(&self.error().to_string())
         )
     }
 }
@@ -2446,6 +2696,7 @@ impl PluginRegistryReport {
 
     pub fn into_registry(self) -> Result<PluginRegistry, PluginError> {
         if self.failures.is_empty() {
+            self.registry.validate_registration_conflicts()?;
             Ok(self.registry)
         } else {
             Err(PluginError::LoadFailures(self.failures))
@@ -2532,6 +2783,7 @@ impl PluginRegistry {
                 ))
             })?;
             plugin.validate()?;
+            validate_registered_capability_gate(plugin)?;
             for tool in plugin.tools() {
                 if let Some(existing_plugin) =
                     seen_names.insert(tool.definition().name.clone(), tool.plugin_id().to_string())
@@ -2558,6 +2810,7 @@ impl PluginRegistry {
                 ))
             })?;
             plugin.validate()?;
+            validate_registered_capability_gate(plugin)?;
             for resource in plugin.resources() {
                 if let Some(existing_plugin) =
                     seen_uris.insert(resource.uri.clone(), plugin.metadata().id.clone())
@@ -2584,6 +2837,7 @@ impl PluginRegistry {
                 ))
             })?;
             plugin.validate()?;
+            validate_registered_capability_gate(plugin)?;
             for prompt in plugin.prompts() {
                 if let Some(existing_plugin) =
                     seen_names.insert(prompt.name.clone(), plugin.metadata().id.clone())
@@ -2611,6 +2865,7 @@ impl PluginRegistry {
                 ))
             })?;
             plugin.validate()?;
+            validate_registered_capability_gate(plugin)?;
             for (server_name, server) in plugin.mcp_servers() {
                 let qualified_name = format!("{}::{server_name}", plugin.metadata().id);
                 if servers
@@ -2654,6 +2909,23 @@ impl PluginRegistry {
                 ))
             })?;
             plugin.shutdown()?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_registration_conflicts(&self) -> Result<(), PluginError> {
+        let mut names = BTreeMap::<String, String>::new();
+        for plugin in &self.plugins {
+            if let Some(existing_id) =
+                names.insert(plugin.metadata().name.clone(), plugin.metadata().id.clone())
+            {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin name `{}` is declared by both `{existing_id}` and `{}`",
+                    plugin.metadata().name,
+                    plugin.metadata().id
+                )));
+            }
+            validate_registered_capability_gate(plugin)?;
         }
         Ok(())
     }
@@ -3035,7 +3307,9 @@ impl PluginManager {
 
     pub fn validate_plugin_source(&self, source: &str) -> Result<PluginManifest, PluginError> {
         let path = resolve_local_source(source)?;
-        load_plugin_from_directory(&path)
+        let manifest = load_plugin_from_directory(&path)?;
+        validate_plugin_registration_policy(PluginKind::External, &manifest)?;
+        Ok(manifest)
     }
 
     pub fn hot_load(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
@@ -3047,15 +3321,17 @@ impl PluginManager {
     }
 
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
+        let _mutation_locks = self.acquire_mutation_locks()?;
         let install_source = parse_install_source(source)?;
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&install_source, &temp_root)?;
         let cleanup_source = matches!(install_source, PluginInstallSource::GitUrl { .. });
         let manifest = load_plugin_from_directory(&staged_source)?;
+        validate_plugin_registration_policy(PluginKind::External, &manifest)?;
 
         let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
         let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
-        let mut registry = self.load_registry()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
         if let Some(existing_record) = registry.plugins.get(&plugin_id).cloned() {
             self.archive_installed_version(
                 &mut registry,
@@ -3086,7 +3362,7 @@ impl PluginManager {
         };
 
         registry.plugins.insert(plugin_id.clone(), record);
-        self.store_registry(&registry)?;
+        self.store_registry_under_registry_lock(&registry)?;
         self.write_enabled_state(&plugin_id, Some(true))?;
         self.config.enabled_plugins.insert(plugin_id.clone(), true);
 
@@ -3116,7 +3392,8 @@ impl PluginManager {
     }
 
     pub fn uninstall(&mut self, plugin_id: &str) -> Result<(), PluginError> {
-        let mut registry = self.load_registry()?;
+        let _mutation_locks = self.acquire_mutation_locks()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
         let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -3136,14 +3413,15 @@ impl PluginManager {
                 }
             }
         }
-        self.store_registry(&registry)?;
+        self.store_registry_under_registry_lock(&registry)?;
         self.write_enabled_state(plugin_id, None)?;
         self.config.enabled_plugins.remove(plugin_id);
         Ok(())
     }
 
     pub fn update(&mut self, plugin_id: &str) -> Result<UpdateOutcome, PluginError> {
-        let mut registry = self.load_registry()?;
+        let _mutation_locks = self.acquire_mutation_locks()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -3152,6 +3430,7 @@ impl PluginManager {
         let staged_source = materialize_source(&record.source, &temp_root)?;
         let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
         let manifest = load_plugin_from_directory(&staged_source)?;
+        validate_plugin_registration_policy(record.kind, &manifest)?;
 
         let archived_record = self.archive_installed_version(
             &mut registry,
@@ -3187,7 +3466,7 @@ impl PluginManager {
         registry
             .plugins
             .insert(plugin_id.to_string(), updated_record);
-        self.store_registry(&registry)?;
+        self.store_registry_under_registry_lock(&registry)?;
 
         Ok(UpdateOutcome {
             plugin_id: plugin_id.to_string(),
@@ -3222,7 +3501,8 @@ impl PluginManager {
         plugin_id: &str,
         version: &str,
     ) -> Result<RollbackOutcome, PluginError> {
-        let mut registry = self.load_registry()?;
+        let _mutation_locks = self.acquire_mutation_locks()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
         let active = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
@@ -3255,7 +3535,7 @@ impl PluginManager {
             ..active.clone()
         };
         registry.plugins.insert(plugin_id.to_string(), rolled_back);
-        self.store_registry(&registry)?;
+        self.store_registry_under_registry_lock(&registry)?;
 
         Ok(RollbackOutcome {
             plugin_id: plugin_id.to_string(),
@@ -3266,7 +3546,7 @@ impl PluginManager {
     }
 
     fn discover_installed_plugins_with_failures(&self) -> Result<PluginDiscovery, PluginError> {
-        let mut registry = self.load_registry()?;
+        let registry = self.load_registry()?;
         let mut discovery = PluginDiscovery::default();
         let mut seen_ids = BTreeSet::<String>::new();
         let mut seen_paths = BTreeSet::<PathBuf>::new();
@@ -3283,7 +3563,8 @@ impl PluginManager {
                 |record| describe_install_source(&record.source),
             );
             match load_plugin_definition(&install_path, kind, source.clone(), kind.marketplace()) {
-                Ok(plugin) => {
+                Ok(mut plugin) => {
+                    append_manifest_warnings(&mut plugin, &registry.migration_warnings);
                     if seen_ids.insert(plugin.metadata().id.clone()) {
                         seen_paths.insert(install_path);
                         discovery.push_plugin(plugin);
@@ -3316,7 +3597,8 @@ impl PluginManager {
                 source.clone(),
                 record.kind.marketplace(),
             ) {
-                Ok(plugin) => {
+                Ok(mut plugin) => {
+                    append_manifest_warnings(&mut plugin, &registry.migration_warnings);
                     if seen_ids.insert(plugin.metadata().id.clone()) {
                         seen_paths.insert(record.install_path.clone());
                         discovery.push_plugin(plugin);
@@ -3334,10 +3616,7 @@ impl PluginManager {
         }
 
         if !stale_registry_ids.is_empty() {
-            for plugin_id in stale_registry_ids {
-                registry.plugins.remove(&plugin_id);
-            }
-            self.store_registry(&registry)?;
+            self.cleanup_stale_registry_entries()?;
         }
 
         Ok(discovery)
@@ -3388,6 +3667,7 @@ impl PluginManager {
     }
 
     fn sync_bundled_plugins(&self) -> Result<(), PluginError> {
+        let _mutation_locks = self.acquire_mutation_locks()?;
         let explicit_root = self.config.bundled_root.is_some();
         let bundled_root = self
             .config
@@ -3406,7 +3686,7 @@ impl PluginManager {
             }
             Err(error) => return Err(error),
         };
-        let mut registry = self.load_registry()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
         let mut changed = false;
         let install_root = self.install_root();
         let mut active_bundled_ids = BTreeSet::new();
@@ -3478,7 +3758,7 @@ impl PluginManager {
         }
 
         if changed {
-            self.store_registry(&registry)?;
+            self.store_registry_under_registry_lock(&registry)?;
         }
 
         Ok(())
@@ -3506,24 +3786,77 @@ impl PluginManager {
     }
 
     fn load_registry(&self) -> Result<InstalledPluginRegistry, PluginError> {
+        self.load_registry_inner(true)
+    }
+
+    fn load_registry_under_exclusive_lock(&self) -> Result<InstalledPluginRegistry, PluginError> {
+        self.load_registry_inner(false)
+    }
+
+    fn load_registry_inner(
+        &self,
+        acquire_migration_lock: bool,
+    ) -> Result<InstalledPluginRegistry, PluginError> {
         let path = self.registry_path();
-        match fs::read_to_string(&path) {
-            Ok(contents) if contents.trim().is_empty() => Ok(InstalledPluginRegistry::default()),
-            Ok(contents) => Ok(serde_json::from_str(&contents)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        match read_registry_at_path(&path) {
+            Ok(registry) => {
+                let sanitized = sanitize_registry_for_storage(&registry);
+                if sanitized == registry {
+                    return Ok(sanitized);
+                }
+                if acquire_migration_lock {
+                    let _migration_guard = self.acquire_registry_lock()?;
+                    let fresh_registry = read_registry_at_path(&path)?;
+                    let fresh_sanitized = sanitize_registry_for_storage(&fresh_registry);
+                    return migrate_registry_source_metadata_under_lock(&path, fresh_sanitized);
+                }
+                migrate_registry_source_metadata_under_lock(&path, sanitized)
+            }
+            Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(InstalledPluginRegistry::default())
             }
-            Err(error) => Err(PluginError::Io(error)),
+            Err(error) => Err(error),
         }
     }
 
+    #[cfg(test)]
     fn store_registry(&self, registry: &InstalledPluginRegistry) -> Result<(), PluginError> {
+        let _registry_guard = self.acquire_registry_lock()?;
+        self.store_registry_under_registry_lock(registry)
+    }
+
+    fn store_registry_under_registry_lock(
+        &self,
+        registry: &InstalledPluginRegistry,
+    ) -> Result<(), PluginError> {
         let path = self.registry_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string_pretty(registry)?)?;
+        let sanitized = sanitize_registry_for_storage(registry);
+        store_registry_at_path(&path, &sanitized)?;
         Ok(())
+    }
+
+    fn cleanup_stale_registry_entries(&self) -> Result<(), PluginError> {
+        let _registry_guard = self.acquire_registry_lock()?;
+        let mut registry = self.load_registry_under_exclusive_lock()?;
+        let stale_ids = registry
+            .plugins
+            .values()
+            .filter_map(|record| {
+                (!record.install_path.exists()
+                    || plugin_manifest_path(&record.install_path).is_err())
+                .then_some(record.id.clone())
+            })
+            .collect::<Vec<_>>();
+        if stale_ids.is_empty() {
+            return Ok(());
+        }
+        for plugin_id in stale_ids {
+            registry.plugins.remove(&plugin_id);
+        }
+        self.store_registry_under_registry_lock(&registry)
     }
 
     fn archive_installed_version(
@@ -3588,6 +3921,39 @@ impl PluginManager {
         })
     }
 
+    fn acquire_registry_lock(&self) -> Result<PluginFileLock, PluginError> {
+        acquire_plugin_file_lock_at(
+            &registry_lock_path(&self.registry_path()),
+            "plugin registry",
+            Duration::from_millis(PLUGIN_LOCK_TIMEOUT_MS),
+        )
+    }
+
+    fn acquire_mutation_locks(&self) -> Result<PluginMutationLocks, PluginError> {
+        let registry_lock_path = registry_lock_path(&self.registry_path());
+        let install_lock_path = install_tree_lock_path(&self.install_root());
+        let registry = acquire_plugin_file_lock_at(
+            &registry_lock_path,
+            "plugin registry",
+            Duration::from_millis(PLUGIN_LOCK_TIMEOUT_MS),
+        )?;
+        let install = (!same_lock_path(&registry_lock_path, &install_lock_path)).then(|| {
+            acquire_plugin_file_lock_at(
+                &install_lock_path,
+                "plugin install tree",
+                Duration::from_millis(PLUGIN_LOCK_TIMEOUT_MS),
+            )
+        });
+        let install = match install {
+            Some(lock) => Some(lock?),
+            None => None,
+        };
+        Ok(PluginMutationLocks {
+            _registry: registry,
+            _install: install,
+        })
+    }
+
     fn installed_plugin_registry(&self) -> Result<PluginRegistry, PluginError> {
         self.installed_plugin_registry_report()?.into_registry()
     }
@@ -3612,10 +3978,15 @@ impl PluginManager {
 #[must_use]
 pub fn builtin_plugins() -> Vec<PluginDefinition> {
     let mut plugins = vec![builtin_plugin_from_manifest(PluginManifest {
+        schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION,
+        id: None,
         name: "example-builtin".to_string(),
         version: "0.1.0".to_string(),
         description: "Example built-in plugin scaffold for the Rust plugin system".to_string(),
         permissions: Vec::new(),
+        permission_declarations: Vec::new(),
+        entrypoint: None,
+        manifest_metadata: PluginManifestMetadata::builtin(),
         default_enabled: false,
         hooks: PluginHooks::default(),
         lifecycle: PluginLifecycle::default(),
@@ -3710,10 +4081,17 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
     .map(|(name, description, tool_name, permission, risk)| {
         let high_risk = matches!(risk, PluginRiskLevel::High | PluginRiskLevel::Critical);
         PluginManifest {
+            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION,
+            id: None,
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: description.to_string(),
             permissions: vec![manifest_permission_for_tool(permission)],
+            permission_declarations: vec![PluginPermissionDeclaration::Legacy {
+                permission: manifest_permission_for_tool(permission),
+            }],
+            entrypoint: None,
+            manifest_metadata: PluginManifestMetadata::builtin(),
             default_enabled: false,
             hooks: PluginHooks::default(),
             lifecycle: PluginLifecycle::default(),
@@ -3817,6 +4195,7 @@ fn builtin_plugin_from_manifest(manifest: PluginManifest) -> PluginDefinition {
         source: BUILTIN_MARKETPLACE.to_string(),
         default_enabled: manifest.default_enabled,
         root: None,
+        manifest: manifest.manifest_metadata,
     };
     let tools = manifest
         .tools
@@ -3845,6 +4224,7 @@ fn builtin_plugin_from_manifest(manifest: PluginManifest) -> PluginDefinition {
         lifecycle: manifest.lifecycle,
         execution_policy: manifest.execution_policy,
         permissions: manifest.permissions,
+        permission_declarations: manifest.permission_declarations,
         tools,
         resources: manifest.resources,
         prompts: manifest.prompts,
@@ -3864,6 +4244,7 @@ fn load_plugin_definition(
     marketplace: &str,
 ) -> Result<PluginDefinition, PluginError> {
     let manifest = load_plugin_from_directory(root)?;
+    validate_plugin_registration_policy(kind, &manifest)?;
     let metadata = PluginMetadata {
         id: plugin_id(&manifest.name, marketplace),
         name: manifest.name.clone(),
@@ -3873,6 +4254,7 @@ fn load_plugin_definition(
         source,
         default_enabled: manifest.default_enabled,
         root: Some(root.to_path_buf()),
+        manifest: manifest.manifest_metadata.clone(),
     };
     let hooks = resolve_hooks(root, &manifest.hooks);
     let lifecycle = resolve_lifecycle(root, &manifest.lifecycle);
@@ -3893,6 +4275,7 @@ fn load_plugin_definition(
             lifecycle,
             execution_policy: manifest.execution_policy,
             permissions: manifest.permissions,
+            permission_declarations: manifest.permission_declarations,
             tools,
             resources: manifest.resources,
             prompts: manifest.prompts,
@@ -3909,6 +4292,7 @@ fn load_plugin_definition(
             lifecycle,
             execution_policy: manifest.execution_policy,
             permissions: manifest.permissions,
+            permission_declarations: manifest.permission_declarations,
             tools,
             resources: manifest.resources,
             prompts: manifest.prompts,
@@ -3925,6 +4309,7 @@ fn load_plugin_definition(
             lifecycle,
             execution_policy: manifest.execution_policy,
             permissions: manifest.permissions,
+            permission_declarations: manifest.permission_declarations,
             tools,
             resources: manifest.resources,
             prompts: manifest.prompts,
@@ -3936,6 +4321,18 @@ fn load_plugin_definition(
             ops_permissions: manifest.ops_permissions,
         }),
     })
+}
+
+fn validate_plugin_registration_policy(
+    kind: PluginKind,
+    manifest: &PluginManifest,
+) -> Result<(), PluginError> {
+    if kind == PluginKind::External && !manifest.hooks.is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "external plugin hooks are rejected by default: FR-2.5 requires a unified sandboxed hook runner before external hooks can be registered".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn load_plugin_from_directory(root: &Path) -> Result<PluginManifest, PluginError> {
@@ -3951,6 +4348,15 @@ fn load_manifest_from_path(
     root: &Path,
     manifest_path: &Path,
 ) -> Result<PluginManifest, PluginError> {
+    audit_plugin_tree(root)?;
+    let metadata = fs::symlink_metadata(manifest_path)?;
+    if metadata.len() > PLUGIN_MANIFEST_MAX_BYTES {
+        return Err(PluginError::ManifestValidation(vec![
+            PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!("plugin manifest exceeds {PLUGIN_MANIFEST_MAX_BYTES} byte limit"),
+            },
+        ]));
+    }
     let contents = fs::read_to_string(manifest_path).map_err(|error| {
         PluginError::NotFound(format!(
             "plugin manifest not found at {}: {error}",
@@ -3958,12 +4364,13 @@ fn load_manifest_from_path(
         ))
     })?;
     let raw_json: Value = serde_json::from_str(&contents)?;
+    let schema = validate_manifest_schema_envelope(&raw_json)?;
     let compatibility_errors = detect_claude_code_manifest_contract_gaps(&raw_json);
     if !compatibility_errors.is_empty() {
         return Err(PluginError::ManifestValidation(compatibility_errors));
     }
     let raw_manifest: RawPluginManifest = serde_json::from_value(raw_json)?;
-    build_plugin_manifest(root, raw_manifest)
+    build_plugin_manifest(root, raw_manifest, schema)
 }
 
 fn detect_claude_code_manifest_contract_gaps(
@@ -4029,6 +4436,367 @@ fn detect_claude_code_manifest_contract_gaps(
     errors
 }
 
+fn validate_manifest_schema_envelope(
+    raw_manifest: &Value,
+) -> Result<ManifestSchemaEnvelope, PluginError> {
+    let Some(root) = raw_manifest.as_object() else {
+        return Err(PluginError::ManifestValidation(vec![
+            PluginManifestValidationError::UnsupportedManifestContract {
+                detail: "plugin manifest root must be a JSON object".to_string(),
+            },
+        ]));
+    };
+
+    let explicit_schema = root.contains_key("schemaVersion");
+    let schema_version = match root.get("schemaVersion") {
+        Some(Value::Number(value)) => value.as_u64(),
+        Some(_) => None,
+        None => Some(PLUGIN_MANIFEST_SCHEMA_VERSION),
+    }
+    .ok_or_else(|| {
+        PluginError::ManifestValidation(vec![
+            PluginManifestValidationError::UnsupportedManifestContract {
+                detail: "plugin manifest schemaVersion must be an unsigned integer".to_string(),
+            },
+        ])
+    })?;
+
+    if schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION {
+        return Err(PluginError::ManifestValidation(vec![
+            PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin manifest schemaVersion {schema_version} is unsupported; supported versions: [{PLUGIN_MANIFEST_SCHEMA_VERSION}]"
+                ),
+            },
+        ]));
+    }
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    validate_manifest_unknown_fields(
+        raw_manifest,
+        &[],
+        explicit_schema,
+        schema_version,
+        &mut warnings,
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Err(PluginError::ManifestValidation(errors));
+    }
+
+    if !explicit_schema {
+        warnings.insert(
+            0,
+            "legacy manifest omitted schemaVersion; normalized to schemaVersion 1".to_string(),
+        );
+    }
+
+    Ok(ManifestSchemaEnvelope {
+        schema_version,
+        legacy: !explicit_schema,
+        explicit_capabilities: root.contains_key("capabilities"),
+        hash: canonical_manifest_hash(raw_manifest),
+        warnings,
+    })
+}
+
+fn validate_manifest_unknown_fields(
+    value: &Value,
+    path: &[&str],
+    explicit_schema: bool,
+    schema_version: u64,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(known_fields) = known_manifest_fields_for_path(path) {
+                for key in object.keys() {
+                    if known_fields.contains(&key.as_str()) {
+                        continue;
+                    }
+                    let field_path = manifest_field_path(path, key);
+                    if explicit_schema {
+                        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                            detail: format!(
+                                "plugin manifest schemaVersion {schema_version} rejects unknown field `{field_path}`"
+                            ),
+                        });
+                    } else if is_sensitive_unknown_manifest_field(key) {
+                        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                            detail: format!(
+                                "legacy plugin manifest unknown security-sensitive field `{field_path}` is rejected; add schemaVersion and use the structured permissions contract"
+                            ),
+                        });
+                    } else {
+                        push_manifest_warning(
+                            warnings,
+                            format!(
+                                "legacy manifest ignored unknown field `{field_path}` while normalizing to schemaVersion 1"
+                            ),
+                        );
+                    }
+                }
+            }
+
+            for (key, child) in object {
+                if should_skip_manifest_unknown_recursion(path, key) {
+                    continue;
+                }
+                if path.is_empty() && key == "mcpServers" {
+                    if let Value::Object(servers) = child {
+                        for server in servers.values() {
+                            validate_manifest_unknown_fields(
+                                server,
+                                &["mcpServers", "*"],
+                                explicit_schema,
+                                schema_version,
+                                warnings,
+                                errors,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let next = next_manifest_path(path, key, child);
+                validate_manifest_unknown_fields(
+                    child,
+                    &next,
+                    explicit_schema,
+                    schema_version,
+                    warnings,
+                    errors,
+                );
+            }
+        }
+        Value::Array(values) => {
+            let next = array_manifest_path(path);
+            for child in values {
+                validate_manifest_unknown_fields(
+                    child,
+                    &next,
+                    explicit_schema,
+                    schema_version,
+                    warnings,
+                    errors,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_manifest_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() < 32 && !warnings.iter().any(|existing| existing == &warning) {
+        warnings.push(truncate_plugin_error(&warning));
+    }
+}
+
+fn manifest_field_path(path: &[&str], key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{}", path.join("."), key)
+    }
+}
+
+fn should_skip_manifest_unknown_recursion(path: &[&str], key: &str) -> bool {
+    matches!(
+        key,
+        "inputSchema" | "outputSchema" | "schema" | "env" | "headers"
+    ) || matches!(path, ["rollback"]) && key == "notes"
+}
+
+fn next_manifest_path<'a>(path: &[&'a str], key: &'a str, _child: &Value) -> Vec<&'a str> {
+    let mut next = path.to_vec();
+    next.push(key);
+    next
+}
+
+fn array_manifest_path<'a>(path: &[&'a str]) -> Vec<&'a str> {
+    let mut next = path.to_vec();
+    next.push("[]");
+    next
+}
+
+fn known_manifest_fields_for_path(path: &[&str]) -> Option<&'static [&'static str]> {
+    match path {
+        [] => Some(&[
+            "schemaVersion",
+            "id",
+            "name",
+            "version",
+            "description",
+            "permissions",
+            "signature",
+            "entrypoint",
+            "defaultEnabled",
+            "hooks",
+            "lifecycle",
+            "executionPolicy",
+            "tools",
+            "commands",
+            "capabilities",
+            "mcpServers",
+            "dependencies",
+            "rollback",
+            "versionPolicy",
+            "opsPermissions",
+            "resources",
+            "prompts",
+        ]),
+        ["hooks"] => Some(&["PreToolUse", "PostToolUse", "PostToolUseFailure"]),
+        ["lifecycle"] => Some(&["Init", "Shutdown"]),
+        ["executionPolicy"] => Some(&["allowExternalSubprocess", "reason"]),
+        ["entrypoint"] => Some(&["command", "args"]),
+        ["tools", "[]"] => Some(&[
+            "name",
+            "description",
+            "inputSchema",
+            "outputSchema",
+            "command",
+            "args",
+            "requiredPermission",
+        ]),
+        ["commands", "[]"] => Some(&["name", "description", "command"]),
+        ["capabilities"] => Some(&["tools", "resources", "prompts", "workflows", "hotReload"]),
+        ["mcpServers", "*"] => Some(&[
+            "transport",
+            "requiredPermission",
+            "command",
+            "args",
+            "env",
+            "url",
+            "headers",
+            "protocolVersion",
+            "toolCallTimeoutMs",
+            "heartbeat",
+            "capabilities",
+        ]),
+        ["mcpServers", "*", "heartbeat"] => Some(&["intervalMs", "timeoutMs"]),
+        ["mcpServers", "*", "capabilities"] => Some(&["tools", "resources", "prompts"]),
+        ["mcpServers", "*", "capabilities", "tools", "[]"] => {
+            Some(&["name", "description", "inputSchema", "outputSchema"])
+        }
+        ["mcpServers", "*", "capabilities", "resources", "[]"] => {
+            Some(&["uri", "name", "description", "mimeType"])
+        }
+        ["mcpServers", "*", "capabilities", "prompts", "[]"] => {
+            Some(&["name", "description", "arguments", "template"])
+        }
+        ["mcpServers", "*", "capabilities", "prompts", "[]", "arguments", "[]"] => {
+            Some(&["name", "description", "required", "schema"])
+        }
+        ["dependencies", "[]"] => Some(&["name", "versionRequirement", "optional"]),
+        ["rollback"] => Some(&["strategy", "commands", "notes"]),
+        ["versionPolicy"] => Some(&["keepVersions", "rollbackOnFailure"]),
+        ["opsPermissions", "[]"] => Some(&[
+            "permission",
+            "scope",
+            "risk",
+            "reason",
+            "rollbackRequired",
+            "rollbackCommand",
+        ]),
+        ["resources", "[]"] => Some(&["uri", "name", "description", "mimeType"]),
+        ["prompts", "[]"] => Some(&["name", "description", "arguments", "template"]),
+        ["prompts", "[]", "arguments", "[]"] => {
+            Some(&["name", "description", "required", "schema"])
+        }
+        ["permissions", "[]"] => Some(&[
+            "type",
+            "permission",
+            "paths",
+            "mode",
+            "origins",
+            "commands",
+            "units",
+            "actions",
+            "managers",
+            "packages",
+            "users",
+            "scopes",
+        ]),
+        _ => None,
+    }
+}
+
+fn is_sensitive_unknown_manifest_field(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    [
+        "permission",
+        "secret",
+        "token",
+        "credential",
+        "authorization",
+        "privilege",
+        "sudo",
+        "sandbox",
+        "security",
+        "capability",
+        "env",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn canonical_manifest_hash(value: &Value) -> String {
+    let mut sanitized = value.clone();
+    if let Some(object) = sanitized.as_object_mut() {
+        object.remove("signature");
+    }
+    let mut encoded = String::new();
+    write_canonical_json(&sanitized, &mut encoded);
+    format!("fnv1a64:{:016x}", fnv1a64(encoded.as_bytes()))
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => out.push_str(&value.to_string()),
+        Value::String(value) => out.push_str(
+            &serde_json::to_string(value).expect("JSON string serialization should succeed"),
+        ),
+        Value::Array(values) => {
+            out.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(value, out);
+            }
+            out.push(']');
+        }
+        Value::Object(values) => {
+            out.push('{');
+            for (index, (key, value)) in
+                values.iter().collect::<BTreeMap<_, _>>().iter().enumerate()
+            {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(
+                    &serde_json::to_string(key).expect("JSON key serialization should succeed"),
+                );
+                out.push(':');
+                write_canonical_json(value, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
     let direct_path = root.join(MANIFEST_FILE_NAME);
     if direct_path.exists() {
@@ -4050,14 +4818,59 @@ fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
 fn build_plugin_manifest(
     root: &Path,
     raw: RawPluginManifest,
+    schema: ManifestSchemaEnvelope,
 ) -> Result<PluginManifest, PluginError> {
     let mut errors = Vec::new();
 
-    validate_required_manifest_field("name", &raw.name, &mut errors);
-    validate_required_manifest_field("version", &raw.version, &mut errors);
-    validate_required_manifest_field("description", &raw.description, &mut errors);
+    validate_manifest_slug_field(
+        "name",
+        &raw.name,
+        PLUGIN_MANIFEST_NAME_MAX_CHARS,
+        &mut errors,
+    );
+    if let Some(id) = raw.id.as_deref() {
+        validate_manifest_slug_field("id", id, PLUGIN_MANIFEST_ID_MAX_CHARS, &mut errors);
+        if id.trim() != raw.name.trim() {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin manifest id `{}` must match name `{}` to avoid confused-deputy registration",
+                    id.trim(),
+                    raw.name.trim()
+                ),
+            });
+        }
+    }
+    validate_manifest_version_field("version", &raw.version, &mut errors);
+    validate_manifest_text_field(
+        "description",
+        &raw.description,
+        PLUGIN_MANIFEST_DESCRIPTION_MAX_CHARS,
+        &mut errors,
+    );
+    if let Some(signature) = raw.signature.as_deref() {
+        validate_manifest_text_field(
+            "signature",
+            signature,
+            PLUGIN_MANIFEST_SIGNATURE_MAX_CHARS,
+            &mut errors,
+        );
+    }
 
-    let permissions = build_manifest_permissions(&raw.permissions, &mut errors);
+    validate_collection_limit("permissions", raw.permissions.len(), &mut errors);
+    validate_collection_limit("tools", raw.tools.len(), &mut errors);
+    validate_collection_limit("commands", raw.commands.len(), &mut errors);
+    validate_collection_limit("mcpServers", raw.mcp_servers.len(), &mut errors);
+    validate_collection_limit("dependencies", raw.dependencies.len(), &mut errors);
+    validate_collection_limit("opsPermissions", raw.ops_permissions.len(), &mut errors);
+    validate_collection_limit("resources", raw.resources.len(), &mut errors);
+    validate_collection_limit("prompts", raw.prompts.len(), &mut errors);
+
+    if let Some(entrypoint) = raw.entrypoint.as_ref() {
+        validate_entrypoint(root, entrypoint, &mut errors);
+    }
+
+    let (permissions, permission_declarations) =
+        build_manifest_permissions(root, &raw.permissions, &mut errors);
     validate_command_entries(root, raw.hooks.pre_tool_use.iter(), "hook", &mut errors);
     validate_command_entries(root, raw.hooks.post_tool_use.iter(), "hook", &mut errors);
     validate_command_entries(
@@ -4086,23 +4899,56 @@ fn build_plugin_manifest(
     let mcp_servers = build_manifest_mcp_servers(root, raw.mcp_servers, &permissions, &mut errors);
     let dependencies = build_manifest_dependencies(raw.dependencies, &mut errors);
     validate_ops_permissions(&raw.ops_permissions, &raw.rollback, &mut errors);
+    let actual_surfaces = actual_surfaces_from_manifest_parts(
+        tools.len(),
+        resources.len(),
+        prompts.len(),
+        &mcp_servers,
+        raw.ops_permissions.len(),
+    );
+    let capabilities = normalize_manifest_capabilities(
+        raw.capabilities,
+        schema.explicit_capabilities,
+        &actual_surfaces,
+        &mut errors,
+    );
 
     if !errors.is_empty() {
         return Err(PluginError::ManifestValidation(errors));
     }
 
+    let manifest_metadata = PluginManifestMetadata {
+        schema_version: schema.schema_version,
+        legacy: schema.legacy,
+        hash: schema.hash,
+        signature: raw.signature.clone(),
+        signature_verified: false,
+        signature_warning: raw
+            .signature
+            .as_ref()
+            .map(|_| "manifest signature is present but has not been verified".to_string()),
+        declared_id: raw.id.clone(),
+        entrypoint: raw.entrypoint.clone(),
+        warnings: schema.warnings,
+    };
+
     Ok(PluginManifest {
+        schema_version: schema.schema_version,
+        id: raw.id,
         name: raw.name,
         version: raw.version,
         description: raw.description,
         permissions,
+        permission_declarations,
+        entrypoint: raw.entrypoint,
+        manifest_metadata,
         default_enabled: raw.default_enabled,
         hooks: raw.hooks,
         lifecycle: raw.lifecycle,
         execution_policy: raw.execution_policy,
         tools,
         commands,
-        capabilities: raw.capabilities,
+        capabilities,
         mcp_servers,
         dependencies,
         rollback: raw.rollback,
@@ -4113,48 +4959,180 @@ fn build_plugin_manifest(
     })
 }
 
-fn validate_required_manifest_field(
+fn validate_manifest_text_field(
+    field: &'static str,
+    value: &str,
+    max_chars: usize,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        errors.push(PluginManifestValidationError::EmptyField { field });
+        return;
+    }
+    if trimmed.chars().count() > max_chars || contains_control_character(trimmed) {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin manifest {field} must be non-control text no longer than {max_chars} characters"
+            ),
+        });
+    }
+}
+
+fn validate_manifest_slug_field(
+    field: &'static str,
+    value: &str,
+    max_chars: usize,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    validate_manifest_text_field(field, value, max_chars, errors);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let is_reserved = matches!(
+        trimmed,
+        "." | ".." | "builtin" | "bundled" | "external" | "root" | "admin" | "system"
+    );
+    if is_reserved
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+    {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin manifest {field} `{trimmed}` must be an ASCII slug using lowercase letters, digits, '-' or '_' and must not be reserved"
+            ),
+        });
+    }
+}
+
+fn validate_manifest_version_field(
     field: &'static str,
     value: &str,
     errors: &mut Vec<PluginManifestValidationError>,
 ) {
+    validate_manifest_text_field(field, value, PLUGIN_MANIFEST_VERSION_MAX_CHARS, errors);
     if value.trim().is_empty() {
-        errors.push(PluginManifestValidationError::EmptyField { field });
+        return;
+    }
+    if parse_semver(value).is_err() {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin manifest {field} `{}` must be semver-compatible",
+                value.trim()
+            ),
+        });
     }
 }
 
-fn build_manifest_permissions(
-    permissions: &[String],
+fn validate_collection_limit(
+    field: &'static str,
+    count: usize,
     errors: &mut Vec<PluginManifestValidationError>,
-) -> Vec<PluginPermission> {
-    let mut seen = BTreeSet::new();
-    let mut validated = Vec::new();
+) {
+    if count > PLUGIN_MANIFEST_MAX_DECLARATIONS {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin manifest {field} has {count} entries, exceeding limit {PLUGIN_MANIFEST_MAX_DECLARATIONS}"
+            ),
+        });
+    }
+}
 
-    for permission in permissions {
-        let permission = permission.trim();
-        if permission.is_empty() {
-            errors.push(PluginManifestValidationError::EmptyEntryField {
-                kind: "permission",
-                field: "value",
-                name: None,
+fn validate_entrypoint(
+    root: &Path,
+    entrypoint: &PluginEntrypoint,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if entrypoint.command.trim().is_empty() {
+        errors.push(PluginManifestValidationError::EmptyEntryField {
+            kind: "entrypoint",
+            field: "command",
+            name: None,
+        });
+        return;
+    }
+    validate_command_entry(root, &entrypoint.command, "entrypoint", errors);
+    validate_collection_limit("entrypoint.args", entrypoint.args.len(), errors);
+    for arg in &entrypoint.args {
+        if arg.chars().count() > PLUGIN_PERMISSION_VALUE_MAX_CHARS
+            || contains_control_character(arg)
+        {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: "plugin entrypoint args must be bounded and contain no control characters"
+                    .to_string(),
             });
-            continue;
-        }
-        if !seen.insert(permission.to_string()) {
-            errors.push(PluginManifestValidationError::DuplicatePermission {
-                permission: permission.to_string(),
-            });
-            continue;
-        }
-        match PluginPermission::parse(permission) {
-            Some(permission) => validated.push(permission),
-            None => errors.push(PluginManifestValidationError::InvalidPermission {
-                permission: permission.to_string(),
-            }),
         }
     }
+}
 
-    validated
+fn contains_control_character(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+fn path_has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn build_manifest_permissions(
+    root: &Path,
+    permissions: &[RawPluginPermissionDeclaration],
+    errors: &mut Vec<PluginManifestValidationError>,
+) -> (Vec<PluginPermission>, Vec<PluginPermissionDeclaration>) {
+    let mut seen = BTreeSet::new();
+    let mut validated = Vec::new();
+    let mut declarations = Vec::new();
+
+    for permission in permissions {
+        let (declaration, duplicate_label) = match permission {
+            RawPluginPermissionDeclaration::Legacy(permission) => {
+                let permission = permission.trim();
+                if permission.is_empty() {
+                    errors.push(PluginManifestValidationError::EmptyEntryField {
+                        kind: "permission",
+                        field: "value",
+                        name: None,
+                    });
+                    continue;
+                }
+                match PluginPermission::parse(permission) {
+                    Some(parsed) => (
+                        PluginPermissionDeclaration::Legacy { permission: parsed },
+                        permission.to_string(),
+                    ),
+                    None => {
+                        errors.push(PluginManifestValidationError::InvalidPermission {
+                            permission: permission.to_string(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            RawPluginPermissionDeclaration::Structured(declaration) => {
+                let key = serde_json::to_string(declaration)
+                    .unwrap_or_else(|_| format!("{declaration:?}"));
+                (declaration.clone(), key)
+            }
+        };
+
+        if !seen.insert(duplicate_label.clone()) {
+            errors.push(PluginManifestValidationError::DuplicatePermission {
+                permission: duplicate_label,
+            });
+            continue;
+        }
+        validate_permission_declaration(root, &declaration, errors);
+        let manifest_permission = manifest_permission_for_declaration(&declaration);
+        if !validated.contains(&manifest_permission) {
+            validated.push(manifest_permission);
+        }
+        declarations.push(declaration);
+    }
+
+    validated.sort();
+    (validated, declarations)
 }
 
 fn manifest_permission_for_tool(permission: PluginToolPermission) -> PluginPermission {
@@ -4162,6 +5140,194 @@ fn manifest_permission_for_tool(permission: PluginToolPermission) -> PluginPermi
         PluginToolPermission::ReadOnly => PluginPermission::Read,
         PluginToolPermission::WorkspaceWrite => PluginPermission::Write,
         PluginToolPermission::DangerFullAccess => PluginPermission::Execute,
+    }
+}
+
+fn manifest_permission_for_declaration(
+    declaration: &PluginPermissionDeclaration,
+) -> PluginPermission {
+    match declaration {
+        PluginPermissionDeclaration::Legacy { permission } => *permission,
+        PluginPermissionDeclaration::Filesystem { mode, .. } => match mode {
+            PluginFilesystemPermissionMode::Read => PluginPermission::Read,
+            PluginFilesystemPermissionMode::Write | PluginFilesystemPermissionMode::ReadWrite => {
+                PluginPermission::Write
+            }
+        },
+        PluginPermissionDeclaration::Network { .. } => PluginPermission::Read,
+        PluginPermissionDeclaration::Process { .. }
+        | PluginPermissionDeclaration::Systemd { .. }
+        | PluginPermissionDeclaration::Package { .. }
+        | PluginPermissionDeclaration::User { .. }
+        | PluginPermissionDeclaration::Firewall { .. } => PluginPermission::Execute,
+    }
+}
+
+fn validate_permission_declaration(
+    root: &Path,
+    declaration: &PluginPermissionDeclaration,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    match declaration {
+        PluginPermissionDeclaration::Legacy { .. } => {}
+        PluginPermissionDeclaration::Filesystem { paths, .. } => {
+            validate_permission_values("filesystem permission", "paths", paths, errors);
+            for path in paths {
+                validate_declared_filesystem_path(root, path, errors);
+            }
+        }
+        PluginPermissionDeclaration::Network { origins } => {
+            validate_permission_values("network permission", "origins", origins, errors);
+            for origin in origins {
+                validate_network_origin(origin, errors);
+            }
+        }
+        PluginPermissionDeclaration::Process { commands } => {
+            validate_permission_values("process permission", "commands", commands, errors);
+            for command in commands {
+                validate_process_permission_command(root, command, errors);
+            }
+        }
+        PluginPermissionDeclaration::Systemd { units, actions } => {
+            validate_permission_values("systemd permission", "units", units, errors);
+            validate_permission_values("systemd permission", "actions", actions, errors);
+        }
+        PluginPermissionDeclaration::Package {
+            managers,
+            actions,
+            packages,
+        } => {
+            validate_permission_values("package permission", "managers", managers, errors);
+            validate_permission_values("package permission", "actions", actions, errors);
+            validate_permission_values("package permission", "packages", packages, errors);
+        }
+        PluginPermissionDeclaration::User { users, actions } => {
+            validate_permission_values("user permission", "users", users, errors);
+            validate_permission_values("user permission", "actions", actions, errors);
+        }
+        PluginPermissionDeclaration::Firewall { scopes, actions } => {
+            validate_permission_values("firewall permission", "scopes", scopes, errors);
+            validate_permission_values("firewall permission", "actions", actions, errors);
+        }
+    }
+}
+
+fn validate_permission_values(
+    kind: &'static str,
+    field: &'static str,
+    values: &[String],
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if values.is_empty() || values.len() > PLUGIN_MANIFEST_MAX_DECLARATIONS {
+        errors.push(PluginManifestValidationError::EmptyEntryField {
+            kind,
+            field,
+            name: None,
+        });
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || trimmed == "*"
+            || trimmed.chars().count() > PLUGIN_PERMISSION_VALUE_MAX_CHARS
+            || contains_control_character(trimmed)
+            || !seen.insert(trimmed.to_string())
+        {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} {field} entry must be unique, non-empty, bounded, and must not use wildcard bypasses"
+                ),
+            });
+        }
+    }
+}
+
+fn validate_declared_filesystem_path(
+    root: &Path,
+    value: &str,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if Path::new(trimmed).is_absolute()
+        || trimmed.contains('*')
+        || path_has_parent_component(Path::new(trimmed))
+    {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin filesystem permission path `{trimmed}` must be plugin-relative and contained within the plugin root"
+            ),
+        });
+        return;
+    }
+    let path = root.join(trimmed);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin filesystem permission path `{trimmed}` must not reference a symlink or special file"
+                ),
+            });
+        }
+    }
+}
+
+fn validate_network_origin(origin: &str, errors: &mut Vec<PluginManifestValidationError>) {
+    let trimmed = origin.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!("plugin network origin `{trimmed}` must use http:// or https://"),
+        });
+        return;
+    };
+    if !matches!(scheme, "http" | "https")
+        || rest.is_empty()
+        || rest.contains('@')
+        || rest.contains('/')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.contains('*')
+        || contains_control_character(trimmed)
+    {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin network origin `{}` must be an origin without userinfo, path, query, fragment, or wildcard",
+                sanitize_plugin_error(trimmed)
+            ),
+        });
+    }
+}
+
+fn validate_process_permission_command(
+    root: &Path,
+    command: &str,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    let trimmed = command.trim();
+    if trimmed.starts_with("./") {
+        validate_command_entry(root, trimmed, "process permission", errors);
+        return;
+    }
+    if trimmed.contains(std::path::MAIN_SEPARATOR)
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.split_whitespace().count() != 1
+        || trimmed.contains('*')
+        || contains_control_character(trimmed)
+        || matches!(
+            trimmed,
+            "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell"
+        )
+    {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin process permission command `{trimmed}` must be a single bounded command token or plugin-relative path, not a shell or wildcard"
+            ),
+        });
     }
 }
 
@@ -4507,6 +5673,181 @@ fn build_manifest_mcp_servers(
     mcp_servers
 }
 
+fn actual_surfaces_for_plugin(plugin: &PluginDefinition) -> PluginActualSurfaces {
+    actual_surfaces_from_manifest_parts(
+        plugin.tools().len(),
+        plugin.resources().len(),
+        plugin.prompts().len(),
+        plugin.mcp_servers(),
+        plugin.ops_permissions().len(),
+    )
+}
+
+fn actual_surfaces_from_manifest_parts(
+    tools: usize,
+    resources: usize,
+    prompts: usize,
+    mcp_servers: &BTreeMap<String, PluginMcpServerManifest>,
+    ops_permissions: usize,
+) -> PluginActualSurfaces {
+    PluginActualSurfaces {
+        tools,
+        resources,
+        prompts,
+        mcp_servers: mcp_servers.len(),
+        mcp_tools: mcp_servers
+            .values()
+            .map(|server| server.capabilities.tools.len())
+            .sum(),
+        mcp_resources: mcp_servers
+            .values()
+            .map(|server| server.capabilities.resources.len())
+            .sum(),
+        mcp_prompts: mcp_servers
+            .values()
+            .map(|server| server.capabilities.prompts.len())
+            .sum(),
+        ops_permissions,
+    }
+}
+
+fn degraded_reason_for_plugin(plugin: &PluginDefinition) -> Option<String> {
+    let warnings = &plugin.metadata().manifest.warnings;
+    (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+fn append_manifest_warnings(plugin: &mut PluginDefinition, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let metadata = plugin.metadata_mut();
+    for warning in warnings {
+        push_manifest_warning(
+            &mut metadata.manifest.warnings,
+            sanitize_plugin_error(warning),
+        );
+    }
+}
+
+fn permission_declaration_statuses_for_plugin(
+    plugin: &PluginDefinition,
+) -> Vec<PluginPermissionDeclarationStatus> {
+    plugin
+        .permission_declarations()
+        .iter()
+        .enumerate()
+        .map(|(index, declaration)| {
+            let enforced = matches!(declaration, PluginPermissionDeclaration::Legacy { .. });
+            PluginPermissionDeclarationStatus {
+                index,
+                permission_type: permission_declaration_type(declaration).to_string(),
+                enforced,
+                declaration_only: !enforced,
+                enforced_permission: enforced
+                    .then(|| manifest_permission_for_declaration(declaration)),
+            }
+        })
+        .collect()
+}
+
+fn permission_declaration_type(declaration: &PluginPermissionDeclaration) -> &'static str {
+    match declaration {
+        PluginPermissionDeclaration::Legacy { .. } => "legacy",
+        PluginPermissionDeclaration::Filesystem { .. } => "filesystem",
+        PluginPermissionDeclaration::Network { .. } => "network",
+        PluginPermissionDeclaration::Process { .. } => "process",
+        PluginPermissionDeclaration::Systemd { .. } => "systemd",
+        PluginPermissionDeclaration::Package { .. } => "package",
+        PluginPermissionDeclaration::User { .. } => "user",
+        PluginPermissionDeclaration::Firewall { .. } => "firewall",
+    }
+}
+
+fn validate_registered_capability_gate(plugin: &RegisteredPlugin) -> Result<(), PluginError> {
+    let actual = actual_surfaces_for_plugin(&plugin.definition);
+    let capabilities = plugin.capabilities();
+    for (capability, declared, has_surface) in [
+        (
+            "tools",
+            capabilities.tools,
+            actual.tools > 0 || actual.mcp_tools > 0 || actual.ops_permissions > 0,
+        ),
+        (
+            "resources",
+            capabilities.resources,
+            actual.resources > 0 || actual.mcp_resources > 0,
+        ),
+        (
+            "prompts",
+            capabilities.prompts,
+            actual.prompts > 0 || actual.mcp_prompts > 0,
+        ),
+    ] {
+        if declared != has_surface {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin `{}` capabilities.{capability}={declared} does not match registered {capability} surfaces",
+                plugin.metadata().id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_manifest_capabilities(
+    raw_capabilities: Option<PluginCapabilities>,
+    explicit_capabilities: bool,
+    actual: &PluginActualSurfaces,
+    errors: &mut Vec<PluginManifestValidationError>,
+) -> PluginCapabilities {
+    let inferred = PluginCapabilities {
+        tools: actual.tools > 0 || actual.mcp_tools > 0 || actual.ops_permissions > 0,
+        resources: actual.resources > 0 || actual.mcp_resources > 0,
+        prompts: actual.prompts > 0 || actual.mcp_prompts > 0,
+        workflows: false,
+        hot_reload: false,
+    };
+
+    let Some(mut capabilities) = raw_capabilities else {
+        return inferred;
+    };
+
+    if explicit_capabilities {
+        validate_capability_matches_surface("tools", capabilities.tools, inferred.tools, errors);
+        validate_capability_matches_surface(
+            "resources",
+            capabilities.resources,
+            inferred.resources,
+            errors,
+        );
+        validate_capability_matches_surface(
+            "prompts",
+            capabilities.prompts,
+            inferred.prompts,
+            errors,
+        );
+    }
+
+    capabilities.tools = inferred.tools;
+    capabilities.resources = inferred.resources;
+    capabilities.prompts = inferred.prompts;
+    capabilities
+}
+
+fn validate_capability_matches_surface(
+    capability: &'static str,
+    declared: bool,
+    actual: bool,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if declared != actual {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin capabilities.{capability}={declared} does not match declared {capability} surfaces"
+            ),
+        });
+    }
+}
+
 fn validate_manifest_mcp_heartbeat(
     server_name: &str,
     server: &PluginMcpServerManifest,
@@ -4577,11 +5918,36 @@ fn validate_ops_permissions(
                 name: None,
             });
         }
+        if permission.scope.contains('*')
+            || permission.scope.chars().count() > PLUGIN_PERMISSION_VALUE_MAX_CHARS
+            || contains_control_character(&permission.scope)
+            || !matches!(
+                permission.scope.split('.').next().unwrap_or_default(),
+                "ops" | "systemd" | "service" | "package" | "user" | "firewall"
+            )
+        {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin ops permission scope `{}` must be bounded, structured, and must not use wildcards",
+                    permission.scope
+                ),
+            });
+        }
         if permission.reason.trim().is_empty() {
             errors.push(PluginManifestValidationError::EmptyEntryField {
                 kind: "ops permission",
                 field: "reason",
                 name: Some(permission.scope.clone()),
+            });
+        }
+        if permission.reason.chars().count() > PLUGIN_MANIFEST_DESCRIPTION_MAX_CHARS
+            || contains_control_character(&permission.reason)
+        {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin ops permission `{}` reason must be bounded and contain no control characters",
+                    permission.scope
+                ),
             });
         }
         if matches!(
@@ -4624,18 +5990,92 @@ fn validate_command_entry(
         return;
     }
     if is_literal_command(entry) {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin {kind} command `{entry}` must be a plugin-contained file path, not a bare command"
+            ),
+        });
         return;
     }
 
+    validate_contained_file_path(root, entry, kind, errors);
+}
+
+fn validate_contained_file_path(
+    root: &Path,
+    entry: &str,
+    kind: &'static str,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if contains_control_character(entry) || path_has_parent_component(Path::new(entry)) {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin {kind} path `{entry}` must not contain control characters or parent-directory traversal"
+            ),
+        });
+        return;
+    }
     let path = if Path::new(entry).is_absolute() {
         PathBuf::from(entry)
     } else {
         root.join(entry)
     };
-    if !path.exists() {
-        errors.push(PluginManifestValidationError::MissingPath { kind, path });
-    } else if !path.is_file() {
-        errors.push(PluginManifestValidationError::PathIsDirectory { kind, path });
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            errors.push(PluginManifestValidationError::MissingPath { kind, path });
+            return;
+        }
+        Err(error) => {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} path `{}` cannot be inspected: {error}",
+                    path.display()
+                ),
+            });
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!(
+                "plugin {kind} path `{}` must not be a symlink",
+                path.display()
+            ),
+        });
+        return;
+    }
+    if !metadata.is_file() {
+        if metadata.is_dir() {
+            errors.push(PluginManifestValidationError::PathIsDirectory { kind, path });
+        } else {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} path `{}` must be a regular file",
+                    path.display()
+                ),
+            });
+        }
+        return;
+    }
+    if let Err(error) = validate_canonical_containment(root, &path, kind) {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: error.to_string(),
+        });
+    }
+}
+
+fn validate_canonical_containment(root: &Path, path: &Path, kind: &str) -> Result<(), PluginError> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    if canonical_path.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(PluginError::InvalidManifest(format!(
+            "{kind} path `{}` resolves outside plugin root `{}`",
+            path.display(),
+            canonical_root.display()
+        )))
     }
 }
 
@@ -4745,25 +6185,38 @@ fn validate_tool_paths(root: Option<&Path>, tools: &[PluginTool]) -> Result<(), 
 
 fn validate_command_path(root: &Path, entry: &str, kind: &str) -> Result<(), PluginError> {
     if is_literal_command(entry) {
-        return Ok(());
+        return Err(PluginError::InvalidManifest(format!(
+            "{kind} command `{entry}` must be a plugin-contained file path, not a bare command"
+        )));
     }
     let path = if Path::new(entry).is_absolute() {
         PathBuf::from(entry)
     } else {
         root.join(entry)
     };
-    if !path.exists() {
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PluginError::InvalidManifest(format!(
+                "{kind} path `{}` does not exist",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(PluginError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
         return Err(PluginError::InvalidManifest(format!(
-            "{kind} path `{}` does not exist",
+            "{kind} path `{}` must not be a symlink",
             path.display()
         )));
     }
-    if !path.is_file() {
+    if !metadata.is_file() {
         return Err(PluginError::InvalidManifest(format!(
             "{kind} path `{}` must point to a file",
             path.display()
         )));
     }
+    validate_canonical_containment(root, &path, kind)?;
     Ok(())
 }
 
@@ -4821,10 +6274,11 @@ fn run_lifecycle_commands(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(PluginError::CommandFailed(format!(
-                "plugin `{}` {} failed for `{}`: {}",
+                "plugin `{}` {} failed for `{}`{}: {}",
                 metadata.id,
                 phase,
                 command,
+                truncated_suffix(output.stderr_truncated),
                 if stderr.is_empty() {
                     format!("exit status {}", output.status)
                 } else {
@@ -4838,32 +6292,127 @@ fn run_lifecycle_commands(
 }
 
 fn resolve_local_source(source: &str) -> Result<PathBuf, PluginError> {
-    let path = PathBuf::from(source);
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(PluginError::NotFound(format!(
-            "plugin source `{source}` was not found"
-        )))
+    if contains_control_character(source) {
+        return Err(PluginError::NotFound(
+            "plugin source contains forbidden control characters".to_string(),
+        ));
     }
+    let path = PathBuf::from(source);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PluginError::NotFound(format!(
+                "plugin source `{}` was not found",
+                sanitize_plugin_error(source)
+            ))
+        } else {
+            PluginError::Io(error)
+        }
+    })?;
+    validate_plugin_entry_metadata(&path, &metadata)?;
+    if !metadata.is_dir() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin source `{}` must be a directory",
+            sanitize_plugin_error(source)
+        )));
+    }
+    Ok(path.canonicalize()?)
 }
 
 fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError> {
     if source.starts_with("http://")
         || source.starts_with("https://")
+        || source.starts_with("ssh://")
         || source.starts_with("git@")
         || Path::new(source)
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
     {
-        Ok(PluginInstallSource::GitUrl {
-            url: source.to_string(),
-        })
+        let sanitized_url = validate_and_sanitize_git_install_url(source)?;
+        Ok(PluginInstallSource::GitUrl { url: sanitized_url })
     } else {
         Ok(PluginInstallSource::LocalPath {
             path: resolve_local_source(source)?,
         })
     }
+}
+
+fn validate_and_sanitize_git_install_url(source: &str) -> Result<String, PluginError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() || contains_control_character(trimmed) {
+        return Err(PluginError::InvalidManifest(
+            "plugin Git install URL must be non-empty and contain no control characters"
+                .to_string(),
+        ));
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if contains_credential_marker(trimmed) {
+        return Err(PluginError::InvalidManifest(
+            "plugin Git install URL must not embed credentials or tokens".to_string(),
+        ));
+    }
+    if let Some((scheme, after_scheme)) = trimmed.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        let authority_end = after_scheme
+            .find(|ch| matches!(ch, '/' | '?' | '#'))
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        let suffix = &after_scheme[authority_end..];
+        if suffix.contains('?') || suffix.contains('#') {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin Git install URL `{}` must not contain query or fragment; use git credential helper for credentials",
+                sanitize_plugin_error(trimmed)
+            )));
+        }
+        if matches!(scheme.as_str(), "http" | "https") && authority.contains('@') {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin Git install URL `{}` must not contain HTTP(S) userinfo; use git credential helper for credentials",
+                sanitize_plugin_error(trimmed)
+            )));
+        }
+        if scheme == "ssh" {
+            if let Some((userinfo, _host)) = authority.rsplit_once('@') {
+                if !valid_git_url_user(userinfo) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin Git install URL `{}` must not contain an SSH password; use git credential helper or SSH agent credentials",
+                        sanitize_plugin_error(trimmed)
+                    )));
+                }
+            }
+        }
+    } else if let Some(scp) = parse_scp_git_url(trimmed) {
+        if trimmed.contains('?') || trimmed.contains('#') {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin Git install URL `{}` must not contain query or fragment; use git credential helper for credentials",
+                sanitize_plugin_error(trimmed)
+            )));
+        }
+        if let Some(user) = scp.user {
+            if !valid_git_url_user(user) {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin Git install URL `{}` must not contain an scp-style password or credential marker; use git credential helper or SSH agent credentials",
+                    sanitize_plugin_error(trimmed)
+                )));
+            }
+        }
+        if scp.host.is_empty()
+            || contains_control_character(scp.host)
+            || scp.host.contains(':')
+            || contains_credential_marker(scp.host)
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin Git install URL `{}` has an invalid scp-style host",
+                sanitize_plugin_error(trimmed)
+            )));
+        }
+    } else if (trimmed.starts_with("git@") || lowered.ends_with(".git"))
+        && (trimmed.contains('?') || trimmed.contains('#'))
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin Git install URL `{}` must not contain query or fragment; use git credential helper for credentials",
+            sanitize_plugin_error(trimmed)
+        )));
+    }
+    sanitize_git_install_url_for_storage(trimmed)
 }
 
 fn materialize_source(
@@ -4890,8 +6439,9 @@ fn materialize_source(
                 .output()?;
             if !output.status.success() {
                 return Err(PluginError::CommandFailed(format!(
-                    "git clone failed for `{url}`: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "git clone failed for `{}`: {}",
+                    sanitize_plugin_error(url),
+                    sanitize_plugin_error(String::from_utf8_lossy(&output.stderr).trim())
                 )));
             }
             Ok(destination)
@@ -4936,7 +6486,12 @@ fn dependency_order_for_plugins(plugins: &[RegisteredPlugin]) -> Result<Vec<Stri
     for plugin in &enabled_plugins {
         let id = plugin.metadata().id.clone();
         ids.insert(id.clone());
-        by_name.insert(plugin.metadata().name.clone(), id);
+        if let Some(existing_id) = by_name.insert(plugin.metadata().name.clone(), id.clone()) {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin name `{}` is declared by both `{existing_id}` and `{id}`",
+                plugin.metadata().name
+            )));
+        }
     }
 
     let mut indegree = ids
@@ -5114,6 +6669,153 @@ fn plugin_id(name: &str, marketplace: &str) -> String {
     format!("{name}@{marketplace}")
 }
 
+#[must_use]
+pub fn sanitize_plugin_error(value: &str) -> String {
+    let mut redacted = redact_scp_credentials(redact_url_credentials_and_query(value));
+    for marker in [
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Bearer ",
+        "token=",
+        "access_token=",
+        "refresh_token=",
+        "api_key=",
+        "apikey=",
+        "key=",
+        "secret=",
+        "password=",
+    ] {
+        redacted = redact_after_marker(&redacted, marker);
+    }
+    truncate_plugin_error(&redacted)
+}
+
+fn truncate_plugin_error(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .filter(|ch| !matches!(ch, '\0'))
+        .take(PLUGIN_ERROR_SURFACE_MAX_CHARS)
+        .collect::<String>();
+    if value.chars().count() > PLUGIN_ERROR_SURFACE_MAX_CHARS {
+        out.push_str("...[truncated]");
+    }
+    out
+}
+
+fn redact_after_marker(value: &str, marker: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(index) = find_ascii_case_insensitive(rest, marker) {
+        let before = &rest[..index + marker.len()];
+        out.push_str(before);
+        out.push_str("[redacted]");
+        let after_marker = &rest[index + marker.len()..];
+        let secret_end = after_marker
+            .find(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '"' | '\'' | '&' | ';' | ',' | '/' | '?' | '#')
+            })
+            .unwrap_or(after_marker.len());
+        rest = &after_marker[secret_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn find_ascii_case_insensitive(value: &str, marker: &str) -> Option<usize> {
+    let marker = marker.as_bytes();
+    if marker.is_empty() {
+        return None;
+    }
+    value.as_bytes().windows(marker.len()).position(|window| {
+        window
+            .iter()
+            .zip(marker)
+            .all(|(left, right)| ascii_bytes_equal_ignore_case(*left, *right))
+    })
+}
+
+fn ascii_bytes_equal_ignore_case(left: u8, right: u8) -> bool {
+    left == right
+        || (left.is_ascii_alphabetic()
+            && right.is_ascii_alphabetic()
+            && left.to_ascii_lowercase() == right.to_ascii_lowercase())
+}
+
+fn redact_scp_credentials(value: String) -> String {
+    let mut out = String::new();
+    let mut rest = value.as_str();
+    while let Some(at_index) = rest.find('@') {
+        let token_start = rest[..at_index]
+            .rfind(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '<')
+            })
+            .map_or(0, |index| index + 1);
+        let userinfo = &rest[token_start..at_index];
+        let after_at = &rest[at_index + 1..];
+        let token_end = after_at
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | ')' | ']' | '>'))
+            .unwrap_or(after_at.len());
+        let after_token = &after_at[..token_end];
+        if userinfo.contains(':') && after_token.contains(':') {
+            out.push_str(&rest[..token_start]);
+            out.push_str("[redacted]@");
+            out.push_str(after_token);
+            rest = &after_at[token_end..];
+        } else {
+            out.push_str(&rest[..at_index + 1]);
+            rest = after_at;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_url_credentials_and_query(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(scheme_index) = rest.find("://") {
+        let prefix_start = rest[..scheme_index]
+            .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '<'))
+            .map_or(0, |index| index + 1);
+        out.push_str(&rest[..prefix_start]);
+        let candidate = &rest[prefix_start..];
+        let end = candidate
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '>'))
+            .unwrap_or(candidate.len());
+        out.push_str(&redact_single_url_like(&candidate[..end]));
+        rest = &candidate[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_single_url_like(value: &str) -> String {
+    let Some((scheme, after_scheme)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let mut authority_and_rest = after_scheme.to_string();
+    let path_start = authority_and_rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(authority_and_rest.len());
+    let (authority, suffix) = authority_and_rest.split_at(path_start);
+    let redacted_authority = authority.rsplit_once('@').map_or_else(
+        || authority.to_string(),
+        |(_, host)| format!("[redacted]@{host}"),
+    );
+    let mut redacted = format!("{scheme}://{redacted_authority}");
+    if let Some(path) = suffix.split(['?', '#']).next() {
+        redacted.push_str(path);
+    }
+    if suffix.contains('?') {
+        redacted.push_str("?[redacted]");
+    }
+    if suffix.contains('#') {
+        redacted.push_str("#[redacted]");
+    }
+    authority_and_rest.clear();
+    redacted
+}
+
 fn sanitize_plugin_id(plugin_id: &str) -> String {
     plugin_id
         .chars()
@@ -5127,8 +6829,211 @@ fn sanitize_plugin_id(plugin_id: &str) -> String {
 fn describe_install_source(source: &PluginInstallSource) -> String {
     match source {
         PluginInstallSource::LocalPath { path } => path.display().to_string(),
-        PluginInstallSource::GitUrl { url } => url.clone(),
+        PluginInstallSource::GitUrl { url } => sanitize_plugin_error(url),
     }
+}
+
+fn sanitize_registry_for_storage(registry: &InstalledPluginRegistry) -> InstalledPluginRegistry {
+    let mut sanitized = registry.clone();
+    for record in sanitized.plugins.values_mut() {
+        record.source = sanitize_install_source_for_storage(&record.source);
+    }
+    sanitized
+}
+
+fn sanitize_install_source_for_storage(source: &PluginInstallSource) -> PluginInstallSource {
+    match source {
+        PluginInstallSource::LocalPath { path } => {
+            PluginInstallSource::LocalPath { path: path.clone() }
+        }
+        PluginInstallSource::GitUrl { url } => PluginInstallSource::GitUrl {
+            url: sanitize_git_install_url_for_storage(url)
+                .unwrap_or_else(|_| sanitize_plugin_error(url)),
+        },
+    }
+}
+
+fn sanitize_git_install_url_for_storage(source: &str) -> Result<String, PluginError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() || contains_control_character(trimmed) {
+        return Err(PluginError::InvalidManifest(
+            "plugin Git install URL must be non-empty and contain no control characters"
+                .to_string(),
+        ));
+    }
+    if let Some((scheme, after_scheme)) = trimmed.split_once("://") {
+        let authority_end = after_scheme
+            .find(|ch| matches!(ch, '/' | '?' | '#'))
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        let suffix = &after_scheme[authority_end..];
+        let path = suffix.split(['?', '#']).next().unwrap_or_default();
+        let scheme_lower = scheme.to_ascii_lowercase();
+        let sanitized_authority = authority.rsplit_once('@').map_or_else(
+            || authority.to_string(),
+            |(userinfo, host)| {
+                if scheme_lower == "ssh" && !userinfo.is_empty() && !userinfo.contains(':') {
+                    format!("{userinfo}@{host}")
+                } else {
+                    host.to_string()
+                }
+            },
+        );
+        Ok(sanitize_storage_markers_and_bound(&format!(
+            "{scheme}://{sanitized_authority}{path}"
+        )))
+    } else if let Some(scp) = parse_scp_git_url(trimmed) {
+        let prefix = scp.user.map_or_else(String::new, |user| format!("{user}@"));
+        Ok(sanitize_plugin_error(&format!(
+            "{prefix}{}:{}",
+            scp.host,
+            scp.path.split(['?', '#']).next().unwrap_or(scp.path)
+        )))
+    } else {
+        Ok(sanitize_plugin_error(
+            trimmed.split(['?', '#']).next().unwrap_or(trimmed),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScpGitUrl<'a> {
+    user: Option<&'a str>,
+    host: &'a str,
+    path: &'a str,
+}
+
+fn parse_scp_git_url(value: &str) -> Option<ScpGitUrl<'_>> {
+    if value.contains("://") {
+        return None;
+    }
+    let first_separator = value
+        .find('@')
+        .and_then(|at| value[at + 1..].find(':').map(|colon| at + 1 + colon))
+        .or_else(|| value.find(':'))?;
+    let before_colon = &value[..first_separator];
+    let path = &value[first_separator + 1..];
+    if before_colon.is_empty()
+        || path.is_empty()
+        || before_colon.contains('/')
+        || before_colon.contains('\\')
+    {
+        return None;
+    }
+    let (user, host) = before_colon
+        .rsplit_once('@')
+        .map_or((None, before_colon), |(user, host)| (Some(user), host));
+    Some(ScpGitUrl { user, host, path })
+}
+
+fn valid_git_url_user(user: &str) -> bool {
+    !user.is_empty()
+        && !contains_control_character(user)
+        && !user.contains(':')
+        && !contains_credential_marker(user)
+}
+
+fn contains_credential_marker(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    [
+        "token=",
+        "access_token=",
+        "refresh_token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn sanitize_storage_markers_and_bound(value: &str) -> String {
+    let mut redacted = value.to_string();
+    for marker in [
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Bearer ",
+        "token=",
+        "access_token=",
+        "refresh_token=",
+        "api_key=",
+        "apikey=",
+        "key=",
+        "secret=",
+        "password=",
+    ] {
+        redacted = redact_after_marker(&redacted, marker);
+    }
+    truncate_plugin_error(&redacted)
+}
+
+fn read_registry_at_path(path: &Path) -> Result<InstalledPluginRegistry, PluginError> {
+    match fs::read_to_string(path) {
+        Ok(contents) if contents.trim().is_empty() => Ok(InstalledPluginRegistry::default()),
+        Ok(contents) => Ok(serde_json::from_str::<InstalledPluginRegistry>(&contents)?),
+        Err(error) => Err(PluginError::Io(error)),
+    }
+}
+
+fn migrate_registry_source_metadata_under_lock(
+    path: &Path,
+    mut sanitized: InstalledPluginRegistry,
+) -> Result<InstalledPluginRegistry, PluginError> {
+    if let Err(error) = store_registry_at_path(path, &sanitized) {
+        push_manifest_warning(
+            &mut sanitized.migration_warnings,
+            format!(
+                "plugin registry source metadata migration failed for `{}`: {}",
+                path.display(),
+                sanitize_plugin_error(&error.to_string())
+            ),
+        );
+    }
+    Ok(sanitized)
+}
+
+fn store_registry_at_path(
+    path: &Path,
+    registry: &InstalledPluginRegistry,
+) -> Result<(), PluginError> {
+    maybe_fail_registry_store_for_test()?;
+    let Some(parent) = path.parent() else {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin registry path `{}` has no parent directory",
+            path.display()
+        )));
+    };
+    fs::create_dir_all(parent)?;
+    let payload = serde_json::to_vec_pretty(registry)?;
+    let mut output = atomic_write_file::AtomicWriteFile::open(path)?;
+    output.as_file_mut().write_all(&payload)?;
+    output.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+static FAIL_REGISTRY_STORE_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_fail_registry_store_for_test(value: bool) {
+    FAIL_REGISTRY_STORE_FOR_TEST.store(value, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn maybe_fail_registry_store_for_test() -> Result<(), PluginError> {
+    if FAIL_REGISTRY_STORE_FOR_TEST.load(Ordering::SeqCst) {
+        Err(PluginError::CommandFailed(
+            "injected plugin registry store failure token=[redacted]".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_fail_registry_store_for_test() -> Result<(), PluginError> {
+    Ok(())
 }
 
 fn unix_time_ms() -> u128 {
@@ -5139,17 +7044,294 @@ fn unix_time_ms() -> u128 {
 }
 
 fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PluginError> {
-    fs::create_dir_all(destination)?;
+    audit_plugin_tree(source)?;
+    let source_metadata = fs::symlink_metadata(source)?;
+    if destination.exists() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install target `{}` already exists",
+            destination.display()
+        )));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(destination)?;
+    let canonical_source_root = source.canonicalize()?;
+    copy_dir_all_inner(source, &canonical_source_root, destination)?;
+    fs::set_permissions(destination, source_metadata.permissions())?;
+    audit_plugin_tree(destination)?;
+    Ok(())
+}
+
+fn copy_dir_all_inner(
+    source: &Path,
+    canonical_source_root: &Path,
+    destination: &Path,
+) -> Result<(), PluginError> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        let source_path = entry.path();
+        let metadata = fs::symlink_metadata(&source_path)?;
+        validate_plugin_entry_metadata(&source_path, &metadata)?;
+        ensure_source_path_within_root(canonical_source_root, &source_path)?;
         let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
+        if metadata.is_dir() {
+            fs::create_dir(&target)?;
+            copy_dir_all_inner(&source_path, canonical_source_root, &target)?;
+            fs::set_permissions(&target, metadata.permissions())?;
+        } else if metadata.is_file() {
+            copy_file_atomic(&source_path, canonical_source_root, &target, &metadata)?;
         } else {
-            fs::copy(entry.path(), target)?;
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden special file `{}`",
+                source_path.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn audit_plugin_tree(root: &Path) -> Result<(), PluginError> {
+    let metadata = fs::symlink_metadata(root)?;
+    validate_plugin_entry_metadata(root, &metadata)?;
+    if !metadata.is_dir() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin tree root `{}` must be a directory",
+            root.display()
+        )));
+    }
+    audit_plugin_tree_inner(root)
+}
+
+fn audit_plugin_tree_inner(root: &Path) -> Result<(), PluginError> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        validate_plugin_entry_metadata(&path, &metadata)?;
+        if metadata.is_dir() {
+            audit_plugin_tree_inner(&path)?;
+        } else if !metadata.is_file() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden special file `{}`",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_entry_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), PluginError> {
+    if metadata.file_type().is_symlink() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin tree contains forbidden symlink `{}`",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.is_file() && metadata.nlink() > 1 {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden hardlink `{}`",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin tree contains forbidden reparse point `{}`",
+                path.display()
+            )));
+        }
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin tree contains forbidden special file `{}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginFileSnapshot {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    nlink: u64,
+}
+
+impl PluginFileSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            #[cfg(unix)]
+            dev: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.dev()
+            },
+            #[cfg(unix)]
+            ino: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.ino()
+            },
+            #[cfg(unix)]
+            nlink: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.nlink()
+            },
+        }
+    }
+
+    fn ensure_same(&self, path: &Path, metadata: &fs::Metadata) -> Result<(), PluginError> {
+        let current = Self::from_metadata(metadata);
+        if &current != self {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin source file `{}` changed during install copy",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn ensure_source_path_within_root(
+    canonical_source_root: &Path,
+    path: &Path,
+) -> Result<PathBuf, PluginError> {
+    let canonical_path = path.canonicalize()?;
+    if !canonical_path.starts_with(canonical_source_root) {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin source path `{}` escaped the source root",
+            path.display()
+        )));
+    }
+    Ok(canonical_path)
+}
+
+fn copy_file_atomic(
+    source_path: &Path,
+    canonical_source_root: &Path,
+    target: &Path,
+    before_metadata: &fs::Metadata,
+) -> Result<(), PluginError> {
+    validate_plugin_entry_metadata(source_path, before_metadata)?;
+    ensure_source_path_within_root(canonical_source_root, source_path)?;
+    if target.exists() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install target `{}` already exists",
+            target.display()
+        )));
+    }
+
+    let before = PluginFileSnapshot::from_metadata(before_metadata);
+    let mut input = fs::File::open(source_path)?;
+    let opened_metadata = input.metadata()?;
+    validate_plugin_entry_metadata(source_path, &opened_metadata)?;
+    before.ensure_same(source_path, &opened_metadata)?;
+
+    static COPY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_target = target.with_file_name(format!(
+        ".{}.tmp-{}-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin-file"),
+        std::process::id(),
+        COPY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_target)?;
+    let cleanup = TempPathCleanupGuard::new(temp_target.clone());
+    let copy_result = (|| -> Result<(), PluginError> {
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        fs::set_permissions(&temp_target, before_metadata.permissions())?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        return Err(error);
+    }
+
+    let after_metadata = fs::symlink_metadata(source_path)?;
+    validate_plugin_entry_metadata(source_path, &after_metadata)?;
+    before.ensure_same(source_path, &after_metadata)?;
+
+    promote_temp_file_no_replace(cleanup, target)
+}
+
+struct TempPathCleanupGuard {
+    path: PathBuf,
+    active: bool,
+}
+
+impl TempPathCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, active: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TempPathCleanupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn promote_temp_file_no_replace(
+    cleanup: TempPathCleanupGuard,
+    target: &Path,
+) -> Result<(), PluginError> {
+    if target.exists() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install target `{}` already exists",
+            target.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        fs::hard_link(cleanup.path(), target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                PluginError::InvalidManifest(format!(
+                    "plugin install target `{}` already exists",
+                    target.display()
+                ))
+            } else {
+                PluginError::Io(error)
+            }
+        })?;
+        fs::remove_file(cleanup.path())?;
+        cleanup.disarm();
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::rename(cleanup.path(), target).map_err(PluginError::Io)?;
+        cleanup.disarm();
+        Ok(())
+    }
 }
 
 fn prune_archived_versions(versions: &mut Vec<InstalledPluginVersionRecord>, keep_versions: usize) {
@@ -5198,6 +7380,103 @@ fn ensure_object<'a>(root: &'a mut Map<String, Value>, key: &str) -> &'a mut Map
     root.get_mut(key)
         .and_then(Value::as_object_mut)
         .expect("object should exist")
+}
+
+struct PluginFileLock {
+    file: fs::File,
+}
+
+impl Drop for PluginFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+struct PluginMutationLocks {
+    _registry: PluginFileLock,
+    _install: Option<PluginFileLock>,
+}
+
+fn registry_lock_path(registry_path: &Path) -> PathBuf {
+    let parent = registry_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = registry_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(REGISTRY_FILE_NAME);
+    parent.join(format!(".{file_name}.lock"))
+}
+
+fn install_tree_lock_path(install_root: &Path) -> PathBuf {
+    install_root.join(".plugin.lock")
+}
+
+fn same_lock_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let normalize = |path: &Path| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| {
+                path.file_name()
+                    .map_or(parent.clone(), |file_name| parent.join(file_name))
+            })
+    };
+    matches!((normalize(left), normalize(right)), (Some(left), Some(right)) if left == right)
+}
+
+fn acquire_plugin_file_lock_at(
+    path: &Path,
+    label: &str,
+    timeout: Duration,
+) -> Result<PluginFileLock, PluginError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(PluginFileLock { file }),
+            Err(error) if is_file_lock_contended(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(PluginError::CommandFailed(format!(
+                        "timed out after {} ms waiting for {label} lock `{}`",
+                        timeout.as_millis(),
+                        path.display()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(PLUGIN_LOCK_POLL_MS));
+            }
+            Err(error) => {
+                return Err(PluginError::CommandFailed(format!(
+                    "failed to acquire {label} lock `{}`: {}",
+                    path.display(),
+                    sanitize_plugin_error(&error.to_string())
+                )));
+            }
+        }
+    }
+}
+
+fn is_file_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION are how Windows
+        // reports a contended fs2 lock.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Environment variable lock for test isolation.
@@ -5292,17 +7571,9 @@ mod tests {
 
     fn write_external_plugin(root: &Path, name: &str, version: &str) {
         write_file(
-            root.join("hooks").join("pre.sh").as_path(),
-            "#!/bin/sh\nprintf 'pre'\n",
-        );
-        write_file(
-            root.join("hooks").join("post.sh").as_path(),
-            "#!/bin/sh\nprintf 'post'\n",
-        );
-        write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"test plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"test plugin\"\n}}"
             )
             .as_str(),
         );
@@ -5714,6 +7985,1099 @@ mod tests {
     }
 
     #[test]
+    fn load_plugin_from_directory_accepts_versioned_structured_manifest() {
+        let _guard = env_guard();
+        let root = temp_dir("manifest-structured");
+        write_file(
+            root.join("bin").join("entry.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(root.join("data").join("readme.txt").as_path(), "ok\n");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "id": "structured-demo",
+  "name": "structured-demo",
+  "version": "1.2.3",
+  "description": "Structured manifest",
+  "signature": "test-signature",
+  "entrypoint": { "command": "./bin/entry.sh", "args": ["--json"] },
+  "permissions": [
+    { "type": "filesystem", "paths": ["./data/readme.txt"], "mode": "read" },
+    { "type": "network", "origins": ["https://example.com"] },
+    { "type": "process", "commands": ["./bin/entry.sh"] }
+  ],
+  "capabilities": { "tools": false, "resources": true, "prompts": false },
+  "resources": [
+    { "uri": "file://structured/readme", "name": "readme" }
+  ]
+}"#,
+        );
+
+        let manifest = load_plugin_from_directory(&root).expect("structured manifest should load");
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.id.as_deref(), Some("structured-demo"));
+        assert_eq!(manifest.permission_declarations.len(), 3);
+        assert!(manifest.permissions.contains(&PluginPermission::Read));
+        assert!(manifest.permissions.contains(&PluginPermission::Execute));
+        assert!(manifest.capabilities.resources);
+        assert!(!manifest.capabilities.tools);
+        assert!(!manifest.manifest_metadata.legacy);
+        assert!(manifest.manifest_metadata.hash.starts_with("fnv1a64:"));
+        assert_eq!(
+            manifest.manifest_metadata.signature.as_deref(),
+            Some("test-signature")
+        );
+        assert!(!manifest.manifest_metadata.signature_verified);
+        assert!(manifest
+            .manifest_metadata
+            .signature_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("not been verified")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_summary_exposes_permission_declarations_and_enforcement_status() {
+        let _guard = env_guard();
+        let structured_root = temp_dir("summary-structured-permissions");
+        write_file(
+            structured_root.join("data").join("readme.txt").as_path(),
+            "ok\n",
+        );
+        write_file(
+            structured_root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "name": "summary-structured",
+  "version": "1.0.0",
+  "description": "Structured permission summary",
+  "permissions": [
+    { "type": "filesystem", "paths": ["./data/readme.txt"], "mode": "read" },
+    { "type": "network", "origins": ["https://example.com"] }
+  ]
+}"#,
+        );
+        let structured = load_plugin_definition(
+            &structured_root,
+            PluginKind::External,
+            "structured-source".to_string(),
+            EXTERNAL_MARKETPLACE,
+        )
+        .expect("structured plugin should load");
+        let structured_summary = RegisteredPlugin::new(structured, true).summary();
+        assert_eq!(structured_summary.permission_declarations.len(), 2);
+        assert_eq!(structured_summary.permission_declaration_statuses.len(), 2);
+        assert!(structured_summary
+            .permission_declaration_statuses
+            .iter()
+            .all(|status| !status.enforced && status.declaration_only));
+
+        let legacy_root = temp_dir("summary-legacy-permissions");
+        write_file(
+            legacy_root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "summary-legacy",
+  "version": "1.0.0",
+  "description": "Legacy permission summary",
+  "permissions": ["read"]
+}"#,
+        );
+        let legacy = load_plugin_definition(
+            &legacy_root,
+            PluginKind::External,
+            "legacy-source".to_string(),
+            EXTERNAL_MARKETPLACE,
+        )
+        .expect("legacy plugin should load");
+        let legacy_summary = RegisteredPlugin::new(legacy, true).summary();
+        assert_eq!(legacy_summary.permission_declarations.len(), 1);
+        assert!(legacy_summary.permission_declaration_statuses[0].enforced);
+        assert!(!legacy_summary.permission_declaration_statuses[0].declaration_only);
+        assert_eq!(
+            legacy_summary.permission_declaration_statuses[0]
+                .enforced_permission
+                .as_ref()
+                .map(|permission| permission.as_str()),
+            Some("read")
+        );
+
+        let _ = fs::remove_dir_all(structured_root);
+        let _ = fs::remove_dir_all(legacy_root);
+    }
+
+    #[test]
+    fn legacy_manifest_gets_schema_v1_warning_and_normalized_capabilities() {
+        let _guard = env_guard();
+        let root = temp_dir("manifest-legacy-normalized");
+        write_file(
+            root.join("tools").join("inspect.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "legacy-normalized",
+  "version": "1.0.0",
+  "description": "Legacy manifest",
+  "permissions": ["read"],
+  "tools": [
+    {
+      "name": "inspect",
+      "description": "Inspect",
+      "inputSchema": { "type": "object" },
+      "command": "./tools/inspect.sh",
+      "requiredPermission": "read-only",
+      "displayHint": "legacy extension"
+    }
+  ],
+  "historicalExtension": true
+}"#,
+        );
+
+        let manifest = load_plugin_from_directory(&root).expect("legacy manifest should load");
+        assert_eq!(manifest.schema_version, 1);
+        assert!(manifest.manifest_metadata.legacy);
+        assert!(manifest.capabilities.tools);
+        assert!(manifest
+            .manifest_metadata
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("normalized to schemaVersion 1")));
+        assert!(manifest
+            .manifest_metadata
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("tools.[].displayHint")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_schema_and_unknown_field_policy_violations() {
+        for (label, manifest, expected) in [
+            (
+                "unknown-version",
+                r#"{"schemaVersion":2,"name":"schema-bad","version":"1.0.0","description":"bad"}"#,
+                "unsupported",
+            ),
+            (
+                "explicit-unknown",
+                r#"{"schemaVersion":1,"name":"schema-extra","version":"1.0.0","description":"bad","extra":true}"#,
+                "rejects unknown field `extra`",
+            ),
+            (
+                "explicit-nested-unknown",
+                r#"{
+  "schemaVersion": 1,
+  "name": "schema-nested-extra",
+  "version": "1.0.0",
+  "description": "bad",
+  "tools": [
+    {
+      "name": "inspect",
+      "description": "Inspect",
+      "inputSchema": { "type": "object" },
+      "command": "./tools/inspect.sh",
+      "requiredPermission": "read-only",
+      "displayHint": true
+    }
+  ]
+}"#,
+                "tools.[].displayHint",
+            ),
+            (
+                "legacy-sensitive",
+                r#"{"name":"legacy-sensitive","version":"1.0.0","description":"bad","secretToken":"value"}"#,
+                "security-sensitive",
+            ),
+            (
+                "legacy-nested-sensitive",
+                r#"{
+  "name": "legacy-nested-sensitive",
+  "version": "1.0.0",
+  "description": "bad",
+  "tools": [
+    {
+      "name": "inspect",
+      "description": "Inspect",
+      "inputSchema": { "type": "object" },
+      "command": "./tools/inspect.sh",
+      "requiredPermission": "read-only",
+      "permissionBypass": true
+    }
+  ]
+}"#,
+                "security-sensitive",
+            ),
+        ] {
+            let _guard = env_guard();
+            let root = temp_dir(&format!("manifest-schema-{label}"));
+            write_file(root.join(MANIFEST_FILE_NAME).as_path(), manifest);
+
+            let error = load_plugin_from_directory(&root).expect_err("manifest should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "{label} did not contain {expected}: {error}"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_name_version_and_capability_mismatch() {
+        let cases = [
+            (
+                "reserved-name",
+                r#"{"schemaVersion":1,"name":"admin","version":"1.0.0","description":"bad"}"#,
+                "reserved",
+            ),
+            (
+                "bad-version",
+                r#"{"schemaVersion":1,"name":"bad-version","version":"latest","description":"bad"}"#,
+                "semver",
+            ),
+            (
+                "id-mismatch",
+                r#"{"schemaVersion":1,"id":"other","name":"id-mismatch","version":"1.0.0","description":"bad"}"#,
+                "must match name",
+            ),
+            (
+                "capability-false",
+                r#"{
+  "schemaVersion": 1,
+  "name": "capability-false",
+  "version": "1.0.0",
+  "description": "bad",
+  "permissions": ["read"],
+  "capabilities": { "tools": false, "resources": false, "prompts": false },
+  "tools": [
+    {
+      "name": "inspect",
+      "description": "Inspect",
+      "inputSchema": { "type": "object" },
+      "command": "./tools/inspect.sh",
+      "requiredPermission": "read-only"
+    }
+  ]
+}"#,
+                "capabilities.tools",
+            ),
+        ];
+
+        for (label, manifest, expected) in cases {
+            let _guard = env_guard();
+            let root = temp_dir(&format!("manifest-boundary-{label}"));
+            write_file(
+                root.join("tools").join("inspect.sh").as_path(),
+                "#!/bin/sh\ncat\n",
+            );
+            write_file(root.join(MANIFEST_FILE_NAME).as_path(), manifest);
+
+            let error = load_plugin_from_directory(&root).expect_err("manifest should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "{label} did not contain {expected}: {error}"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn external_plugin_hooks_are_rejected_during_registration() {
+        let _guard = env_guard();
+        let config_home = temp_dir("external-hooks-home");
+        let root = temp_dir("external-hooks");
+        write_file(
+            root.join("hooks").join("pre.sh").as_path(),
+            "#!/bin/sh\ntrue\n",
+        );
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "external-hooks",
+  "version": "1.0.0",
+  "description": "External hooks",
+  "hooks": { "PreToolUse": ["./hooks/pre.sh"] }
+}"#,
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let validate_error = manager
+            .validate_plugin_source(root.to_str().expect("utf8 path"))
+            .expect_err("external hook source should fail validation");
+        assert!(validate_error.to_string().contains("external plugin hooks"));
+        let install_error = manager
+            .install(root.to_str().expect("utf8 path"))
+            .expect_err("external hook install should fail");
+        assert!(install_error.to_string().contains("external plugin hooks"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_paths_must_stay_inside_plugin_root() {
+        let _guard = env_guard();
+        let parent = temp_dir("path-traversal-parent");
+        let root = parent.join("plugin");
+        write_file(parent.join("outside.sh").as_path(), "#!/bin/sh\ntrue\n");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "name": "path-traversal",
+  "version": "1.0.0",
+  "description": "Traversal",
+  "permissions": ["read"],
+  "tools": [
+    {
+      "name": "inspect",
+      "description": "Inspect",
+      "inputSchema": { "type": "object" },
+      "command": "../outside.sh",
+      "requiredPermission": "read-only"
+    }
+  ]
+}"#,
+        );
+
+        let error = load_plugin_from_directory(&root).expect_err("traversal should fail");
+        assert!(error.to_string().contains("parent-directory traversal"));
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_registration() {
+        let _guard = env_guard();
+        let root = temp_dir("manifest-oversize");
+        let oversized = "x".repeat((PLUGIN_MANIFEST_MAX_BYTES as usize) + 1);
+        write_file(root.join(MANIFEST_FILE_NAME).as_path(), &oversized);
+
+        let error = load_plugin_from_directory(&root).expect_err("oversize should fail");
+        assert!(error.to_string().contains("byte limit"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_plugin_names_fail_registry_closed() {
+        let _guard = env_guard();
+        let config_home = temp_dir("duplicate-name-home");
+        let source_root = temp_dir("duplicate-name-source");
+        write_external_plugin(&source_root, "example-builtin", "1.0.0");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install should succeed");
+        let error = manager
+            .plugin_registry()
+            .expect_err("duplicate name should fail registry");
+        assert!(error.to_string().contains("plugin name `example-builtin`"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn plugin_error_sanitizer_redacts_secrets_and_bounds_output() {
+        let secret = "SECRET-value-that-must-not-leak";
+        let input = format!(
+            "failed {}TOKEN={secret} https://user:{secret}@example.com/path?Token={secret} Authorization: Bearer {secret} stderr Secret={secret} API_KEY={secret} {}",
+            "\u{0130}",
+            "x".repeat(3000)
+        );
+        let sanitized = sanitize_plugin_error(&input);
+
+        assert!(!sanitized.contains(secret));
+        assert!(!sanitized.contains("TOKEN=SECRET"));
+        assert!(!sanitized.contains("Secret=SECRET"));
+        assert!(!sanitized.contains("API_KEY=SECRET"));
+        assert!(sanitized.contains("[redacted]"));
+        assert!(
+            sanitized.chars().count()
+                <= PLUGIN_ERROR_SURFACE_MAX_CHARS + "...[truncated]".chars().count()
+        );
+    }
+
+    #[test]
+    fn plugin_error_sanitizer_redacts_scp_style_passwords() {
+        let secret = "SECRET-token-value";
+        let sanitized = sanitize_plugin_error(&format!(
+            "git failed for user:{secret}@example.com:team/repo.git TOKEN={secret}"
+        ));
+
+        assert!(!sanitized.contains(secret));
+        assert!(sanitized.contains("[redacted]@example.com:team/repo.git"));
+        assert!(sanitized.contains("TOKEN=[redacted]"));
+    }
+
+    #[test]
+    fn describe_install_source_redacts_ascii_case_markers() {
+        let secret = "SECRET-source-value";
+        let source = PluginInstallSource::GitUrl {
+            url: format!(
+                "ssh://git@example.com/team/TOKEN={secret}/Secret={secret}/repo.git?API_KEY={secret}"
+            ),
+        };
+        let rendered = describe_install_source(&source);
+
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("TOKEN=SECRET"));
+        assert!(!rendered.contains("Secret=SECRET"));
+        assert!(!rendered.contains("API_KEY=SECRET"));
+        assert!(rendered.contains("TOKEN=[redacted]"));
+        assert!(rendered.contains("Secret=[redacted]"));
+    }
+
+    #[test]
+    fn plugin_child_pipe_reader_caps_output_and_reports_truncation() {
+        let payload = vec![b'x'; PLUGIN_CHILD_OUTPUT_LIMIT + 17];
+        let (output, truncated) =
+            read_pipe_capped(std::io::Cursor::new(payload), PLUGIN_CHILD_OUTPUT_LIMIT)
+                .expect("capped pipe read should succeed");
+
+        assert_eq!(output.len(), PLUGIN_CHILD_OUTPUT_LIMIT);
+        assert!(truncated);
+        assert_eq!(truncated_suffix(truncated), " [truncated]");
+    }
+
+    #[test]
+    fn git_install_source_rejects_embedded_credentials_without_leaking_values() {
+        let secret = "secret-token-value";
+        for source in [
+            format!("https://user:{secret}@example.com/repo.git"),
+            format!("https://example.com/repo.git?token={secret}"),
+            format!("https://example.com/repo.git#{secret}"),
+            format!("ssh://user:{secret}@example.com/repo.git"),
+            format!("user:{secret}@example.com:team/repo.git"),
+            format!("token={secret}@example.com:team/repo.git"),
+        ] {
+            let error = parse_install_source(&source).expect_err("credential URL should fail");
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(secret),
+                "error leaked credential for {source}: {rendered}"
+            );
+            assert!(
+                rendered.contains("credential")
+                    || rendered.contains("userinfo")
+                    || rendered.contains("query")
+                    || rendered.contains("fragment"),
+                "error should explain credential policy: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_install_source_allows_passwordless_ssh_and_scp_forms() {
+        let ssh = parse_install_source("ssh://git@example.com/team/repo.git")
+            .expect("passwordless ssh URL should parse");
+        assert_eq!(
+            ssh,
+            PluginInstallSource::GitUrl {
+                url: "ssh://git@example.com/team/repo.git".to_string()
+            }
+        );
+
+        let scp =
+            parse_install_source("git@example.com:team/repo.git").expect("scp form should parse");
+        assert_eq!(
+            scp,
+            PluginInstallSource::GitUrl {
+                url: "git@example.com:team/repo.git".to_string()
+            }
+        );
+
+        let scp_without_user =
+            parse_install_source("example.com:team/repo.git").expect("scp host form should parse");
+        assert_eq!(
+            scp_without_user,
+            PluginInstallSource::GitUrl {
+                url: "example.com:team/repo.git".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn git_install_registry_and_summary_store_only_sanitized_source_metadata() {
+        let _guard = env_guard();
+        let config_home = temp_dir("git-install-clean-home");
+        let parent = temp_dir("git-install-clean-parent");
+        let repo = parent.join("clean.git");
+        write_external_plugin(&repo, "git-clean", "1.0.0");
+
+        if !run_git(&repo, &["init"])
+            || !run_git(&repo, &["add", "."])
+            || !run_git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Claw Test",
+                    "-c",
+                    "user.email=claw-test@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+            )
+        {
+            let _ = fs::remove_dir_all(config_home);
+            let _ = fs::remove_dir_all(parent);
+            return;
+        }
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(repo.to_str().expect("git fixture path should be utf8"))
+            .expect("local git install should succeed");
+
+        let registry_text =
+            fs::read_to_string(manager.registry_path()).expect("registry should exist");
+        for forbidden in ["user:", "password=", "token=", "access_token=", "secret="] {
+            assert!(
+                !registry_text.contains(forbidden),
+                "registry leaked forbidden marker {forbidden}: {registry_text}"
+            );
+        }
+        let summaries = manager
+            .list_installed_plugins()
+            .expect("installed plugin summaries should load");
+        let summary = summaries
+            .iter()
+            .find(|plugin| plugin.metadata.id == "git-clean@external")
+            .expect("git plugin summary should be present");
+        for forbidden in ["user:", "password=", "token=", "access_token=", "secret="] {
+            assert!(
+                !summary.metadata.source.contains(forbidden),
+                "summary source leaked forbidden marker {forbidden}: {}",
+                summary.metadata.source
+            );
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn load_registry_migrates_historical_git_source_secrets_on_disk() {
+        let _guard = env_guard();
+        let config_home = temp_dir("registry-source-migration-home");
+        let install_path = config_home.join("plugins").join("installed").join("legacy");
+        let scp_install_path = config_home
+            .join("plugins")
+            .join("installed")
+            .join("legacy-scp");
+        let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let secret = "SECRET-token-value";
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "legacy@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "legacy@external".to_string(),
+                name: "legacy".to_string(),
+                version: "1.0.0".to_string(),
+                description: "legacy registry".to_string(),
+                install_path,
+                source: PluginInstallSource::GitUrl {
+                    url: format!(
+                        "https://user:{secret}@example.com/team/TOKEN={secret}/Secret={secret}/repo.git?API_KEY={secret}#frag"
+                    ),
+                },
+                version_policy: PluginVersionPolicy::default(),
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        registry.plugins.insert(
+            "legacy-scp@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "legacy-scp@external".to_string(),
+                name: "legacy-scp".to_string(),
+                version: "1.0.0".to_string(),
+                description: "legacy scp registry".to_string(),
+                install_path: scp_install_path,
+                source: PluginInstallSource::GitUrl {
+                    url: format!("user:{secret}@example.com:team/Secret={secret}/repo.git"),
+                },
+                version_policy: PluginVersionPolicy::default(),
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        if let Some(parent) = manager.registry_path().parent() {
+            fs::create_dir_all(parent).expect("registry parent");
+        }
+        fs::write(
+            manager.registry_path(),
+            serde_json::to_string_pretty(&registry).expect("registry json"),
+        )
+        .expect("write raw registry");
+
+        let loaded = manager.load_registry().expect("registry should migrate");
+        let PluginInstallSource::GitUrl { url } = &loaded.plugins["legacy@external"].source else {
+            panic!("source should remain git");
+        };
+        assert_eq!(
+            url,
+            "https://example.com/team/TOKEN=[redacted]/Secret=[redacted]/repo.git"
+        );
+        let PluginInstallSource::GitUrl { url: scp_url } =
+            &loaded.plugins["legacy-scp@external"].source
+        else {
+            panic!("scp source should remain git");
+        };
+        assert_eq!(
+            scp_url,
+            "[redacted]@example.com:team/Secret=[redacted]/repo.git"
+        );
+
+        let disk = fs::read_to_string(manager.registry_path()).expect("registry disk");
+        assert!(!disk.contains(secret));
+        assert!(!disk.contains("TOKEN=SECRET"));
+        assert!(!disk.contains("Secret=SECRET"));
+        assert!(!disk.contains("API_KEY=SECRET"));
+        assert!(!disk.contains("user:"));
+        assert!(
+            disk.contains("https://example.com/team/TOKEN=[redacted]/Secret=[redacted]/repo.git")
+        );
+        assert!(disk.contains("[redacted]@example.com:team/Secret=[redacted]/repo.git"));
+
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn load_registry_migration_store_failure_keeps_readonly_list_degraded() {
+        let _guard = env_guard();
+        let config_home = temp_dir("registry-migration-fail-home");
+        let bundled_root = temp_dir("registry-migration-fail-bundled");
+        let install_path = config_home
+            .join("plugins")
+            .join("installed")
+            .join("legacy-list");
+        write_external_plugin(&install_path, "legacy-list", "1.0.0");
+        let manager_config = {
+            let mut config = PluginManagerConfig::new(&config_home);
+            config.bundled_root = Some(bundled_root.clone());
+            config
+        };
+        let manager = PluginManager::new(manager_config);
+        let secret = "SECRET-token-value";
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "legacy-list@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "legacy-list@external".to_string(),
+                name: "legacy-list".to_string(),
+                version: "1.0.0".to_string(),
+                description: "legacy list registry".to_string(),
+                install_path,
+                source: PluginInstallSource::GitUrl {
+                    url: format!(
+                        "https://user:{secret}@example.com/team/TOKEN={secret}/repo.git?Secret={secret}"
+                    ),
+                },
+                version_policy: PluginVersionPolicy::default(),
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        if let Some(parent) = manager.registry_path().parent() {
+            fs::create_dir_all(parent).expect("registry parent");
+        }
+        fs::write(
+            manager.registry_path(),
+            serde_json::to_string_pretty(&registry).expect("registry json"),
+        )
+        .expect("write raw registry");
+
+        set_fail_registry_store_for_test(true);
+        let _reset = RegistryStoreFailureReset;
+        let summaries = manager
+            .list_installed_plugins()
+            .expect("readonly list should not fail when migration write fails");
+        let summary = summaries
+            .iter()
+            .find(|plugin| plugin.metadata.id == "legacy-list@external")
+            .expect("legacy plugin should be listed");
+        assert!(!summary.metadata.source.contains(secret));
+        assert!(!summary.metadata.source.contains("TOKEN=SECRET"));
+        assert!(!summary.metadata.source.contains("Secret=SECRET"));
+        let degraded = summary
+            .degraded_reason
+            .as_deref()
+            .expect("migration warning should be surfaced");
+        assert!(degraded.contains("migration failed"));
+        assert!(!degraded.contains(secret));
+
+        let store_error = manager
+            .store_registry(&InstalledPluginRegistry::default())
+            .expect_err("explicit store should still fail closed");
+        assert!(store_error
+            .to_string()
+            .contains("injected plugin registry store failure"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    struct RegistryStoreFailureReset;
+
+    impl Drop for RegistryStoreFailureReset {
+        fn drop(&mut self) {
+            set_fail_registry_store_for_test(false);
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlink_entries_in_plugin_tree() {
+        use std::os::unix::fs as unix_fs;
+
+        let _guard = env_guard();
+        let config_home = temp_dir("symlink-install-home");
+        let source_root = temp_dir("symlink-install-source");
+        write_external_plugin(&source_root, "symlink-plugin", "1.0.0");
+        write_file(source_root.join("target.txt").as_path(), "target\n");
+        unix_fs::symlink("target.txt", source_root.join("linked.txt")).expect("create symlink");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let error = manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect_err("symlink source should fail");
+        assert!(error.to_string().contains("forbidden symlink"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn copy_file_atomic_refuses_existing_target_without_overwrite() {
+        let source_root = temp_dir("copy-no-overwrite-source");
+        let destination_root = temp_dir("copy-no-overwrite-dest");
+        write_file(source_root.join("file.txt").as_path(), "new\n");
+        fs::create_dir_all(&destination_root).expect("destination root");
+        let target = destination_root.join("file.txt");
+        write_file(target.as_path(), "existing\n");
+
+        let metadata = fs::symlink_metadata(source_root.join("file.txt")).expect("metadata");
+        let canonical_source = source_root.canonicalize().expect("canonical source");
+        let error = copy_file_atomic(
+            &source_root.join("file.txt"),
+            &canonical_source,
+            &target,
+            &metadata,
+        )
+        .expect_err("existing target should fail");
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(target).expect("target remains readable"),
+            "existing\n"
+        );
+
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(destination_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_all_preserves_unix_executable_and_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_root = temp_dir("copy-mode-source");
+        let destination_root = temp_dir("copy-mode-dest");
+        let source_file = source_root.join("bin").join("private-tool");
+        write_file(source_file.as_path(), "#!/bin/sh\nexit 0\n");
+        let mut root_permissions = fs::metadata(&source_root)
+            .expect("root metadata")
+            .permissions();
+        root_permissions.set_mode(0o700);
+        fs::set_permissions(&source_root, root_permissions).expect("set root mode");
+        let mut bin_permissions = fs::metadata(source_root.join("bin"))
+            .expect("bin metadata")
+            .permissions();
+        bin_permissions.set_mode(0o750);
+        fs::set_permissions(source_root.join("bin"), bin_permissions).expect("set bin mode");
+        let mut permissions = fs::metadata(&source_file).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&source_file, permissions).expect("set source mode");
+
+        copy_dir_all(&source_root, &destination_root).expect("copy should succeed");
+
+        let root_mode = fs::metadata(&destination_root)
+            .expect("copied root metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let bin_mode = fs::metadata(destination_root.join("bin"))
+            .expect("copied bin metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(destination_root.join("bin").join("private-tool"))
+            .expect("copied metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(bin_mode, 0o750);
+        assert_eq!(file_mode, 0o700);
+
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(destination_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_all_applies_readonly_directory_permissions_after_children() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_root = temp_dir("copy-readonly-source");
+        let destination_root = temp_dir("copy-readonly-dest");
+        let nested_dir = source_root.join("readonly");
+        write_file(nested_dir.join("data.txt").as_path(), "copied\n");
+
+        let mut nested_permissions = fs::metadata(&nested_dir)
+            .expect("nested metadata")
+            .permissions();
+        nested_permissions.set_mode(0o555);
+        fs::set_permissions(&nested_dir, nested_permissions).expect("set nested readonly mode");
+        let mut root_permissions = fs::metadata(&source_root)
+            .expect("root metadata")
+            .permissions();
+        root_permissions.set_mode(0o555);
+        fs::set_permissions(&source_root, root_permissions).expect("set root readonly mode");
+
+        copy_dir_all(&source_root, &destination_root).expect("copy should succeed");
+
+        assert_eq!(
+            fs::read_to_string(destination_root.join("readonly").join("data.txt"))
+                .expect("copied file"),
+            "copied\n"
+        );
+        let root_mode = fs::metadata(&destination_root)
+            .expect("copied root metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let nested_mode = fs::metadata(destination_root.join("readonly"))
+            .expect("copied nested metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(root_mode, 0o555);
+        assert_eq!(nested_mode, 0o555);
+
+        let mut cleanup_permissions = fs::metadata(&source_root)
+            .expect("source cleanup metadata")
+            .permissions();
+        cleanup_permissions.set_mode(0o755);
+        fs::set_permissions(&source_root, cleanup_permissions).expect("restore source root mode");
+        let mut cleanup_nested_permissions = fs::metadata(&nested_dir)
+            .expect("nested cleanup metadata")
+            .permissions();
+        cleanup_nested_permissions.set_mode(0o755);
+        fs::set_permissions(&nested_dir, cleanup_nested_permissions)
+            .expect("restore source nested mode");
+        let mut destination_permissions = fs::metadata(&destination_root)
+            .expect("destination cleanup metadata")
+            .permissions();
+        destination_permissions.set_mode(0o755);
+        fs::set_permissions(&destination_root, destination_permissions)
+            .expect("restore destination root mode");
+        let mut destination_nested_permissions = fs::metadata(destination_root.join("readonly"))
+            .expect("destination nested cleanup metadata")
+            .permissions();
+        destination_nested_permissions.set_mode(0o755);
+        fs::set_permissions(
+            destination_root.join("readonly"),
+            destination_nested_permissions,
+        )
+        .expect("restore destination nested mode");
+
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(destination_root);
+    }
+
+    #[test]
+    fn plugin_file_lock_times_out_and_reacquires_after_drop() {
+        let lock_root = temp_dir("plugin-lock-timeout");
+        let lock_path = lock_root.join(".plugin.lock");
+        let first =
+            acquire_plugin_file_lock_at(&lock_path, "test plugin", Duration::from_millis(250))
+                .expect("first lock should succeed");
+
+        let error =
+            match acquire_plugin_file_lock_at(&lock_path, "test plugin", Duration::from_millis(50))
+            {
+                Ok(lock) => {
+                    drop(lock);
+                    panic!("second handle should time out while lock is held");
+                }
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("timed out"));
+
+        drop(first);
+        let _second =
+            acquire_plugin_file_lock_at(&lock_path, "test plugin", Duration::from_millis(250))
+                .expect("lock should be reacquired after drop");
+
+        let _ = fs::remove_dir_all(lock_root);
+    }
+
+    #[test]
+    fn concurrent_registry_mutations_do_not_drop_records() {
+        let _guard = env_guard();
+        let config_home = temp_dir("concurrent-registry-home");
+        let alpha_source = temp_dir("concurrent-alpha-source");
+        let beta_source = temp_dir("concurrent-beta-source");
+        write_external_plugin(&alpha_source, "parallel-alpha", "1.0.0");
+        write_external_plugin(&beta_source, "parallel-beta", "1.0.0");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let alpha_config = config_home.clone();
+        let beta_config = config_home.clone();
+        let alpha_barrier = std::sync::Arc::clone(&barrier);
+        let beta_barrier = std::sync::Arc::clone(&barrier);
+        let alpha_source_for_thread = alpha_source.clone();
+        let beta_source_for_thread = beta_source.clone();
+
+        let alpha = std::thread::spawn(move || {
+            alpha_barrier.wait();
+            let mut manager = PluginManager::new(PluginManagerConfig::new(&alpha_config));
+            manager
+                .install(alpha_source_for_thread.to_str().expect("utf8 path"))
+                .expect("alpha install")
+        });
+        let beta = std::thread::spawn(move || {
+            beta_barrier.wait();
+            let mut manager = PluginManager::new(PluginManagerConfig::new(&beta_config));
+            manager
+                .install(beta_source_for_thread.to_str().expect("utf8 path"))
+                .expect("beta install")
+        });
+
+        alpha.join().expect("alpha thread");
+        beta.join().expect("beta thread");
+
+        let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let installed = manager
+            .list_installed_plugins()
+            .expect("installed plugins should list");
+        assert!(installed
+            .iter()
+            .any(|plugin| plugin.metadata.id == "parallel-alpha@external"));
+        assert!(installed
+            .iter()
+            .any(|plugin| plugin.metadata.id == "parallel-beta@external"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(alpha_source);
+        let _ = fs::remove_dir_all(beta_source);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_atomic_store_preserves_existing_file_when_open_fails() {
+        let _guard = env_guard();
+        let root = temp_dir("windows-registry-replace-fail");
+        let target = root.join(REGISTRY_FILE_NAME);
+        write_file(&target, "old\n");
+
+        set_fail_registry_store_for_test(true);
+        let error = store_registry_at_path(&target, &InstalledPluginRegistry::default())
+            .expect_err("injected store failure should fail before replacement");
+        set_fail_registry_store_for_test(false);
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(
+            fs::read_to_string(&target).expect("target remains readable"),
+            "old\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_atomic_store_replaces_existing_target() {
+        let _guard = env_guard();
+        set_fail_registry_store_for_test(false);
+        let root = temp_dir("windows-registry-replace-success");
+        let target = root.join(REGISTRY_FILE_NAME);
+        write_file(&target, "old\n");
+
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "windows-replace@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "windows-replace@external".to_string(),
+                name: "windows-replace".to_string(),
+                version: "1.0.0".to_string(),
+                description: "replace test".to_string(),
+                install_path: root.join("installed"),
+                source: PluginInstallSource::LocalPath {
+                    path: root.join("source"),
+                },
+                version_policy: PluginVersionPolicy::default(),
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+
+        store_registry_at_path(&target, &registry).expect("replace succeeds");
+        let stored = read_registry_at_path(&target).expect("registry should read");
+        assert!(stored.plugins.contains_key("windows-replace@external"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_hardlink_entries_in_plugin_tree() {
+        let _guard = env_guard();
+        let config_home = temp_dir("hardlink-install-home");
+        let source_root = temp_dir("hardlink-install-source");
+        write_external_plugin(&source_root, "hardlink-plugin", "1.0.0");
+        write_file(source_root.join("target.txt").as_path(), "target\n");
+        fs::hard_link(
+            source_root.join("target.txt"),
+            source_root.join("linked-hardlink.txt"),
+        )
+        .expect("create hardlink");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let error = manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect_err("hardlink source should fail");
+        assert!(error.to_string().contains("forbidden hardlink"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
     fn load_plugin_from_directory_rejects_invalid_tool_required_permission() {
         let root = temp_dir("manifest-invalid-tool-permission");
         write_file(
@@ -5830,8 +9194,7 @@ mod tests {
             .any(|plugin| plugin.metadata.id == "demo@external" && plugin.enabled));
 
         let hooks = manager.aggregated_hooks().expect("hooks should aggregate");
-        assert_eq!(hooks.pre_tool_use.len(), 1);
-        assert!(hooks.pre_tool_use[0].contains("pre.sh"));
+        assert!(hooks.is_empty());
 
         manager
             .disable("demo@external")

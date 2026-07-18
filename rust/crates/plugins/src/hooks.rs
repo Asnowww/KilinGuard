@@ -463,7 +463,7 @@ mod tests {
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"defaultEnabled\": true,\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
             ),
         )
         .expect("write plugin manifest");
@@ -473,8 +473,9 @@ mod tests {
     fn collects_and_runs_hooks_from_enabled_plugins() {
         // given
         let config_home = temp_dir("config");
-        let first_source_root = temp_dir("source-a");
-        let second_source_root = temp_dir("source-b");
+        let bundled_root = temp_dir("bundled-hooks");
+        let first_source_root = bundled_root.join("source-a");
+        let second_source_root = bundled_root.join("source-b");
         write_hook_plugin(
             &first_source_root,
             "first",
@@ -490,13 +491,9 @@ mod tests {
             "plugin failure two",
         );
 
-        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        manager
-            .install(first_source_root.to_str().expect("utf8 path"))
-            .expect("first plugin install should succeed");
-        manager
-            .install(second_source_root.to_str().expect("utf8 path"))
-            .expect("second plugin install should succeed");
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
         let registry = manager.plugin_registry().expect("registry should build");
 
         // when
@@ -526,8 +523,7 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(first_source_root);
-        let _ = fs::remove_dir_all(second_source_root);
+        let _ = fs::remove_dir_all(bundled_root);
     }
 
     #[test]

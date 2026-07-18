@@ -3214,7 +3214,10 @@ pub fn render_plugins_report_with_failures(
                 failure.kind,
                 failure.plugin_root.display()
             ));
-            lines.push(format!("      Error: {}", failure.error()));
+            lines.push(format!(
+                "      Error: {}",
+                plugins::sanitize_plugin_error(&failure.error().to_string())
+            ));
         }
     }
 
@@ -4717,8 +4720,9 @@ mod tests {
         DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
-        PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
-        PluginManagerConfig, PluginMetadata, PluginSummary,
+        PluginActualSurfaces, PluginCapabilities, PluginError, PluginKind, PluginLifecycle,
+        PluginLoadFailure, PluginManager, PluginManagerConfig, PluginManifestMetadata,
+        PluginMetadata, PluginSummary,
     };
     use runtime::{
         CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
@@ -5548,9 +5552,16 @@ mod tests {
                     source: "demo".to_string(),
                     default_enabled: false,
                     root: None,
+                    manifest: PluginManifestMetadata::default(),
                 },
                 enabled: true,
                 lifecycle: PluginLifecycle::default(),
+                permissions: Vec::new(),
+                permission_declarations: Vec::new(),
+                permission_declaration_statuses: Vec::new(),
+                capabilities: PluginCapabilities::default(),
+                actual_surfaces: PluginActualSurfaces::default(),
+                degraded_reason: None,
             },
             PluginSummary {
                 metadata: PluginMetadata {
@@ -5562,9 +5573,16 @@ mod tests {
                     source: "sample".to_string(),
                     default_enabled: false,
                     root: None,
+                    manifest: PluginManifestMetadata::default(),
                 },
                 enabled: false,
                 lifecycle: PluginLifecycle::default(),
+                permissions: Vec::new(),
+                permission_declarations: Vec::new(),
+                permission_declaration_statuses: Vec::new(),
+                capabilities: PluginCapabilities::default(),
+                actual_surfaces: PluginActualSurfaces::default(),
+                degraded_reason: None,
             },
         ]);
 
@@ -5578,6 +5596,7 @@ mod tests {
 
     #[test]
     fn renders_plugins_report_with_broken_plugin_warnings() {
+        let secret = "SECRET-render-value";
         let rendered = render_plugins_report_with_failures(
             &[PluginSummary {
                 metadata: PluginMetadata {
@@ -5589,15 +5608,24 @@ mod tests {
                     source: "demo".to_string(),
                     default_enabled: false,
                     root: None,
+                    manifest: PluginManifestMetadata::default(),
                 },
                 enabled: true,
                 lifecycle: PluginLifecycle::default(),
+                permissions: Vec::new(),
+                permission_declarations: Vec::new(),
+                permission_declaration_statuses: Vec::new(),
+                capabilities: PluginCapabilities::default(),
+                actual_surfaces: PluginActualSurfaces::default(),
+                degraded_reason: None,
             }],
             &[PluginLoadFailure::new(
                 PathBuf::from("/tmp/broken-plugin"),
                 PluginKind::External,
                 "broken".to_string(),
-                PluginError::InvalidManifest("hook path `hooks/pre.sh` does not exist".to_string()),
+                PluginError::InvalidManifest(format!(
+                    "hook path `hooks/pre.sh` does not exist TOKEN={secret} Secret={secret} API_KEY={secret}"
+                )),
             )],
         );
 
@@ -5605,6 +5633,10 @@ mod tests {
         assert!(rendered.contains("Failed to load external plugin"));
         assert!(rendered.contains("/tmp/broken-plugin"));
         assert!(rendered.contains("does not exist"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("TOKEN=SECRET"));
+        assert!(!rendered.contains("Secret=SECRET"));
+        assert!(!rendered.contains("API_KEY=SECRET"));
     }
 
     #[test]

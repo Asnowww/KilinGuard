@@ -508,7 +508,14 @@ fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
         "version": &plugin.metadata.version,
         "description": &plugin.metadata.description,
         "kind": plugin.metadata.kind.to_string(),
-        "source": &plugin.metadata.source,
+        "source": plugins::sanitize_plugin_error(&plugin.metadata.source),
+        "manifest": &plugin.metadata.manifest,
+        "permissions": plugin.permissions.iter().map(|permission| permission.as_str()).collect::<Vec<_>>(),
+        "permissionDeclarations": &plugin.permission_declarations,
+        "permissionDeclarationStatuses": &plugin.permission_declaration_statuses,
+        "capabilities": &plugin.capabilities,
+        "actual_surfaces": &plugin.actual_surfaces,
+        "degraded_reason": &plugin.degraded_reason,
         // #730: path parity with agents (#728) and skills (#729)
         "path": plugin.metadata.root.as_ref().map(|p| p.display().to_string()),
         "enabled": plugin.enabled,
@@ -531,9 +538,9 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
     json!({
         "plugin_root": failure.plugin_root.display().to_string(),
         "kind": failure.kind.to_string(),
-        "source": &failure.source,
+        "source": plugins::sanitize_plugin_error(&failure.source),
         "lifecycle_state": "load_failed",
-        "error": failure.error().to_string(),
+        "error": plugins::sanitize_plugin_error(&failure.error().to_string()),
     })
 }
 
@@ -12369,8 +12376,10 @@ mod tests {
         LogSummaryTimeRange,
     };
     use plugins::{
-        PluginManager, PluginManagerConfig, PluginMcpServerManifest, PluginTool,
-        PluginToolDefinition, PluginToolPermission,
+        PluginActualSurfaces, PluginCapabilities, PluginError, PluginKind, PluginLifecycle,
+        PluginLoadFailure, PluginManager, PluginManagerConfig, PluginManifestMetadata,
+        PluginMcpServerManifest, PluginMetadata, PluginSummary, PluginTool, PluginToolDefinition,
+        PluginToolPermission,
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
@@ -12920,10 +12929,15 @@ mod tests {
         } else {
             ""
         };
+        let execution_policy = if include_lifecycle {
+            ",\n  \"executionPolicy\": {\n    \"allowExternalSubprocess\": true,\n    \"reason\": \"test fixture\"\n  }"
+        } else {
+            ""
+        };
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime plugin fixture\"{hooks}{lifecycle}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime plugin fixture\"{execution_policy}{hooks}{lifecycle}\n}}"
             ),
         )
         .expect("write plugin manifest");
@@ -14074,6 +14088,69 @@ mod tests {
         assert!(payload.message.contains("Plugins"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_summary_json_redacts_source_markers() {
+        let secret = "SECRET-summary-value";
+        let plugin = PluginSummary {
+            metadata: PluginMetadata {
+                id: "summary@external".to_string(),
+                name: "summary".to_string(),
+                version: "1.0.0".to_string(),
+                description: "summary fixture".to_string(),
+                kind: PluginKind::External,
+                source: format!(
+                    "https://example.invalid/team/TOKEN={secret}/repo.git?Secret={secret}&API_KEY={secret}"
+                ),
+                default_enabled: false,
+                root: None,
+                manifest: PluginManifestMetadata::default(),
+            },
+            enabled: true,
+            lifecycle: PluginLifecycle::default(),
+            permissions: Vec::new(),
+            permission_declarations: Vec::new(),
+            permission_declaration_statuses: Vec::new(),
+            capabilities: PluginCapabilities::default(),
+            actual_surfaces: PluginActualSurfaces::default(),
+            degraded_reason: None,
+        };
+
+        let rendered = super::plugin_summary_json(&plugin).to_string();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("TOKEN=SECRET"));
+        assert!(!rendered.contains("Secret=SECRET"));
+        assert!(!rendered.contains("API_KEY=SECRET"));
+        assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn plugin_load_failure_json_redacts_and_bounds_registration_errors() {
+        let secret = "SECRET-value-that-must-not-leak";
+        let failure = PluginLoadFailure::new(
+            PathBuf::from("/tmp/broken-plugin"),
+            PluginKind::External,
+            format!(
+                "https://user:{secret}@example.invalid/plugin.git?TOKEN={secret}&Secret={secret}"
+            ),
+            PluginError::InvalidManifest(format!(
+                "Authorization: Bearer {secret} stderr API_KEY={secret} Secret={secret} {}",
+                "x".repeat(3000)
+            )),
+        );
+
+        let rendered = super::plugin_load_failure_json(&failure).to_string();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("TOKEN=SECRET"));
+        assert!(!rendered.contains("Secret=SECRET"));
+        assert!(!rendered.contains("API_KEY=SECRET"));
+        assert!(rendered.contains("[redacted]"));
+        assert!(
+            rendered.len() < 2600,
+            "plugin load failure JSON should remain bounded: {} bytes",
+            rendered.len()
+        );
     }
 
     #[test]
@@ -16496,7 +16573,7 @@ UU conflicted.rs",
         assert!(!saved.path.exists(), "saved session should be deleted");
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        remove_dir_all_retry(&workspace).expect("workspace should clean up");
     }
 
     #[test]
@@ -16632,6 +16709,21 @@ UU conflicted.rs",
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+    }
+
+    fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
+        let mut last_error = None;
+        for _ in 0..5 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("remove_dir_all failed")))
     }
 
     #[test]
@@ -17174,16 +17266,26 @@ UU conflicted.rs",
     fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
         let config_home = temp_dir();
         let workspace = temp_dir();
-        let source_root = temp_dir();
+        let bundled_root = temp_dir();
+        let bundled_plugin = bundled_root.join("hook-runtime-demo");
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
-        fs::create_dir_all(&source_root).expect("source root");
-        write_plugin_fixture(&source_root, "hook-runtime-demo", true, false);
+        fs::create_dir_all(&bundled_plugin).expect("bundled plugin root");
+        write_plugin_fixture(&bundled_plugin, "hook-runtime-demo", true, false);
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "plugins": {
+                    "bundledRoot": bundled_root.to_string_lossy(),
+                    "enabled": {
+                        "hook-runtime-demo@bundled": true
+                    }
+                }
+            }))
+            .expect("serialize plugin settings"),
+        )
+        .expect("write plugin settings");
 
-        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        manager
-            .install(source_root.to_str().expect("utf8 source path"))
-            .expect("plugin install should succeed");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
@@ -17197,7 +17299,7 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
-        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(bundled_root);
     }
 
     #[test]
@@ -17427,9 +17529,13 @@ UU conflicted.rs",
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
-        let script_path = workspace.join("plugin-fixture-mcp.py");
+        let script_path = source_root.join("plugin-fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
-        write_plugin_mcp_fixture(&source_root, "plugin-mcp-runtime", &script_path);
+        write_plugin_mcp_fixture(
+            &source_root,
+            "plugin-mcp-runtime",
+            Path::new("./plugin-fixture-mcp.py"),
+        );
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         manager
@@ -17638,17 +17744,30 @@ UU conflicted.rs",
         // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
         let workspace = temp_dir();
-        let source_root = temp_dir();
+        let bundled_root = temp_dir();
+        let bundled_plugin = bundled_root.join("lifecycle-runtime-demo");
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
-        fs::create_dir_all(&source_root).expect("source root");
-        write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
-
-        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        let install = manager
-            .install(source_root.to_str().expect("utf8 source path"))
-            .expect("plugin install should succeed");
-        let log_path = install.install_path.join("lifecycle.log");
+        fs::create_dir_all(&bundled_plugin).expect("bundled plugin root");
+        write_plugin_fixture(&bundled_plugin, "lifecycle-runtime-demo", false, true);
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "plugins": {
+                    "bundledRoot": bundled_root.to_string_lossy(),
+                    "enabled": {
+                        "lifecycle-runtime-demo@bundled": true
+                    }
+                }
+            }))
+            .expect("serialize plugin settings"),
+        )
+        .expect("write plugin settings");
+        let log_path = config_home
+            .join("plugins")
+            .join("installed")
+            .join("lifecycle-runtime-demo-bundled")
+            .join("lifecycle.log");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let runtime_plugin_state =
@@ -17684,7 +17803,7 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
-        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(bundled_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 

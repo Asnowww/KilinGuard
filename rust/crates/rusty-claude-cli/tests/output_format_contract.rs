@@ -375,6 +375,34 @@ fn inventory_commands_emit_structured_json_when_requested() {
             plugin["lifecycle"]["configured"].is_boolean(),
             "plugin entries should expose lifecycle contract summary"
         );
+        assert!(
+            plugin["manifest"]["schemaVersion"].is_number(),
+            "plugin entries should expose manifest schema metadata"
+        );
+        assert!(
+            plugin["capabilities"].is_object(),
+            "plugin entries should expose declared capabilities"
+        );
+        assert!(
+            plugin["actual_surfaces"].is_object(),
+            "plugin entries should expose actual registered surfaces"
+        );
+        assert!(
+            plugin["permissions"].is_array(),
+            "plugin entries should expose declared permissions"
+        );
+        assert!(
+            plugin["permissionDeclarations"].is_array(),
+            "plugin entries should expose raw permission declarations"
+        );
+        assert!(
+            plugin["permissionDeclarationStatuses"].is_array(),
+            "plugin entries should expose permission enforcement status"
+        );
+        assert!(
+            plugin["manifest"]["signatureVerified"].is_boolean(),
+            "plugin manifest metadata should expose signature verification state"
+        );
     }
     assert!(plugins["load_failures"]
         .as_array()
@@ -456,6 +484,22 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
     assert_eq!(plugin["lifecycle"]["init"]["command_count"], 1);
     assert_eq!(plugin["lifecycle"]["shutdown"]["configured"], true);
     assert_eq!(plugin["lifecycle"]["shutdown"]["command_count"], 1);
+    assert_eq!(plugin["manifest"]["schemaVersion"], 1);
+    assert!(plugin["manifest"]["hash"]
+        .as_str()
+        .expect("manifest hash")
+        .starts_with("fnv1a64:"));
+    assert!(plugin["manifest"]["legacy"].as_bool().expect("legacy bool"));
+    assert_eq!(plugin["manifest"]["signatureVerified"], false);
+    assert!(plugin["manifest"]["signatureWarning"].is_null());
+    assert!(plugin["degraded_reason"]
+        .as_str()
+        .expect("legacy warning")
+        .contains("normalized to schemaVersion 1"));
+    assert_eq!(plugin["actual_surfaces"]["tools"], 0);
+    assert_eq!(plugin["capabilities"]["tools"], false);
+    assert!(plugin["permissionDeclarations"].is_array());
+    assert!(plugin["permissionDeclarationStatuses"].is_array());
 }
 
 #[test]
