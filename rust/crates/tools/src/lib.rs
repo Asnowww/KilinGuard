@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aspect_macros::aspect;
 use aspect_std::LoggingAspect;
@@ -698,7 +699,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "workflow": { "type": "object" },
                     "checkpointPath": { "type": "string" },
                     "resume": { "type": "boolean" },
-                    "rollbackOnFailure": { "type": "boolean" }
+                    "rollbackOnFailure": { "type": "boolean" },
+                    "checkpointTtlMs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 604800000
+                    }
                 },
                 "required": ["workflow", "checkpointPath"],
                 "additionalProperties": false
@@ -3202,20 +3208,20 @@ fn run_ops_workflow(
     mut input: OpsWorkflowRunInput,
 ) -> Result<String, String> {
     input.checkpoint_path = resolve_ops_checkpoint_path(&input.checkpoint_path)?;
-    if let Some(parent) = input.checkpoint_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
+    validate_ops_workflow_checkpoint_ttl(input.checkpoint_ttl_ms)?;
 
     let checkpoint = if input.resume && input.checkpoint_path.exists() {
-        let contents =
-            std::fs::read_to_string(&input.checkpoint_path).map_err(|error| error.to_string())?;
-        serde_json::from_str::<ops_plugin_sdk::WorkflowCheckpoint>(&contents)
-            .map_err(|error| error.to_string())?
+        read_ops_workflow_checkpoint(&input.checkpoint_path, &input.workflow)?
     } else {
         ops_plugin_sdk::WorkflowCheckpoint::default()
     };
 
-    let mut runner = ops_plugin_sdk::WorkflowRunner::new();
+    let checkpoint_path = input.checkpoint_path.clone();
+    let checkpoint_ttl_ms = input.checkpoint_ttl_ms;
+    let mut runner =
+        ops_plugin_sdk::WorkflowRunner::new().with_checkpoint_observer(move |checkpoint| {
+            write_ops_workflow_checkpoint(&checkpoint_path, checkpoint, checkpoint_ttl_ms)
+        });
     for tool_name in
         input
             .workflow
@@ -3246,17 +3252,20 @@ fn run_ops_workflow(
     } else {
         runner.run(&input.workflow)
     };
-    let rollback_results =
-        if result.status == ops_plugin_sdk::WorkflowStatus::Failed && input.rollback_on_failure {
-            runner.rollback_and_record(&mut result.checkpoint)
-        } else {
-            Vec::new()
-        };
-    std::fs::write(
+    let checkpoint_allows_rollback = result.status == ops_plugin_sdk::WorkflowStatus::Failed
+        && input.rollback_on_failure
+        && ops_plugin_sdk::validate_workflow_checkpoint(&input.workflow, &result.checkpoint)
+            .is_ok();
+    let rollback_results = if checkpoint_allows_rollback {
+        runner.rollback_and_record(&mut result.checkpoint)
+    } else {
+        Vec::new()
+    };
+    write_ops_workflow_checkpoint(
         &input.checkpoint_path,
-        serde_json::to_string_pretty(&result.checkpoint).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+        &result.checkpoint,
+        input.checkpoint_ttl_ms,
+    )?;
     let rollback_plan = result.checkpoint.rollback_plan.clone();
     to_pretty_json(json!({
         "status": result.status,
@@ -3265,7 +3274,8 @@ fn run_ops_workflow(
         "checkpointPath": input.checkpoint_path,
         "error": result.error,
         "rollbackPlan": rollback_plan,
-        "rollbackResults": rollback_results
+        "rollbackResults": rollback_results,
+        "checkpointSchemaVersion": OPS_WORKFLOW_CHECKPOINT_SCHEMA_VERSION
     }))
 }
 
@@ -3364,6 +3374,228 @@ fn resolve_ops_checkpoint_path(path: &Path) -> Result<PathBuf, String> {
     }
 
     Ok(candidate)
+}
+
+const OPS_WORKFLOW_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const OPS_WORKFLOW_CHECKPOINT_MAX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsWorkflowCheckpointEnvelope {
+    schema_version: u32,
+    workflow_hash: String,
+    step_hashes: BTreeMap<String, String>,
+    updated_at_epoch_ms: u64,
+    expires_at_epoch_ms: u64,
+    checkpoint: ops_plugin_sdk::WorkflowCheckpoint,
+}
+
+fn validate_ops_workflow_checkpoint_ttl(ttl_ms: u64) -> Result<(), String> {
+    if ttl_ms == 0 || ttl_ms > OPS_WORKFLOW_CHECKPOINT_MAX_TTL_MS {
+        return Err(format!(
+            "checkpointTtlMs must be between 1 and {OPS_WORKFLOW_CHECKPOINT_MAX_TTL_MS}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_ops_workflow_checkpoint(
+    path: &Path,
+    workflow: &ops_plugin_sdk::WorkflowDefinition,
+) -> Result<ops_plugin_sdk::WorkflowCheckpoint, String> {
+    reject_ops_checkpoint_symlink_path(path)?;
+    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let raw: Value = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+    if raw.get("checkpoint").is_none() {
+        return Err(
+            "workflow checkpoint must use schemaVersion envelope and cannot be resumed from raw legacy checkpoint"
+                .to_string(),
+        );
+    }
+    let envelope: OpsWorkflowCheckpointEnvelope =
+        serde_json::from_value(raw).map_err(|error| error.to_string())?;
+    if envelope.schema_version != OPS_WORKFLOW_CHECKPOINT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported workflow checkpoint schemaVersion `{}`",
+            envelope.schema_version
+        ));
+    }
+    let now = current_epoch_ms()?;
+    if envelope.expires_at_epoch_ms < now {
+        return Err("workflow checkpoint has expired and cannot be resumed".to_string());
+    }
+    let expected_workflow_hash = ops_plugin_sdk::workflow_hash(workflow);
+    if envelope.workflow_hash != expected_workflow_hash {
+        return Err("workflow checkpoint hash does not match current workflow".to_string());
+    }
+    let expected_step_hashes = ops_plugin_sdk::workflow_step_hashes(workflow);
+    if envelope.step_hashes != expected_step_hashes {
+        return Err("workflow checkpoint step hashes do not match current workflow".to_string());
+    }
+    let mut checkpoint = envelope.checkpoint;
+    if checkpoint.workflow_hash.as_deref() != Some(envelope.workflow_hash.as_str()) {
+        return Err("workflow checkpoint inner hash does not match envelope".to_string());
+    }
+    if checkpoint.step_hashes != envelope.step_hashes {
+        return Err("workflow checkpoint inner step hashes do not match envelope".to_string());
+    }
+    checkpoint.workflow_hash = Some(envelope.workflow_hash);
+    checkpoint.step_hashes = envelope.step_hashes;
+    Ok(checkpoint)
+}
+
+fn write_ops_workflow_checkpoint(
+    path: &Path,
+    checkpoint: &ops_plugin_sdk::WorkflowCheckpoint,
+    ttl_ms: u64,
+) -> Result<(), String> {
+    validate_ops_workflow_checkpoint_ttl(ttl_ms)?;
+    reject_ops_checkpoint_symlink_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "workflow checkpoint path has no parent directory".to_string())?;
+    create_ops_checkpoint_dir_all(parent)?;
+    reject_ops_checkpoint_symlink_path(path)?;
+    let workflow_hash = checkpoint
+        .workflow_hash
+        .clone()
+        .ok_or_else(|| "workflow checkpoint is missing workflow hash".to_string())?;
+    if checkpoint.step_hashes.is_empty() {
+        return Err("workflow checkpoint is missing step hashes".to_string());
+    }
+    let now = current_epoch_ms()?;
+    let envelope = OpsWorkflowCheckpointEnvelope {
+        schema_version: OPS_WORKFLOW_CHECKPOINT_SCHEMA_VERSION,
+        workflow_hash,
+        step_hashes: checkpoint.step_hashes.clone(),
+        updated_at_epoch_ms: now,
+        expires_at_epoch_ms: now.saturating_add(ttl_ms),
+        checkpoint: checkpoint.clone(),
+    };
+    let payload = serde_json::to_vec_pretty(&envelope).map_err(|error| error.to_string())?;
+    let mut output =
+        atomic_write_file::AtomicWriteFile::open(path).map_err(|error| error.to_string())?;
+    set_ops_checkpoint_file_mode(output.as_file_mut())?;
+    output
+        .as_file_mut()
+        .write_all(&payload)
+        .map_err(|error| error.to_string())?;
+    output.commit().map_err(|error| error.to_string())?;
+    set_ops_checkpoint_path_mode(path)?;
+    Ok(())
+}
+
+fn reject_ops_checkpoint_symlink_path(path: &Path) -> Result<(), String> {
+    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if is_symlink_or_reparse_point(&metadata) {
+            return Err(format!(
+                "workflow checkpoint path `{}` must not contain symlink or reparse components",
+                ancestor.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_ops_checkpoint_dir_all(path: &Path) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| "workflow checkpoint directory has no existing ancestor".to_string())?;
+    }
+    reject_ops_checkpoint_symlink_path(cursor)?;
+    let metadata = std::fs::symlink_metadata(cursor).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+        return Err(format!(
+            "workflow checkpoint ancestor `{}` must be a normal directory",
+            cursor.display()
+        ));
+    }
+    for directory in missing.iter().rev() {
+        create_ops_checkpoint_dir(directory)?;
+        let metadata = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+            return Err(format!(
+                "workflow checkpoint directory `{}` must be a normal directory",
+                directory.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_ops_checkpoint_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn create_ops_checkpoint_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn set_ops_checkpoint_file_mode(file: &std::fs::File) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_ops_checkpoint_file_mode(_file: &std::fs::File) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_ops_checkpoint_path_mode(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_ops_checkpoint_path_mode(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn is_symlink_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || is_windows_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn current_epoch_ms() -> Result<u64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?;
+    Ok(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 /// Classify bash command permission based on command type and path.
@@ -4418,6 +4650,8 @@ struct OpsWorkflowRunInput {
     resume: bool,
     #[serde(default = "default_true")]
     rollback_on_failure: bool,
+    #[serde(default = "default_ops_workflow_checkpoint_ttl_ms")]
+    checkpoint_ttl_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4432,6 +4666,10 @@ struct OpsPluginScaffoldInput {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ops_workflow_checkpoint_ttl_ms() -> u64 {
+    24 * 60 * 60 * 1000
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -12613,6 +12851,7 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn ops_workflow_tool_persists_checkpoint_and_runs_pipeline() {
+        let _guard = env_guard();
         let previous_cwd = std::env::current_dir().expect("cwd");
         let workspace = temp_path("ops-workflow-workspace");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -12660,12 +12899,56 @@ printf 'pwsh:%s' "$1"
             .join("workflow-checkpoints")
             .join("incident.json")
             .exists());
+        let checkpoint_file = fs::read_to_string(
+            workspace
+                .join(".claw")
+                .join("workflow-checkpoints")
+                .join("incident.json"),
+        )
+        .expect("checkpoint file");
+        let checkpoint_json: Value =
+            serde_json::from_str(&checkpoint_file).expect("checkpoint json");
+        assert_eq!(checkpoint_json["schemaVersion"], 1);
+        assert!(checkpoint_json["workflowHash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:")));
+        assert_eq!(
+            checkpoint_json["checkpoint"]["irreversible_steps"]
+                .as_array()
+                .expect("irreversible steps")
+                .len(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let checkpoint_dir = workspace.join(".claw").join("workflow-checkpoints");
+            let checkpoint_path = checkpoint_dir.join("incident.json");
+            assert_eq!(
+                fs::metadata(&checkpoint_dir)
+                    .expect("checkpoint dir metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&checkpoint_path)
+                    .expect("checkpoint file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         std::env::set_current_dir(previous_cwd).expect("restore cwd");
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
     fn ops_plugin_scaffold_writes_linux_entrypoint_inside_workspace() {
+        let _guard = env_guard();
         let previous_cwd = std::env::current_dir().expect("cwd");
         let workspace = temp_path("ops-plugin-scaffold");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -12724,6 +13007,7 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn ops_workflow_executes_and_records_partial_rollback_on_failure() {
+        let _guard = env_guard();
         let previous_cwd = std::env::current_dir().expect("cwd");
         let workspace = temp_path("ops-workflow-rollback");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -12762,8 +13046,384 @@ printf 'pwsh:%s' "$1"
             value["checkpoint"]["rollback_results"][0]["succeeded"],
             true
         );
+        let resumed = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": {
+                        "name": "rollback-on-failure",
+                        "steps": [
+                            {
+                                "id": "prepare",
+                                "tool": "StructuredOutput",
+                                "input": {"prepared": true},
+                                "rollback": {
+                                    "id": "undo_prepare",
+                                    "tool": "StructuredOutput",
+                                    "input": {"rolledBack": true}
+                                }
+                            },
+                            {"id": "fail", "tool": "missing_workflow_tool", "input": {}}
+                        ]
+                    },
+                    "checkpointPath": "rollback.json",
+                    "resume": true,
+                    "rollbackOnFailure": true
+                }),
+            )
+            .expect("rolled back workflow should return structured failed result");
+        let resumed: Value = serde_json::from_str(&resumed).expect("resume json");
+        assert_eq!(resumed["status"], "failed");
+        assert!(resumed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot be resumed")));
+        assert_eq!(
+            resumed["checkpoint"]["rollback_results"]
+                .as_array()
+                .expect("rollback results")
+                .len(),
+            1
+        );
         std::env::set_current_dir(previous_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn ops_workflow_resume_rejects_workflow_hash_tamper() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-hash");
+        fs::create_dir_all(&workspace).expect("workspace");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        let registry = workspace_write_registry();
+        let workflow = json!({
+            "name": "hash-bind",
+            "steps": [
+                {"id": "prepare", "tool": "StructuredOutput", "input": {"value": 1}},
+                {"id": "fail", "tool": "missing_workflow_tool", "input": {}}
+            ]
+        });
+        let output = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "hash.json",
+                    "rollbackOnFailure": false
+                }),
+            )
+            .expect("workflow should return failed result");
+        let failed: Value = serde_json::from_str(&output).expect("failed json");
+        assert_eq!(failed["status"], "failed");
+
+        let tampered = json!({
+            "name": "hash-bind",
+            "steps": [
+                {"id": "prepare", "tool": "StructuredOutput", "input": {"value": 2}},
+                {"id": "fail", "tool": "StructuredOutput", "input": {}}
+            ]
+        });
+        let error = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": tampered,
+                    "checkpointPath": "hash.json",
+                    "resume": true
+                }),
+            )
+            .expect_err("tampered workflow should be rejected before resume");
+        assert!(error.contains("checkpoint hash"), "{error}");
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn ops_workflow_resume_rejects_forged_skip_and_rollback_injection() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-forged");
+        fs::create_dir_all(&workspace).expect("workspace");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        let registry = workspace_write_registry();
+        let workflow = json!({
+            "name": "forged",
+            "steps": [
+                {"id": "prepare", "tool": "StructuredOutput", "input": {"value": 1}},
+                {"id": "fail", "tool": "missing_workflow_tool", "input": {}}
+            ]
+        });
+        registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "forged.json",
+                    "rollbackOnFailure": false
+                }),
+            )
+            .expect("workflow should create checkpoint");
+        let checkpoint_path = workspace
+            .join(".claw")
+            .join("workflow-checkpoints")
+            .join("forged.json");
+        let original: Value =
+            serde_json::from_str(&fs::read_to_string(&checkpoint_path).expect("checkpoint"))
+                .expect("checkpoint json");
+
+        let mut forged_skip = original.clone();
+        forged_skip["checkpoint"]["next_index"] = json!(2);
+        forged_skip["checkpoint"]["completed"] = json!({});
+        forged_skip["checkpoint"]["completed_order"] = json!([]);
+        forged_skip["checkpoint"]["rollback_plan"] = json!([]);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&forged_skip).expect("encode forged skip"),
+        )
+        .expect("write forged skip");
+        let skipped = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "forged.json",
+                    "resume": true
+                }),
+            )
+            .expect("forged skip should return structured failed result");
+        let skipped: Value = serde_json::from_str(&skipped).expect("skip json");
+        assert_eq!(skipped["status"], "failed");
+        assert!(skipped["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("next_index")));
+
+        let mut forged_rollback = original;
+        forged_rollback["checkpoint"]["rollback_plan"] = json!([
+            {"id": "evil", "tool": "StructuredOutput", "input": {"pwned": true}}
+        ]);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&forged_rollback).expect("encode forged rollback"),
+        )
+        .expect("write forged rollback");
+        let injected = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "forged.json",
+                    "resume": true
+                }),
+            )
+            .expect("rollback injection should return structured failed result");
+        let injected: Value = serde_json::from_str(&injected).expect("injected json");
+        assert_eq!(injected["status"], "failed");
+        assert!(injected["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("rollback_plan")));
+
+        let mut forged_executed = forged_rollback;
+        forged_executed["checkpoint"]["rollback_results"] = json!([
+            {
+                "id": "evil",
+                "tool": "StructuredOutput",
+                "succeeded": false,
+                "error": "retry",
+                "output": null
+            }
+        ]);
+        forged_executed["checkpoint"]["rollback_executed"] = json!(true);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&forged_executed).expect("encode forged executed rollback"),
+        )
+        .expect("write forged executed rollback");
+        let executed = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "forged.json",
+                    "resume": true,
+                    "rollbackOnFailure": true
+                }),
+            )
+            .expect("executed rollback injection should return structured failed result");
+        let executed: Value = serde_json::from_str(&executed).expect("executed json");
+        assert_eq!(executed["status"], "failed");
+        assert!(executed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("rollback_plan")));
+        assert!(match executed["rollbackResults"].as_array() {
+            Some(results) => results.is_empty(),
+            None => true,
+        });
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn ops_workflow_resume_rejects_expired_checkpoint() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-expired");
+        fs::create_dir_all(&workspace).expect("workspace");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        let registry = workspace_write_registry();
+        let workflow = json!({
+            "name": "expires",
+            "steps": [
+                {"id": "one", "tool": "StructuredOutput", "input": {"value": 1}}
+            ]
+        });
+        registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "expired.json"
+                }),
+            )
+            .expect("workflow should run");
+        let checkpoint_path = workspace
+            .join(".claw")
+            .join("workflow-checkpoints")
+            .join("expired.json");
+        let mut checkpoint_json: Value =
+            serde_json::from_str(&fs::read_to_string(&checkpoint_path).expect("checkpoint"))
+                .expect("checkpoint json");
+        checkpoint_json["expiresAtEpochMs"] = json!(0);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint_json).expect("checkpoint encode"),
+        )
+        .expect("tamper checkpoint expiry");
+        let error = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": workflow,
+                    "checkpointPath": "expired.json",
+                    "resume": true
+                }),
+            )
+            .expect_err("expired checkpoint should fail closed");
+        assert!(error.contains("expired"), "{error}");
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn ops_workflow_resume_rejects_raw_legacy_checkpoint() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-raw-checkpoint");
+        let checkpoint_dir = workspace.join(".claw").join("workflow-checkpoints");
+        fs::create_dir_all(&checkpoint_dir).expect("checkpoint dir");
+        fs::write(
+            checkpoint_dir.join("raw.json"),
+            serde_json::to_vec_pretty(&json!({
+                "next_index": 0,
+                "completed": {},
+                "failed_step": null,
+                "rollback_plan": []
+            }))
+            .expect("raw checkpoint"),
+        )
+        .expect("write raw checkpoint");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        let registry = workspace_write_registry();
+        let error = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": {
+                        "name": "raw",
+                        "steps": [
+                            {"id": "one", "tool": "StructuredOutput", "input": {"value": 1}}
+                        ]
+                    },
+                    "checkpointPath": "raw.json",
+                    "resume": true
+                }),
+            )
+            .expect_err("raw checkpoint must be rejected");
+        assert!(error.contains("schemaVersion envelope"), "{error}");
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ops_workflow_checkpoint_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-symlink");
+        fs::create_dir_all(workspace.join(".claw").join("workflow-checkpoints"))
+            .expect("checkpoint root");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        symlink(
+            workspace.join("outside.json"),
+            workspace
+                .join(".claw")
+                .join("workflow-checkpoints")
+                .join("link.json"),
+        )
+        .expect("checkpoint symlink");
+        let registry = workspace_write_registry();
+        let error = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": {
+                        "name": "symlink",
+                        "steps": [
+                            {"id": "one", "tool": "StructuredOutput", "input": {"value": 1}}
+                        ]
+                    },
+                    "checkpointPath": "link.json"
+                }),
+            )
+            .expect_err("symlink checkpoint must be refused");
+        assert!(error.contains("symlink"), "{error}");
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ops_workflow_checkpoint_rejects_symlink_parent_directory_before_create() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let workspace = temp_path("ops-workflow-parent-symlink");
+        let outside = temp_path("ops-workflow-parent-outside");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, workspace.join(".claw")).expect("parent symlink");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        let registry = workspace_write_registry();
+        let error = registry
+            .execute(
+                "OpsWorkflowRun",
+                &json!({
+                    "workflow": {
+                        "name": "parent-symlink",
+                        "steps": [
+                            {"id": "one", "tool": "StructuredOutput", "input": {"value": 1}}
+                        ]
+                    },
+                    "checkpointPath": "parent.json"
+                }),
+            )
+            .expect_err("symlink parent checkpoint directory must be refused");
+        assert!(error.contains("symlink"), "{error}");
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 api = { path = "../api" }
+atomic-write-file = "0.3"
 commands = { path = "../commands" }
 flate2 = "1"
 plugins = { path = "../plugins" }

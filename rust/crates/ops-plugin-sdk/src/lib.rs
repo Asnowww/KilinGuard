@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+const WORKFLOW_MAX_STEPS: usize = 128;
+const WORKFLOW_MAX_PARALLEL_GROUP_WIDTH: usize = 32;
+const WORKFLOW_MAX_NAME_CHARS: usize = 128;
+const WORKFLOW_MAX_STEP_ID_CHARS: usize = 96;
+const WORKFLOW_MAX_TOOL_CHARS: usize = 128;
+const WORKFLOW_MAX_ROLLBACK_ID_CHARS: usize = 96;
+const WORKFLOW_MAX_IRREVERSIBLE_REASON_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -881,6 +890,8 @@ pub struct WorkflowStep {
     pub input_from: Option<WorkflowInputSource>,
     #[serde(default)]
     pub rollback: Option<WorkflowRollbackStep>,
+    #[serde(default)]
+    pub irreversible_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,24 +914,47 @@ pub struct WorkflowRollbackStep {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowCheckpoint {
+    #[serde(default)]
+    pub workflow_hash: Option<String>,
+    #[serde(default)]
+    pub step_hashes: BTreeMap<String, String>,
     pub next_index: usize,
     pub completed: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub completed_order: Vec<String>,
     pub failed_step: Option<String>,
     pub rollback_plan: Vec<WorkflowRollbackStep>,
     #[serde(default)]
     pub rollback_results: Vec<WorkflowRollbackResult>,
+    #[serde(default)]
+    pub rollback_executed: bool,
+    #[serde(default)]
+    pub irreversible_steps: Vec<WorkflowIrreversibleStep>,
 }
 
 impl Default for WorkflowCheckpoint {
     fn default() -> Self {
         Self {
+            workflow_hash: None,
+            step_hashes: BTreeMap::new(),
             next_index: 0,
             completed: BTreeMap::new(),
+            completed_order: Vec::new(),
             failed_step: None,
             rollback_plan: Vec::new(),
             rollback_results: Vec::new(),
+            rollback_executed: false,
+            irreversible_steps: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowIrreversibleStep {
+    pub id: String,
+    pub tool: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -949,10 +983,18 @@ pub struct WorkflowRunResult {
 }
 
 type ToolHandler = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
+type CheckpointObserver = Arc<dyn Fn(&WorkflowCheckpoint) -> Result<(), String> + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct WorkflowRunner {
     handlers: BTreeMap<String, ToolHandler>,
+    checkpoint_observer: Option<CheckpointObserver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParallelGroupFailure {
+    Step { step_id: String, error: String },
+    Persist { error: String },
 }
 
 impl WorkflowRunner {
@@ -969,6 +1011,15 @@ impl WorkflowRunner {
         self.handlers.insert(name.into(), Arc::new(handler));
     }
 
+    #[must_use]
+    pub fn with_checkpoint_observer(
+        mut self,
+        observer: impl Fn(&WorkflowCheckpoint) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.checkpoint_observer = Some(Arc::new(observer));
+        self
+    }
+
     pub fn run(&self, workflow: &WorkflowDefinition) -> WorkflowRunResult {
         self.resume(workflow, WorkflowCheckpoint::default())
     }
@@ -979,6 +1030,9 @@ impl WorkflowRunner {
         checkpoint: WorkflowCheckpoint,
     ) -> WorkflowRunResult {
         let mut state = checkpoint;
+        if let Err(error) = validate_workflow_definition(workflow) {
+            return failed_result(state, error);
+        }
         if state.next_index > workflow.steps.len() {
             let next_index = state.next_index;
             let step_count = workflow.steps.len();
@@ -991,6 +1045,15 @@ impl WorkflowRunner {
                 ),
             );
         }
+        if let Err(error) = bind_or_validate_checkpoint(workflow, &mut state) {
+            return failed_result(state, error);
+        }
+        if state.rollback_executed {
+            return failed_result(
+                state,
+                "checkpoint has already been rolled back and cannot be resumed".to_string(),
+            );
+        }
         state.failed_step = None;
         let mut index = state.next_index;
 
@@ -1000,26 +1063,30 @@ impl WorkflowRunner {
                     .iter()
                     .position(|step| step.mode != WorkflowStepMode::Parallel)
                     .map_or(workflow.steps.len(), |offset| index + offset);
-                match self.run_parallel_group(&workflow.steps[index..end], &state.completed) {
-                    Ok(outputs) => {
-                        for (step_id, output, rollback) in outputs {
-                            state.completed.insert(step_id, output);
-                            if let Some(rollback) = rollback {
-                                state.rollback_plan.insert(0, rollback);
-                            }
-                        }
+                match self.run_parallel_group(&workflow.steps[index..end], &mut state, end) {
+                    Ok(()) => {
                         index = end;
                         state.next_index = index;
-                    }
-                    Err((step_id, error, partial_outputs)) => {
-                        for (step_id, output, rollback) in partial_outputs {
-                            state.completed.insert(step_id, output);
-                            if let Some(rollback) = rollback {
-                                state.rollback_plan.insert(0, rollback);
-                            }
+                        if let Err(error) = self.persist_checkpoint(&state) {
+                            state.failed_step = None;
+                            return failed_result(state, error);
                         }
+                    }
+                    Err(ParallelGroupFailure::Step { step_id, error }) => {
                         state.failed_step = Some(step_id);
-                        state.next_index = index;
+                        if state.next_index < end {
+                            state.next_index = index;
+                        }
+                        let error = match self.persist_checkpoint(&state) {
+                            Ok(()) => error,
+                            Err(persist_error) => format!(
+                                "{error}; additionally failed to persist workflow checkpoint: {persist_error}"
+                            ),
+                        };
+                        return failed_result(state, error);
+                    }
+                    Err(ParallelGroupFailure::Persist { error }) => {
+                        state.failed_step = None;
                         return failed_result(state, error);
                     }
                 }
@@ -1035,16 +1102,23 @@ impl WorkflowRunner {
 
             match self.run_step(step, &state.completed) {
                 Ok(output) => {
-                    state.completed.insert(step.id.clone(), output);
-                    if let Some(rollback) = &step.rollback {
-                        state.rollback_plan.insert(0, rollback.clone());
-                    }
+                    record_successful_step(&mut state, step, output);
                     index += 1;
                     state.next_index = index;
+                    if let Err(error) = self.persist_checkpoint(&state) {
+                        state.failed_step = None;
+                        return failed_result(state, error);
+                    }
                 }
                 Err(error) => {
                     state.failed_step = Some(step.id.clone());
                     state.next_index = index;
+                    let error = match self.persist_checkpoint(&state) {
+                        Ok(()) => error,
+                        Err(persist_error) => format!(
+                            "{error}; additionally failed to persist workflow checkpoint: {persist_error}"
+                        ),
+                    };
                     return failed_result(state, error);
                 }
             }
@@ -1075,100 +1149,144 @@ impl WorkflowRunner {
         &self,
         checkpoint: &mut WorkflowCheckpoint,
     ) -> Vec<WorkflowRollbackResult> {
-        let results = checkpoint
-            .rollback_plan
-            .iter()
-            .map(|step| {
-                let result = self
-                    .handlers
-                    .get(&step.tool)
-                    .ok_or_else(|| format!("missing rollback tool `{}`", step.tool))
-                    .and_then(|handler| handler(step.input.clone()));
-                match result {
-                    Ok(output) => WorkflowRollbackResult {
-                        id: step.id.clone(),
-                        tool: step.tool.clone(),
-                        succeeded: true,
-                        output: Some(output),
-                        error: None,
-                    },
-                    Err(error) => WorkflowRollbackResult {
-                        id: step.id.clone(),
-                        tool: step.tool.clone(),
-                        succeeded: false,
-                        output: None,
-                        error: Some(error),
-                    },
-                }
-            })
-            .collect::<Vec<_>>();
-        checkpoint.rollback_results.extend(results.clone());
+        if checkpoint.rollback_plan.is_empty() {
+            return Vec::new();
+        }
+        if checkpoint.rollback_executed
+            && checkpoint
+                .rollback_plan
+                .iter()
+                .all(|step| rollback_succeeded(checkpoint, &step.id, &step.tool))
+        {
+            return checkpoint.rollback_results.clone();
+        }
+        let mut results = Vec::new();
+        let mut attempted = false;
+        for step in checkpoint.rollback_plan.clone() {
+            if let Some(existing) = checkpoint
+                .rollback_results
+                .iter()
+                .find(|result| result.id == step.id && result.tool == step.tool && result.succeeded)
+                .cloned()
+            {
+                results.push(existing);
+                continue;
+            }
+            checkpoint
+                .rollback_results
+                .retain(|result| !(result.id == step.id && result.tool == step.tool));
+            attempted = true;
+            let result = self
+                .handlers
+                .get(&step.tool)
+                .ok_or_else(|| format!("missing rollback tool `{}`", step.tool))
+                .and_then(|handler| handler(step.input.clone()));
+            let recorded = match result {
+                Ok(output) => WorkflowRollbackResult {
+                    id: step.id.clone(),
+                    tool: step.tool.clone(),
+                    succeeded: true,
+                    output: Some(output),
+                    error: None,
+                },
+                Err(error) => WorkflowRollbackResult {
+                    id: step.id.clone(),
+                    tool: step.tool.clone(),
+                    succeeded: false,
+                    output: None,
+                    error: Some(error),
+                },
+            };
+            checkpoint.rollback_results.push(recorded.clone());
+            results.push(recorded);
+        }
+        if attempted {
+            checkpoint.rollback_executed = true;
+        }
         results
     }
 
     fn run_parallel_group(
         &self,
         steps: &[WorkflowStep],
-        completed: &BTreeMap<String, Value>,
-    ) -> Result<
-        Vec<(String, Value, Option<WorkflowRollbackStep>)>,
-        (
-            String,
-            String,
-            Vec<(String, Value, Option<WorkflowRollbackStep>)>,
-        ),
-    > {
+        state: &mut WorkflowCheckpoint,
+        group_end: usize,
+    ) -> Result<(), ParallelGroupFailure> {
         let mut prepared = Vec::new();
         for step in steps {
-            if completed.contains_key(&step.id) {
+            if state.completed.contains_key(&step.id) {
                 continue;
             }
             let handler = self.handlers.get(&step.tool).cloned().ok_or_else(|| {
-                (
-                    step.id.clone(),
-                    format!("missing tool `{}`", step.tool),
-                    Vec::new(),
-                )
+                ParallelGroupFailure::Step {
+                    step_id: step.id.clone(),
+                    error: format!("missing tool `{}`", step.tool),
+                }
             })?;
-            let input = prepare_input(step, completed)
-                .map_err(|error| (step.id.clone(), error, Vec::new()))?;
-            prepared.push((step.id.clone(), handler, input, step.rollback.clone()));
+            let input = prepare_input(step, &state.completed).map_err(|error| {
+                ParallelGroupFailure::Step {
+                    step_id: step.id.clone(),
+                    error,
+                }
+            })?;
+            prepared.push((step.clone(), handler, input));
         }
 
         let mut handles = Vec::new();
-        for (step_id, handler, input, rollback) in prepared {
-            handles.push(thread::spawn(move || {
-                let result = handler(input);
-                (step_id, result, rollback)
-            }));
+        for (step, handler, input) in prepared {
+            let join_step_id = step.id.clone();
+            handles.push((
+                join_step_id,
+                thread::spawn(move || {
+                    let result = handler(input);
+                    (step, result)
+                }),
+            ));
         }
 
-        let mut outputs = Vec::new();
-        let mut failure: Option<(String, String)> = None;
-        for handle in handles {
-            let (step_id, result, rollback) = match handle.join() {
+        let mut failure: Option<ParallelGroupFailure> = None;
+        for (join_step_id, handle) in handles {
+            let (step, result) = match handle.join() {
                 Ok(value) => value,
                 Err(_) => {
                     if failure.is_none() {
-                        failure =
-                            Some(("parallel".to_string(), "parallel step panicked".to_string()));
+                        failure = Some(ParallelGroupFailure::Step {
+                            step_id: join_step_id,
+                            error: "parallel step panicked".to_string(),
+                        });
                     }
                     continue;
                 }
             };
             match result {
-                Ok(output) => outputs.push((step_id, output, rollback)),
+                Ok(output) => {
+                    record_successful_step(state, &step, output);
+                    if steps
+                        .iter()
+                        .all(|candidate| state.completed.contains_key(&candidate.id))
+                    {
+                        state.next_index = group_end;
+                    }
+                    if let Err(error) = self.persist_checkpoint(state) {
+                        failure.get_or_insert_with(|| ParallelGroupFailure::Persist {
+                            error: format!("failed to persist workflow checkpoint: {error}"),
+                        });
+                    }
+                }
                 Err(error) => {
                     if failure.is_none() {
-                        failure = Some((step_id, error));
+                        failure = Some(ParallelGroupFailure::Step {
+                            step_id: step.id.clone(),
+                            error,
+                        });
                     }
                 }
             }
         }
-        if let Some((step_id, error)) = failure {
-            return Err((step_id, error, outputs));
+        if let Some(failure) = failure {
+            return Err(failure);
         }
-        Ok(outputs)
+        Ok(())
     }
 
     fn run_step(
@@ -1182,6 +1300,579 @@ impl WorkflowRunner {
             .get(&step.tool)
             .ok_or_else(|| format!("missing tool `{}`", step.tool))?;
         handler(input)
+    }
+
+    fn persist_checkpoint(&self, checkpoint: &WorkflowCheckpoint) -> Result<(), String> {
+        if let Some(observer) = &self.checkpoint_observer {
+            observer(checkpoint)?;
+        }
+        Ok(())
+    }
+}
+
+fn rollback_succeeded(
+    checkpoint: &WorkflowCheckpoint,
+    rollback_id: &str,
+    rollback_tool: &str,
+) -> bool {
+    checkpoint
+        .rollback_results
+        .iter()
+        .any(|result| result.id == rollback_id && result.tool == rollback_tool && result.succeeded)
+}
+
+fn record_successful_step(state: &mut WorkflowCheckpoint, step: &WorkflowStep, output: Value) {
+    let step_id = step.id.clone();
+    if !state.completed.contains_key(&step_id) {
+        state.completed_order.push(step_id.clone());
+    }
+    state.completed.insert(step_id.clone(), output);
+    match step.rollback.clone() {
+        Some(rollback) => {
+            if !state
+                .rollback_plan
+                .iter()
+                .any(|existing| existing.id == rollback.id)
+            {
+                state.rollback_plan.insert(0, rollback);
+            }
+        }
+        None => {
+            if let Some(reason) = step.irreversible_reason.clone() {
+                if !state
+                    .irreversible_steps
+                    .iter()
+                    .any(|existing| existing.id == step_id)
+                {
+                    state.irreversible_steps.push(WorkflowIrreversibleStep {
+                        id: step_id,
+                        tool: step.tool.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn rebuild_rollback_plan_for_order(
+    workflow: &WorkflowDefinition,
+    completed_order: &[String],
+) -> Vec<WorkflowRollbackStep> {
+    completed_order
+        .iter()
+        .filter_map(|step_id| workflow.steps.iter().find(|step| step.id == *step_id))
+        .filter_map(|step| step.rollback.clone())
+        .rev()
+        .collect()
+}
+
+fn rebuild_irreversible_steps_for_order(
+    workflow: &WorkflowDefinition,
+    completed_order: &[String],
+) -> Vec<WorkflowIrreversibleStep> {
+    completed_order
+        .iter()
+        .filter_map(|step_id| workflow.steps.iter().find(|step| step.id == *step_id))
+        .filter_map(|step| {
+            step.irreversible_reason
+                .clone()
+                .map(|reason| WorkflowIrreversibleStep {
+                    id: step.id.clone(),
+                    tool: step.tool.clone(),
+                    reason,
+                })
+        })
+        .collect()
+}
+
+fn completed_key_order_is_coherent(state: &WorkflowCheckpoint) -> bool {
+    if state.completed_order.len() != state.completed.len() {
+        return false;
+    }
+    let mut seen = BTreeMap::new();
+    for step_id in &state.completed_order {
+        if !state.completed.contains_key(step_id) || seen.insert(step_id, ()).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+fn expected_next_index_for_completed_order(
+    workflow: &WorkflowDefinition,
+    completed_order: &[String],
+) -> Result<usize, String> {
+    let completed = completed_order.iter().cloned().collect::<BTreeSet<_>>();
+    let mut index = 0;
+    let mut order_index = 0;
+    while index < workflow.steps.len() {
+        if workflow.steps[index].mode == WorkflowStepMode::Parallel {
+            let end = parallel_group_end(workflow, index);
+            let group = &workflow.steps[index..end];
+            let group_ids = group
+                .iter()
+                .map(|step| step.id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut group_order_count = 0;
+            while order_index < completed_order.len()
+                && group_ids.contains(&completed_order[order_index])
+            {
+                group_order_count += 1;
+                order_index += 1;
+            }
+            let group_completed_count = group
+                .iter()
+                .filter(|step| completed.contains(&step.id))
+                .count();
+            if group_order_count != group_completed_count {
+                return Err(
+                    "checkpoint completed_order has parallel group entries outside their workflow group"
+                        .to_string(),
+                );
+            }
+            if group_order_count == group.len() {
+                index = end;
+                continue;
+            }
+            if group_order_count == 0 {
+                if order_index != completed_order.len() {
+                    return Err(
+                        "checkpoint completed_order contains steps after an incomplete workflow step"
+                            .to_string(),
+                    );
+                }
+                return Ok(index);
+            }
+            if order_index != completed_order.len() {
+                return Err(
+                    "checkpoint completed_order contains steps after a partial parallel group"
+                        .to_string(),
+                );
+            }
+            return Ok(index);
+        }
+
+        let step_id = &workflow.steps[index].id;
+        if order_index < completed_order.len() && &completed_order[order_index] == step_id {
+            order_index += 1;
+            index += 1;
+        } else if completed.contains(step_id) {
+            return Err(format!(
+                "checkpoint completed_order places step `{step_id}` out of workflow order"
+            ));
+        } else {
+            if order_index != completed_order.len() {
+                return Err(
+                    "checkpoint completed_order contains steps after an incomplete workflow step"
+                        .to_string(),
+                );
+            }
+            return Ok(index);
+        }
+    }
+    if order_index != completed_order.len() {
+        return Err("checkpoint completed_order contains unknown trailing steps".to_string());
+    }
+    Ok(workflow.steps.len())
+}
+
+fn parallel_group_end(workflow: &WorkflowDefinition, start: usize) -> usize {
+    workflow.steps[start..]
+        .iter()
+        .position(|step| step.mode != WorkflowStepMode::Parallel)
+        .map_or(workflow.steps.len(), |offset| start + offset)
+}
+
+pub fn workflow_hash(workflow: &WorkflowDefinition) -> String {
+    canonical_hash(&serde_json::to_value(workflow).expect("workflow definition should serialize"))
+}
+
+pub fn workflow_step_hashes(workflow: &WorkflowDefinition) -> BTreeMap<String, String> {
+    workflow
+        .steps
+        .iter()
+        .map(|step| {
+            (
+                step.id.clone(),
+                canonical_hash(
+                    &serde_json::to_value(step).expect("workflow step should serialize"),
+                ),
+            )
+        })
+        .collect()
+}
+
+pub fn validate_workflow_checkpoint(
+    workflow: &WorkflowDefinition,
+    checkpoint: &WorkflowCheckpoint,
+) -> Result<(), String> {
+    validate_workflow_definition(workflow)?;
+    if checkpoint.next_index > workflow.steps.len() {
+        return Err(format!(
+            "checkpoint next_index {} exceeds workflow step count {}",
+            checkpoint.next_index,
+            workflow.steps.len()
+        ));
+    }
+    let mut state = checkpoint.clone();
+    bind_or_validate_checkpoint(workflow, &mut state)
+}
+
+fn bind_or_validate_checkpoint(
+    workflow: &WorkflowDefinition,
+    state: &mut WorkflowCheckpoint,
+) -> Result<(), String> {
+    let expected_workflow_hash = workflow_hash(workflow);
+    let expected_step_hashes = workflow_step_hashes(workflow);
+    let has_progress = state.next_index > 0
+        || !state.completed.is_empty()
+        || state.failed_step.is_some()
+        || !state.rollback_plan.is_empty()
+        || !state.rollback_results.is_empty();
+    match &state.workflow_hash {
+        Some(actual) if actual != &expected_workflow_hash => {
+            return Err(
+                "checkpoint workflow hash does not match current workflow definition".into(),
+            );
+        }
+        Some(_) => {}
+        None if has_progress => {
+            return Err("checkpoint is missing workflow hash and cannot be resumed safely".into());
+        }
+        None => state.workflow_hash = Some(expected_workflow_hash),
+    }
+    if state.step_hashes.is_empty() {
+        if has_progress {
+            return Err("checkpoint is missing step hashes and cannot be resumed safely".into());
+        }
+        state.step_hashes = expected_step_hashes;
+    } else if state.step_hashes != expected_step_hashes {
+        return Err("checkpoint step hashes do not match current workflow definition".into());
+    }
+    validate_checkpoint_progress_coherence(workflow, state)?;
+    Ok(())
+}
+
+fn validate_checkpoint_progress_coherence(
+    workflow: &WorkflowDefinition,
+    state: &WorkflowCheckpoint,
+) -> Result<(), String> {
+    if !completed_key_order_is_coherent(state) {
+        return Err(
+            "checkpoint completed keys, completed_order, and outputs are inconsistent".to_string(),
+        );
+    }
+    for step_id in state.completed.keys() {
+        if !workflow.steps.iter().any(|step| step.id == *step_id) {
+            return Err(format!(
+                "checkpoint completed step `{step_id}` is not present in workflow definition"
+            ));
+        }
+    }
+    let expected_next_index =
+        expected_next_index_for_completed_order(workflow, &state.completed_order)?;
+    if state.next_index != expected_next_index {
+        return Err(format!(
+            "checkpoint next_index {} is inconsistent with completed_order; expected {}",
+            state.next_index, expected_next_index
+        ));
+    }
+    if let Some(failed_step) = &state.failed_step {
+        validate_failed_step_position(workflow, expected_next_index, failed_step)?;
+    }
+    let expected_rollback_plan = rebuild_rollback_plan_for_order(workflow, &state.completed_order);
+    if state.rollback_plan != expected_rollback_plan {
+        return Err("checkpoint rollback_plan does not match completed workflow steps".to_string());
+    }
+    let expected_irreversible =
+        rebuild_irreversible_steps_for_order(workflow, &state.completed_order);
+    if state.irreversible_steps != expected_irreversible {
+        return Err(
+            "checkpoint irreversible_steps do not match completed workflow steps".to_string(),
+        );
+    }
+    validate_rollback_results(state)?;
+    Ok(())
+}
+
+fn validate_rollback_results(state: &WorkflowCheckpoint) -> Result<(), String> {
+    if state.rollback_results.is_empty() {
+        if state.rollback_executed {
+            return Err(
+                "checkpoint rollback_executed requires at least one rollback result".to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if !state.rollback_executed {
+        return Err(
+            "checkpoint rollback_results require rollback_executed=true before resume".to_string(),
+        );
+    }
+    if state.rollback_plan.is_empty() {
+        return Err("checkpoint rollback_executed requires a rollback_plan".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for result in &state.rollback_results {
+        if !seen.insert((result.id.clone(), result.tool.clone())) {
+            return Err(format!(
+                "checkpoint rollback result `{}` for tool `{}` is duplicated",
+                result.id, result.tool
+            ));
+        }
+        if !state
+            .rollback_plan
+            .iter()
+            .any(|step| step.id == result.id && step.tool == result.tool)
+        {
+            return Err(format!(
+                "checkpoint rollback result `{}` does not match the rebuilt rollback plan",
+                result.id
+            ));
+        }
+        if result.succeeded {
+            if result.error.is_some() {
+                return Err(format!(
+                    "checkpoint rollback result `{}` cannot include error when succeeded=true",
+                    result.id
+                ));
+            }
+        } else {
+            if result.output.is_some() {
+                return Err(format!(
+                    "checkpoint rollback result `{}` cannot include output when succeeded=false",
+                    result.id
+                ));
+            }
+            if match result.error.as_deref() {
+                Some(error) => error.trim().is_empty(),
+                None => true,
+            } {
+                return Err(format!(
+                    "checkpoint rollback result `{}` requires a non-empty error when succeeded=false",
+                    result.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_failed_step_position(
+    workflow: &WorkflowDefinition,
+    expected_next_index: usize,
+    failed_step: &str,
+) -> Result<(), String> {
+    if expected_next_index >= workflow.steps.len() {
+        return Err(format!(
+            "checkpoint failed_step `{failed_step}` is inconsistent with completed workflow"
+        ));
+    }
+    if workflow.steps[expected_next_index].mode == WorkflowStepMode::Parallel {
+        let end = parallel_group_end(workflow, expected_next_index);
+        if workflow.steps[expected_next_index..end]
+            .iter()
+            .any(|step| step.id == failed_step)
+        {
+            return Ok(());
+        }
+    } else if workflow.steps[expected_next_index].id == failed_step {
+        return Ok(());
+    }
+    Err(format!(
+        "checkpoint failed_step `{failed_step}` is inconsistent with next executable workflow step"
+    ))
+}
+
+fn validate_workflow_definition(workflow: &WorkflowDefinition) -> Result<(), String> {
+    if workflow.name.trim().is_empty() {
+        return Err("workflow name must not be empty".into());
+    }
+    validate_text_len("workflow name", &workflow.name, WORKFLOW_MAX_NAME_CHARS)?;
+    if workflow.steps.is_empty() {
+        return Err("workflow must contain at least one step".to_string());
+    }
+    if workflow.steps.len() > WORKFLOW_MAX_STEPS {
+        return Err(format!(
+            "workflow has {} steps, exceeding limit {}",
+            workflow.steps.len(),
+            WORKFLOW_MAX_STEPS
+        ));
+    }
+    let mut seen = BTreeMap::new();
+    let mut rollback_ids = BTreeMap::new();
+    for (index, step) in workflow.steps.iter().enumerate() {
+        if step.id.trim().is_empty() {
+            return Err("workflow step id must not be empty".into());
+        }
+        validate_text_len(
+            &format!("workflow step `{}` id", step.id),
+            &step.id,
+            WORKFLOW_MAX_STEP_ID_CHARS,
+        )?;
+        if step.tool.trim().is_empty() {
+            return Err(format!(
+                "workflow step `{}` tool must not be empty",
+                step.id
+            ));
+        }
+        validate_text_len(
+            &format!("workflow step `{}` tool", step.id),
+            &step.tool,
+            WORKFLOW_MAX_TOOL_CHARS,
+        )?;
+        if step.rollback.is_some() && step.irreversible_reason.is_some() {
+            return Err(format!(
+                "workflow step `{}` cannot declare both rollback and irreversibleReason",
+                step.id
+            ));
+        }
+        if step
+            .irreversible_reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return Err(format!(
+                "workflow step `{}` irreversibleReason must not be empty",
+                step.id
+            ));
+        }
+        if let Some(reason) = &step.irreversible_reason {
+            validate_text_len(
+                &format!("workflow step `{}` irreversibleReason", step.id),
+                reason,
+                WORKFLOW_MAX_IRREVERSIBLE_REASON_CHARS,
+            )?;
+        }
+        if let Some(rollback) = &step.rollback {
+            if rollback.id.trim().is_empty() {
+                return Err(format!(
+                    "workflow step `{}` rollback id must not be empty",
+                    step.id
+                ));
+            }
+            validate_text_len(
+                &format!("workflow step `{}` rollback id", step.id),
+                &rollback.id,
+                WORKFLOW_MAX_ROLLBACK_ID_CHARS,
+            )?;
+            if rollback.tool.trim().is_empty() {
+                return Err(format!(
+                    "workflow step `{}` rollback tool must not be empty",
+                    step.id
+                ));
+            }
+            validate_text_len(
+                &format!("workflow step `{}` rollback tool", step.id),
+                &rollback.tool,
+                WORKFLOW_MAX_TOOL_CHARS,
+            )?;
+            if let Some(previous_step) = rollback_ids.insert(rollback.id.clone(), step.id.clone()) {
+                return Err(format!(
+                    "duplicate rollback id `{}` declared by workflow steps `{}` and `{}`",
+                    rollback.id, previous_step, step.id
+                ));
+            }
+        }
+        if let Some(previous) = seen.insert(step.id.clone(), index) {
+            return Err(format!(
+                "workflow step id `{}` is duplicated at positions {} and {}",
+                step.id, previous, index
+            ));
+        }
+    }
+    for (index, step) in workflow.steps.iter().enumerate() {
+        if let Some(source) = &step.input_from {
+            let Some(source_index) = seen.get(&source.step_id) else {
+                return Err(format!(
+                    "workflow step `{}` references unknown inputFrom step `{}`",
+                    step.id, source.step_id
+                ));
+            };
+            if *source_index >= index {
+                return Err(format!(
+                    "workflow step `{}` inputFrom `{}` must refer to a completed earlier step",
+                    step.id, source.step_id
+                ));
+            }
+            if same_parallel_group(workflow, *source_index, index) {
+                return Err(format!(
+                    "workflow parallel step `{}` inputFrom `{}` must refer to a step outside the current parallel group",
+                    step.id, source.step_id
+                ));
+            }
+        }
+    }
+    validate_parallel_group_width(workflow)?;
+    Ok(())
+}
+
+fn validate_text_len(field: &str, value: &str, max_chars: usize) -> Result<(), String> {
+    let actual = value.chars().count();
+    if actual > max_chars {
+        return Err(format!("{field} length {actual} exceeds limit {max_chars}"));
+    }
+    Ok(())
+}
+
+fn validate_parallel_group_width(workflow: &WorkflowDefinition) -> Result<(), String> {
+    let mut index = 0;
+    while index < workflow.steps.len() {
+        if workflow.steps[index].mode != WorkflowStepMode::Parallel {
+            index += 1;
+            continue;
+        }
+        let end = parallel_group_end(workflow, index);
+        let width = end - index;
+        if width > WORKFLOW_MAX_PARALLEL_GROUP_WIDTH {
+            return Err(format!(
+                "workflow parallel group width {width} exceeds limit {WORKFLOW_MAX_PARALLEL_GROUP_WIDTH}"
+            ));
+        }
+        index = end;
+    }
+    Ok(())
+}
+
+fn same_parallel_group(workflow: &WorkflowDefinition, left: usize, right: usize) -> bool {
+    if workflow.steps[left].mode != WorkflowStepMode::Parallel
+        || workflow.steps[right].mode != WorkflowStepMode::Parallel
+    {
+        return false;
+    }
+    parallel_group_bounds(workflow, left) == parallel_group_bounds(workflow, right)
+}
+
+fn parallel_group_bounds(workflow: &WorkflowDefinition, index: usize) -> (usize, usize) {
+    let mut start = index;
+    while start > 0 && workflow.steps[start - 1].mode == WorkflowStepMode::Parallel {
+        start -= 1;
+    }
+    (start, parallel_group_end(workflow, start))
+}
+
+fn canonical_hash(value: &Value) -> String {
+    let canonical = canonical_value(value);
+    let encoded = serde_json::to_vec(&canonical).expect("canonical JSON should serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_value).collect()),
+        Value::Object(entries) => {
+            let mut ordered = Map::new();
+            let mut keys = entries.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                ordered.insert(key.clone(), canonical_value(&entries[key]));
+            }
+            Value::Object(ordered)
+        }
+        other => other.clone(),
     }
 }
 
@@ -1484,6 +2175,7 @@ mod tests {
                     input: Value::Null,
                     input_from: None,
                     rollback: None,
+                    irreversible_reason: None,
                 },
                 WorkflowStep {
                     id: "b".to_string(),
@@ -1496,6 +2188,7 @@ mod tests {
                         target_field: Some("n".to_string()),
                     }),
                     rollback: None,
+                    irreversible_reason: None,
                 },
             ],
         };
@@ -1526,6 +2219,7 @@ mod tests {
                         tool: "undo".to_string(),
                         input: json!({"step": "prepare"}),
                     }),
+                    irreversible_reason: None,
                 },
                 WorkflowStep {
                     id: "apply".to_string(),
@@ -1538,6 +2232,7 @@ mod tests {
                         target_field: Some("token".to_string()),
                     }),
                     rollback: None,
+                    irreversible_reason: None,
                 },
             ],
         };
@@ -1575,6 +2270,7 @@ mod tests {
                     input: json!({"side": "left"}),
                     input_from: None,
                     rollback: None,
+                    irreversible_reason: None,
                 },
                 WorkflowStep {
                     id: "right".to_string(),
@@ -1583,6 +2279,7 @@ mod tests {
                     input: json!({"side": "right"}),
                     input_from: None,
                     rollback: None,
+                    irreversible_reason: None,
                 },
             ],
         };
@@ -1591,6 +2288,87 @@ mod tests {
         assert_eq!(result.status, WorkflowStatus::Completed);
         assert_eq!(result.outputs["left"]["side"], "left");
         assert_eq!(result.outputs["right"]["side"], "right");
+    }
+
+    #[test]
+    fn workflow_rejects_parallel_group_wider_than_limit() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("echo", |input| Ok(input));
+        let steps = (0..=WORKFLOW_MAX_PARALLEL_GROUP_WIDTH)
+            .map(|index| WorkflowStep {
+                id: format!("step-{index}"),
+                tool: "echo".to_string(),
+                mode: WorkflowStepMode::Parallel,
+                input: json!({"index": index}),
+                input_from: None,
+                rollback: None,
+                irreversible_reason: None,
+            })
+            .collect();
+        let workflow = WorkflowDefinition {
+            name: "too-wide".to_string(),
+            steps,
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("parallel group width")));
+    }
+
+    #[test]
+    fn workflow_parallel_step_can_depend_on_earlier_converged_parallel_group() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("echo", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "parallel-input".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "left".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"value": 7}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "right".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"value": 8}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "barrier".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"barrier": true}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "later".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({}),
+                    input_from: Some(WorkflowInputSource {
+                        step_id: "left".to_string(),
+                        path: Some("value".to_string()),
+                        target_field: Some("copied".to_string()),
+                    }),
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Completed);
+        assert_eq!(result.outputs["later"]["copied"], 7);
     }
 
     #[test]
@@ -1605,6 +2383,7 @@ mod tests {
                 input: json!({}),
                 input_from: None,
                 rollback: None,
+                irreversible_reason: None,
             }],
         };
         let checkpoint = WorkflowCheckpoint {
@@ -1618,5 +2397,766 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("exceeds workflow step count")));
+    }
+
+    #[test]
+    fn workflow_rejects_empty_step_list() {
+        let runner = WorkflowRunner::new();
+        let workflow = WorkflowDefinition {
+            name: "empty".to_string(),
+            steps: Vec::new(),
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("at least one step")));
+    }
+
+    #[test]
+    fn workflow_rejects_duplicate_steps_and_future_dependencies() {
+        let runner = WorkflowRunner::new();
+        let duplicate = WorkflowDefinition {
+            name: "duplicate".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "same".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "same".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&duplicate);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicated")));
+
+        let future_dependency = WorkflowDefinition {
+            name: "future".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "uses_future".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: Some(WorkflowInputSource {
+                        step_id: "later".to_string(),
+                        path: None,
+                        target_field: None,
+                    }),
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "later".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&future_dependency);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must refer to a completed earlier step")));
+
+        let parallel_dependency = WorkflowDefinition {
+            name: "parallel-dependency".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "left".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "right".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({}),
+                    input_from: Some(WorkflowInputSource {
+                        step_id: "left".to_string(),
+                        path: None,
+                        target_field: None,
+                    }),
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&parallel_dependency);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside the current parallel group")));
+
+        let duplicate_rollback_id = WorkflowDefinition {
+            name: "duplicate-rollback".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "first".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: Some(WorkflowRollbackStep {
+                        id: "undo_same".to_string(),
+                        tool: "noop".to_string(),
+                        input: json!({}),
+                    }),
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "second".to_string(),
+                    tool: "noop".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: Some(WorkflowRollbackStep {
+                        id: "undo_same".to_string(),
+                        tool: "noop".to_string(),
+                        input: json!({}),
+                    }),
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&duplicate_rollback_id);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate rollback id")));
+    }
+
+    #[test]
+    fn workflow_checkpoint_hash_rejects_definition_tamper() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |_| Ok(json!({"ok": true})));
+        runner.register_tool("fail", |_| Err("stop".to_string()));
+        let workflow = WorkflowDefinition {
+            name: "hash".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "done".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"value": 1}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "later".to_string(),
+                    tool: "fail".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let failed = runner.run(&workflow);
+        assert_eq!(failed.status, WorkflowStatus::Failed);
+        assert!(failed.checkpoint.workflow_hash.is_some());
+        assert_eq!(failed.checkpoint.step_hashes.len(), 2);
+
+        let mut tampered = workflow.clone();
+        tampered.steps[1].input = json!({"changed": true});
+        let result = runner.resume(&tampered, failed.checkpoint);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("workflow hash")));
+    }
+
+    #[test]
+    fn workflow_checkpoint_rejects_forged_skip_and_rollback_injection() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "coherence".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "first".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"step": 1}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "second".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"step": 2}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let forged_skip = WorkflowCheckpoint {
+            workflow_hash: Some(workflow_hash(&workflow)),
+            step_hashes: workflow_step_hashes(&workflow),
+            next_index: workflow.steps.len(),
+            ..WorkflowCheckpoint::default()
+        };
+        let result = runner.resume(&workflow, forged_skip);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("next_index")));
+
+        let forged_rollback = WorkflowCheckpoint {
+            workflow_hash: Some(workflow_hash(&workflow)),
+            step_hashes: workflow_step_hashes(&workflow),
+            next_index: 1,
+            completed: BTreeMap::from([("first".to_string(), json!({"step": 1}))]),
+            completed_order: vec!["first".to_string()],
+            rollback_plan: vec![WorkflowRollbackStep {
+                id: "evil".to_string(),
+                tool: "danger".to_string(),
+                input: json!({"arbitrary": true}),
+            }],
+            ..WorkflowCheckpoint::default()
+        };
+        let result = runner.resume(&workflow, forged_rollback);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("rollback_plan")));
+
+        let forged_executed_rollback = WorkflowCheckpoint {
+            workflow_hash: Some(workflow_hash(&workflow)),
+            step_hashes: workflow_step_hashes(&workflow),
+            next_index: 1,
+            completed: BTreeMap::from([("first".to_string(), json!({"step": 1}))]),
+            completed_order: vec!["first".to_string()],
+            rollback_plan: vec![WorkflowRollbackStep {
+                id: "evil".to_string(),
+                tool: "ok".to_string(),
+                input: json!({"arbitrary": true}),
+            }],
+            rollback_results: vec![WorkflowRollbackResult {
+                id: "evil".to_string(),
+                tool: "ok".to_string(),
+                succeeded: false,
+                output: None,
+                error: Some("retry me".to_string()),
+            }],
+            rollback_executed: true,
+            ..WorkflowCheckpoint::default()
+        };
+        let result = runner.resume(&workflow, forged_executed_rollback);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("rollback_plan")));
+    }
+
+    #[test]
+    fn workflow_checkpoint_rejects_ambiguous_rollback_results() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "rollback-results".to_string(),
+            steps: vec![WorkflowStep {
+                id: "first".to_string(),
+                tool: "ok".to_string(),
+                mode: WorkflowStepMode::Sequential,
+                input: json!({"step": 1}),
+                input_from: None,
+                rollback: Some(WorkflowRollbackStep {
+                    id: "undo_first".to_string(),
+                    tool: "ok".to_string(),
+                    input: json!({"undo": true}),
+                }),
+                irreversible_reason: None,
+            }],
+        };
+        let completed = runner.run(&workflow);
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        let mut duplicate = completed.checkpoint.clone();
+        duplicate.rollback_executed = true;
+        duplicate.rollback_results = vec![
+            WorkflowRollbackResult {
+                id: "undo_first".to_string(),
+                tool: "ok".to_string(),
+                succeeded: false,
+                output: None,
+                error: Some("first failure".to_string()),
+            },
+            WorkflowRollbackResult {
+                id: "undo_first".to_string(),
+                tool: "ok".to_string(),
+                succeeded: false,
+                output: None,
+                error: Some("second failure".to_string()),
+            },
+        ];
+        let result = runner.resume(&workflow, duplicate);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicated")));
+
+        let mut invalid_success = completed.checkpoint;
+        invalid_success.rollback_executed = true;
+        invalid_success.rollback_results = vec![WorkflowRollbackResult {
+            id: "undo_first".to_string(),
+            tool: "ok".to_string(),
+            succeeded: true,
+            output: Some(json!({"ok": true})),
+            error: Some("must not be present".to_string()),
+        }];
+        let result = runner.resume(&workflow, invalid_success);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("succeeded=true")));
+    }
+
+    #[test]
+    fn workflow_rollback_is_idempotent_and_blocks_resume_after_undo() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |_| Ok(json!({"ok": true})));
+        runner.register_tool("fail", |_| Err("stop".to_string()));
+        runner.register_tool("undo", |_| Ok(json!({"undone": true})));
+        let workflow = WorkflowDefinition {
+            name: "rollback-once".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "done".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: Some(WorkflowRollbackStep {
+                        id: "undo_done".to_string(),
+                        tool: "undo".to_string(),
+                        input: json!({}),
+                    }),
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "failed".to_string(),
+                    tool: "fail".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let failed = runner.run(&workflow);
+        let mut checkpoint = failed.checkpoint;
+        let first = runner.rollback_and_record(&mut checkpoint);
+        let second = runner.rollback_and_record(&mut checkpoint);
+        assert_eq!(first, second);
+        assert_eq!(checkpoint.rollback_results.len(), 1);
+        assert!(checkpoint.rollback_executed);
+        assert_eq!(checkpoint.completed_order, vec!["done".to_string()]);
+        assert!(checkpoint.completed.contains_key("done"));
+        assert_eq!(checkpoint.next_index, 1);
+
+        let resumed = runner.resume(&workflow, checkpoint);
+        assert_eq!(resumed.status, WorkflowStatus::Failed);
+        assert_eq!(resumed.checkpoint.failed_step.as_deref(), Some("failed"));
+        assert!(resumed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot be resumed")));
+    }
+
+    #[test]
+    fn workflow_failed_rollback_retries_and_successful_rollback_is_skipped() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let undo_attempts = attempts.clone();
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |_| Ok(json!({"ok": true})));
+        runner.register_tool("fail", |_| Err("stop".to_string()));
+        runner.register_tool("undo", move |_| {
+            let attempt = undo_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err("temporary rollback failure".to_string())
+            } else {
+                Ok(json!({"undone": true}))
+            }
+        });
+        let workflow = WorkflowDefinition {
+            name: "retry-rollback".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "done".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: Some(WorkflowRollbackStep {
+                        id: "undo_done".to_string(),
+                        tool: "undo".to_string(),
+                        input: json!({}),
+                    }),
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "failed".to_string(),
+                    tool: "fail".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let failed = runner.run(&workflow);
+        let mut checkpoint = failed.checkpoint;
+        let first = runner.rollback_and_record(&mut checkpoint);
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].succeeded);
+        assert!(checkpoint.rollback_executed);
+        let second = runner.rollback_and_record(&mut checkpoint);
+        assert_eq!(second.len(), 1);
+        assert!(second[0].succeeded);
+        assert_eq!(checkpoint.rollback_results.len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let third = runner.rollback_and_record(&mut checkpoint);
+        assert_eq!(third.len(), 1);
+        assert!(third[0].succeeded);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn workflow_empty_rollback_plan_does_not_block_resume() {
+        let mut failing_runner = WorkflowRunner::new();
+        failing_runner.register_tool("ok", |_| Ok(json!({"ok": true})));
+        failing_runner.register_tool("fail", |_| Err("stop".to_string()));
+        let workflow = WorkflowDefinition {
+            name: "empty-plan".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "prepare".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "apply".to_string(),
+                    tool: "fail".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let failed = failing_runner.run(&workflow);
+        let mut checkpoint = failed.checkpoint;
+        assert!(failing_runner
+            .rollback_and_record(&mut checkpoint)
+            .is_empty());
+        assert!(!checkpoint.rollback_executed);
+
+        let mut resumed_runner = WorkflowRunner::new();
+        resumed_runner.register_tool("ok", |_| Ok(json!({"ok": true})));
+        resumed_runner.register_tool("fail", |_| Ok(json!({"recovered": true})));
+        let resumed = resumed_runner.resume(&workflow, checkpoint);
+        assert_eq!(resumed.status, WorkflowStatus::Completed);
+        assert_eq!(resumed.outputs["apply"]["recovered"], true);
+    }
+
+    #[test]
+    fn workflow_records_only_explicit_irreversible_steps() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "irreversible".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "read".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"read": true}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "terminate".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"terminate": true}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: Some(
+                        "terminating a live session cannot be replayed deterministically"
+                            .to_string(),
+                    ),
+                },
+            ],
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Completed);
+        assert_eq!(result.checkpoint.irreversible_steps.len(), 1);
+        assert_eq!(result.checkpoint.irreversible_steps[0].id, "terminate");
+
+        let invalid = WorkflowDefinition {
+            name: "invalid".to_string(),
+            steps: vec![WorkflowStep {
+                id: "bad".to_string(),
+                tool: "ok".to_string(),
+                mode: WorkflowStepMode::Sequential,
+                input: json!({}),
+                input_from: None,
+                rollback: Some(WorkflowRollbackStep {
+                    id: "undo_bad".to_string(),
+                    tool: "ok".to_string(),
+                    input: json!({}),
+                }),
+                irreversible_reason: Some("also irreversible".to_string()),
+            }],
+        };
+        let result = runner.run(&invalid);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("both rollback and irreversibleReason")));
+    }
+
+    #[test]
+    fn workflow_parallel_panic_records_actual_step_id_and_successes_settle() {
+        let mut runner = WorkflowRunner::new();
+        runner.register_tool("ok", |input| Ok(input));
+        runner.register_tool("panic", |_| panic!("parallel failure"));
+        let workflow = WorkflowDefinition {
+            name: "parallel-panic".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "left".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"side": "left"}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "boom".to_string(),
+                    tool: "panic".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = runner.run(&workflow);
+        std::panic::set_hook(previous_hook);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert_eq!(result.checkpoint.failed_step.as_deref(), Some("boom"));
+        assert_eq!(result.checkpoint.completed["left"]["side"], "left");
+    }
+
+    #[test]
+    fn workflow_checkpoint_observer_runs_after_each_completed_step() {
+        use std::sync::{Arc, Mutex};
+
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = snapshots.clone();
+        let mut runner = WorkflowRunner::new().with_checkpoint_observer(move |checkpoint| {
+            observed
+                .lock()
+                .expect("observer lock")
+                .push(checkpoint.next_index);
+            Ok(())
+        });
+        runner.register_tool("ok", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "observer".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "one".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"n": 1}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "two".to_string(),
+                    tool: "ok".to_string(),
+                    mode: WorkflowStepMode::Sequential,
+                    input: json!({"n": 2}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Completed);
+        assert_eq!(*snapshots.lock().expect("snapshots"), vec![1, 2]);
+    }
+
+    #[test]
+    fn workflow_parallel_final_observer_snapshot_can_resume() {
+        use std::sync::{Arc, Mutex};
+
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = snapshots.clone();
+        let mut runner = WorkflowRunner::new().with_checkpoint_observer(move |checkpoint| {
+            observed
+                .lock()
+                .expect("observer lock")
+                .push(checkpoint.clone());
+            Ok(())
+        });
+        runner.register_tool("echo", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "parallel-final-observer".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "left".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"side": "left"}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "right".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"side": "right"}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Completed);
+        let final_snapshot = snapshots
+            .lock()
+            .expect("snapshots")
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.completed.len() == 2)
+            .cloned()
+            .expect("final parallel checkpoint");
+        assert_eq!(final_snapshot.next_index, workflow.steps.len());
+
+        let mut resumed_runner = WorkflowRunner::new();
+        resumed_runner.register_tool("echo", |input| Ok(input));
+        let resumed = resumed_runner.resume(&workflow, final_snapshot);
+        assert_eq!(resumed.status, WorkflowStatus::Completed);
+        assert_eq!(resumed.outputs.len(), 2);
+    }
+
+    #[test]
+    fn workflow_parallel_observer_failure_returns_coherent_checkpoint() {
+        use std::sync::{Arc, Mutex};
+
+        let attempts = Arc::new(Mutex::new(0usize));
+        let observed = attempts.clone();
+        let mut runner = WorkflowRunner::new().with_checkpoint_observer(move |checkpoint| {
+            let mut count = observed.lock().expect("observer lock");
+            *count += 1;
+            if checkpoint.completed.len() == 2 {
+                Err("transient checkpoint sink failure".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        runner.register_tool("echo", |input| Ok(input));
+        let workflow = WorkflowDefinition {
+            name: "parallel-observer-failure".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    id: "left".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"side": "left"}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+                WorkflowStep {
+                    id: "right".to_string(),
+                    tool: "echo".to_string(),
+                    mode: WorkflowStepMode::Parallel,
+                    input: json!({"side": "right"}),
+                    input_from: None,
+                    rollback: None,
+                    irreversible_reason: None,
+                },
+            ],
+        };
+        let result = runner.run(&workflow);
+        assert_eq!(result.status, WorkflowStatus::Failed);
+        assert_eq!(result.checkpoint.failed_step, None);
+        assert_eq!(result.checkpoint.next_index, workflow.steps.len());
+        assert_eq!(result.checkpoint.completed.len(), 2);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("checkpoint")));
+
+        let mut resumed_runner = WorkflowRunner::new();
+        resumed_runner.register_tool("echo", |input| Ok(input));
+        let resumed = resumed_runner.resume(&workflow, result.checkpoint);
+        assert_eq!(resumed.status, WorkflowStatus::Completed);
+        assert_eq!(resumed.outputs.len(), 2);
     }
 }
