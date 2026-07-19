@@ -36,6 +36,7 @@ mod prompt;
 pub mod recovery_recipes;
 mod remote;
 mod report_schema;
+pub mod safety_intent;
 pub mod sandbox;
 mod session;
 pub mod session_control;
@@ -172,6 +173,13 @@ pub use report_schema::{
     NegativeEvidence, NegativeFindingStatus, ProjectionProvenance, RedactionProvenance,
     ReportClaim, ReportConfidence, ReportIdentity, ReportProjectionV1, ReportSchemaField,
     ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
+};
+pub use safety_intent::{
+    analyze_plan, analyze_plan_with_config, ImpactScope, ImplicitOperation, IntentRiskAssessment,
+    IntentTarget, IntentTargetKind, IntentUncertainty, RiskFactor, RiskFactorAssessment,
+    RiskFactorWeights, RiskLevel, RiskPolicy, RiskThresholds, SafetyAction, SafetyIntent,
+    SafetyIntentConfig, SafetyIntentError, SafetyIntentErrorCode, SafetyIntentLimits,
+    SafetyIntentReport, ToolCallPlan, ToolExecutionPlan,
 };
 pub use sandbox::{
     build_linux_sandbox_command, build_overlayfs_plan, build_sandbox_invocation,
