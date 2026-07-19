@@ -8,9 +8,7 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,6 +31,7 @@ const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 const BUILTIN_OPS_PLACEHOLDER_COMMAND: &str = "__claw_builtin_ops_placeholder__";
 const BUILTIN_OPS_EXECUTOR_COMMAND: &str = "__claw_builtin_ops_executor__";
+const BUILTIN_OPS_RESULT_SCHEMA: &str = "claw.ops.result.v1";
 const PLUGIN_TOOL_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 30_000;
 pub const PLUGIN_HOT_RELOAD_DEADLINE_MS: u64 = 3_000;
@@ -109,8 +108,14 @@ pub struct PluginMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginManifestMetadata {
+    #[serde(
+        rename = "schemaVersion",
+        default = "default_manifest_metadata_schema_version"
+    )]
     pub schema_version: u64,
+    #[serde(default)]
     pub legacy: bool,
+    #[serde(default)]
     pub hash: String,
     #[serde(default)]
     pub signature: Option<String>,
@@ -122,8 +127,22 @@ pub struct PluginManifestMetadata {
     pub declared_id: Option<String>,
     #[serde(default)]
     pub entrypoint: Option<PluginEntrypoint>,
+    #[serde(rename = "sourceOnly", default)]
+    pub source_only: bool,
+    #[serde(rename = "buildRequired", default)]
+    pub build_required: bool,
+    #[serde(rename = "registrationReady", default = "default_registration_ready")]
+    pub registration_ready: bool,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+fn default_registration_ready() -> bool {
+    true
+}
+
+fn default_manifest_metadata_schema_version() -> u64 {
+    PLUGIN_MANIFEST_SCHEMA_VERSION
 }
 
 impl PluginManifestMetadata {
@@ -138,6 +157,9 @@ impl PluginManifestMetadata {
             signature_warning: None,
             declared_id: None,
             entrypoint: None,
+            source_only: false,
+            build_required: false,
+            registration_ready: true,
             warnings: Vec::new(),
         }
     }
@@ -154,6 +176,9 @@ impl Default for PluginManifestMetadata {
             signature_warning: None,
             declared_id: None,
             entrypoint: None,
+            source_only: false,
+            build_required: false,
+            registration_ready: true,
             warnings: vec![
                 "legacy manifest omitted schemaVersion; normalized to schemaVersion 1".to_string(),
             ],
@@ -601,6 +626,10 @@ pub struct PluginOpsPermission {
     pub risk: PluginRiskLevel,
     pub reason: String,
     #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(rename = "irreversibleActions", default)]
+    pub irreversible_actions: Vec<String>,
+    #[serde(default)]
     pub rollback_required: bool,
     #[serde(default)]
     pub rollback_command: Option<String>,
@@ -628,6 +657,8 @@ struct RawPluginManifest {
     pub signature: Option<String>,
     #[serde(default)]
     pub entrypoint: Option<PluginEntrypoint>,
+    #[serde(rename = "manifestMetadata", default)]
+    pub manifest_metadata: PluginManifestMetadata,
     #[serde(rename = "defaultEnabled", default)]
     pub default_enabled: bool,
     #[serde(default)]
@@ -683,6 +714,341 @@ struct ManifestSchemaEnvelope {
     explicit_capabilities: bool,
     hash: String,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginToolAuthorizationRequest {
+    pub plugin_id: String,
+    pub tool_name: String,
+    pub input_hash: String,
+    pub plan_hash: String,
+    pub plan: Value,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct PluginToolExecutionContext {
+    builtin_ops_authorization: Option<BuiltinOpsAuthorization>,
+}
+
+impl PluginToolExecutionContext {
+    #[must_use]
+    fn builtin_ops(authorization: BuiltinOpsAuthorization) -> Self {
+        Self {
+            builtin_ops_authorization: Some(authorization),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BuiltinOpsAuthorization {
+    plugin_id: String,
+    tool_name: String,
+    input_hash: String,
+    plan_hash: String,
+    consumed: Arc<AtomicBool>,
+}
+
+impl BuiltinOpsAuthorization {
+    #[must_use]
+    fn from_verified_grant(
+        plugin_id: String,
+        tool_name: String,
+        input_hash: String,
+        plan_hash: String,
+        consumed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            plugin_id,
+            tool_name,
+            input_hash,
+            plan_hash,
+            consumed,
+        }
+    }
+
+    fn matches_and_consume(
+        &self,
+        plugin_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        plan_hash: &str,
+    ) -> bool {
+        if self.plugin_id != plugin_id
+            || self.tool_name != tool_name
+            || self.input_hash != input_hash
+            || self.plan_hash != plan_hash
+        {
+            return false;
+        }
+        !self.consumed.swap(true, Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginApprovalIssuer {
+    channel_id: String,
+    registry_id: String,
+    secret: Arc<[u8; 32]>,
+}
+
+#[derive(Clone)]
+pub struct PluginApprovalVerifier {
+    channel_id: String,
+    registry_id: String,
+    secret: Option<Arc<[u8; 32]>>,
+}
+
+#[derive(Clone)]
+pub struct PluginApprovalGrant {
+    channel_id: String,
+    registry_id: String,
+    plugin_id: String,
+    tool_name: String,
+    input_hash: String,
+    plan_hash: String,
+    nonce: String,
+    signature: [u8; 32],
+    consumed: Arc<AtomicBool>,
+}
+
+pub fn plugin_approval_channel(
+) -> Result<(PluginApprovalIssuer, PluginApprovalVerifier), PluginError> {
+    let channel_id = random_hex_128()?;
+    let registry_id = random_hex_128()?;
+    let secret = Arc::new(random_secret_256()?);
+    Ok((
+        PluginApprovalIssuer {
+            channel_id: channel_id.clone(),
+            registry_id: registry_id.clone(),
+            secret: secret.clone(),
+        },
+        PluginApprovalVerifier {
+            channel_id,
+            registry_id,
+            secret: Some(secret),
+        },
+    ))
+}
+
+impl std::fmt::Debug for PluginApprovalIssuer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginApprovalIssuer")
+            .field("channel_id", &self.channel_id)
+            .field("registry_id", &self.registry_id)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PluginApprovalVerifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginApprovalVerifier")
+            .field("channel_id", &self.channel_id)
+            .field("registry_id", &self.registry_id)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PluginApprovalGrant {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginApprovalGrant")
+            .field("channel_id", &self.channel_id)
+            .field("registry_id", &self.registry_id)
+            .field("plugin_id", &self.plugin_id)
+            .field("tool_name", &self.tool_name)
+            .field("input_hash", &self.input_hash)
+            .field("plan_hash", &self.plan_hash)
+            .field("nonce", &"[redacted]")
+            .field("signature", &"[redacted]")
+            .field("consumed", &self.is_consumed())
+            .finish()
+    }
+}
+
+impl PluginApprovalIssuer {
+    #[must_use]
+    pub fn issue(
+        &self,
+        plugin_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        plan_hash: &str,
+    ) -> Result<PluginApprovalGrant, PluginError> {
+        let nonce = random_hex_128()?;
+        let signature = approval_signature(
+            &self.secret,
+            &self.channel_id,
+            &self.registry_id,
+            plugin_id,
+            tool_name,
+            input_hash,
+            plan_hash,
+            &nonce,
+        );
+        Ok(PluginApprovalGrant {
+            channel_id: self.channel_id.clone(),
+            registry_id: self.registry_id.clone(),
+            plugin_id: plugin_id.to_string(),
+            tool_name: tool_name.to_string(),
+            input_hash: input_hash.to_string(),
+            plan_hash: plan_hash.to_string(),
+            nonce,
+            signature,
+            consumed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+impl PluginApprovalVerifier {
+    fn disabled() -> Self {
+        Self {
+            channel_id: String::new(),
+            registry_id: String::new(),
+            secret: None,
+        }
+    }
+
+    fn verify_and_consume(
+        &self,
+        grant: &PluginApprovalGrant,
+        plugin_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        plan_hash: &str,
+    ) -> Option<PluginToolExecutionContext> {
+        let secret = self.secret.as_deref()?;
+        if grant.channel_id != self.channel_id
+            || grant.registry_id != self.registry_id
+            || grant.plugin_id != plugin_id
+            || grant.tool_name != tool_name
+            || grant.input_hash != input_hash
+            || grant.plan_hash != plan_hash
+        {
+            return None;
+        }
+        let expected = approval_signature(
+            secret,
+            &grant.channel_id,
+            &grant.registry_id,
+            &grant.plugin_id,
+            &grant.tool_name,
+            &grant.input_hash,
+            &grant.plan_hash,
+            &grant.nonce,
+        );
+        if !constant_time_eq(&expected, &grant.signature)
+            || grant.consumed.swap(true, Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(PluginToolExecutionContext::builtin_ops(
+            BuiltinOpsAuthorization::from_verified_grant(
+                plugin_id.to_string(),
+                tool_name.to_string(),
+                input_hash.to_string(),
+                plan_hash.to_string(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        ))
+    }
+}
+
+impl PluginApprovalGrant {
+    #[must_use]
+    pub fn is_consumed(&self) -> bool {
+        self.consumed.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn matches_request(
+        &self,
+        plugin_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        plan_hash: &str,
+    ) -> bool {
+        self.plugin_id == plugin_id
+            && self.tool_name == tool_name
+            && self.input_hash == input_hash
+            && self.plan_hash == plan_hash
+    }
+}
+
+fn random_secret_256() -> Result<[u8; 32], PluginError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        PluginError::CommandFailed(format!("failed to create plugin approval secret: {error}"))
+    })?;
+    Ok(bytes)
+}
+
+fn random_hex_128() -> Result<String, PluginError> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        PluginError::CommandFailed(format!("failed to create plugin approval nonce: {error}"))
+    })?;
+    Ok(hex_encode(&bytes))
+}
+
+fn approval_signature(
+    secret: &[u8; 32],
+    channel_id: &str,
+    registry_id: &str,
+    plugin_id: &str,
+    tool_name: &str,
+    input_hash: &str,
+    plan_hash: &str,
+    nonce: &str,
+) -> [u8; 32] {
+    const SHA256_BLOCK_SIZE: usize = 64;
+    let mut inner_pad = [0x36u8; SHA256_BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; SHA256_BLOCK_SIZE];
+    for (index, byte) in secret.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(inner_pad);
+    for part in [
+        channel_id,
+        registry_id,
+        plugin_id,
+        tool_name,
+        input_hash,
+        plan_hash,
+        nonce,
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let inner = hasher.finalize();
+    let mut hasher = Sha256::new();
+    hasher.update(outer_pad);
+    hasher.update(inner);
+    hasher.finalize().into()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -749,19 +1115,48 @@ impl PluginTool {
         self.required_permission.as_str()
     }
 
+    pub fn authorization_request(
+        &self,
+        input: &Value,
+    ) -> Result<Option<PluginToolAuthorizationRequest>, PluginError> {
+        validate_json_schema_value(&self.definition.input_schema, input, "input")?;
+        if self.command == BUILTIN_OPS_PLACEHOLDER_COMMAND
+            || self.command == BUILTIN_OPS_EXECUTOR_COMMAND
+        {
+            return prepare_builtin_ops_authorization_request(
+                &self.plugin_id,
+                &self.definition.name,
+                input,
+            );
+        }
+        Ok(None)
+    }
+
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
+        self.execute_with_context(input, None)
+    }
+
+    fn execute_with_context(
+        &self,
+        input: &Value,
+        context: Option<&PluginToolExecutionContext>,
+    ) -> Result<String, PluginError> {
         validate_json_schema_value(&self.definition.input_schema, input, "input")?;
 
         if self.command == BUILTIN_OPS_PLACEHOLDER_COMMAND
             || self.command == BUILTIN_OPS_EXECUTOR_COMMAND
         {
-            return execute_builtin_ops_tool(
+            let value = execute_builtin_ops_tool(
                 &self.plugin_id,
                 &self.definition.name,
                 self.required_permission,
                 input,
-            )
-            .map(|value| value.to_string());
+                context,
+            )?;
+            if let Some(output_schema) = &self.definition.output_schema {
+                validate_json_schema_value(output_schema, &value, "output")?;
+            }
+            return Ok(value.to_string());
         }
 
         let input_json = input.to_string();
@@ -801,12 +1196,12 @@ impl PluginTool {
                 "plugin tool `{}` from `{}` failed for `{}`{}: {}",
                 self.definition.name,
                 self.plugin_id,
-                self.command,
+                sanitize_plugin_error(&self.command),
                 truncated_suffix(output.stderr_truncated),
                 if stderr.is_empty() {
                     format!("exit status {}", output.status)
                 } else {
-                    stderr
+                    sanitize_plugin_error(&stderr)
                 }
             )))
         }
@@ -840,13 +1235,13 @@ fn run_controlled_child(
     if !request.external_subprocess_allowed {
         return Err(PluginError::CommandFailed(format!(
             "external plugin subprocess `{}` was refused: FR-2.13 requires an OS sandbox, and this runner only provides process policy guards; set executionPolicy.allowExternalSubprocess=true only for explicitly trusted plugins",
-            request.command
+            sanitize_plugin_error(&request.command)
         )));
     }
     if matches!(request.permission, PluginToolPermission::DangerFullAccess) {
         return Err(PluginError::CommandFailed(format!(
             "command `{}` requires danger-full-access and was rejected because no explicit operator approval policy is attached",
-            request.command
+            sanitize_plugin_error(&request.command)
         )));
     }
 
@@ -906,12 +1301,12 @@ fn run_controlled_child(
             let (stderr, stderr_truncated) = join_pipe_reader(stderr_reader)?;
             return Err(PluginError::CommandFailed(format!(
                 "command `{}` timed out after {} ms; process was terminated; stdout{}: {}; stderr{}: {}",
-                request.command,
+                sanitize_plugin_error(&request.command),
                 request.timeout.as_millis(),
                 truncated_suffix(stdout_truncated),
-                String::from_utf8_lossy(&stdout).trim(),
+                sanitize_plugin_error(String::from_utf8_lossy(&stdout).trim()),
                 truncated_suffix(stderr_truncated),
-                String::from_utf8_lossy(&stderr).trim()
+                sanitize_plugin_error(String::from_utf8_lossy(&stderr).trim())
             )));
         }
         thread::sleep(Duration::from_millis(PLUGIN_CHILD_POLL_MS));
@@ -934,7 +1329,7 @@ fn linux_plugin_sandbox_command(request: &ControlledChildRequest) -> Result<Comm
     if !Path::new(SYSTEMD_RUN).is_file() {
         return Err(PluginError::CommandFailed(format!(
             "external plugin subprocess `{}` was refused: required Linux sandbox launcher {SYSTEMD_RUN} is unavailable",
-            request.command
+            sanitize_plugin_error(&request.command)
         )));
     }
 
@@ -1009,7 +1404,7 @@ fn append_systemd_environment(
 fn linux_plugin_sandbox_command(request: &ControlledChildRequest) -> Result<Command, PluginError> {
     Err(PluginError::CommandFailed(format!(
         "external plugin subprocess `{}` was refused: FR-2.13 requires the Linux/systemd sandbox available on Kylin Advanced Server OS",
-        request.command
+        sanitize_plugin_error(&request.command)
     )))
 }
 
@@ -1185,6 +1580,20 @@ fn validate_json_schema_value(
     }
 
     if let Some(text) = value.as_str() {
+        if let Some(min_length) = schema_object.get("minLength").and_then(Value::as_u64) {
+            if text.chars().count() < min_length as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} is shorter than minLength {min_length}"
+                )));
+            }
+        }
+        if let Some(max_length) = schema_object.get("maxLength").and_then(Value::as_u64) {
+            if text.chars().count() > max_length as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} exceeds maxLength {max_length}"
+                )));
+            }
+        }
         if let Some(pattern) = schema_object.get("pattern").and_then(Value::as_str) {
             if !json_schema_pattern_matches(pattern, text) {
                 return Err(PluginError::CommandFailed(format!(
@@ -1195,6 +1604,20 @@ fn validate_json_schema_value(
     }
 
     if let Some(array) = value.as_array() {
+        if let Some(min_items) = schema_object.get("minItems").and_then(Value::as_u64) {
+            if array.len() < min_items as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} has fewer than minItems {min_items}"
+                )));
+            }
+        }
+        if let Some(max_items) = schema_object.get("maxItems").and_then(Value::as_u64) {
+            if array.len() > max_items as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} exceeds maxItems {max_items}"
+                )));
+            }
+        }
         if let Some(item_schema) = schema_object.get("items") {
             for (index, item) in array.iter().enumerate() {
                 validate_json_schema_value(item_schema, item, &format!("{location}[{index}]"))?;
@@ -1203,6 +1626,20 @@ fn validate_json_schema_value(
     }
 
     if let Some(value_object) = value.as_object() {
+        if let Some(min_properties) = schema_object.get("minProperties").and_then(Value::as_u64) {
+            if value_object.len() < min_properties as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} has fewer than minProperties {min_properties}"
+                )));
+            }
+        }
+        if let Some(max_properties) = schema_object.get("maxProperties").and_then(Value::as_u64) {
+            if value_object.len() > max_properties as usize {
+                return Err(PluginError::CommandFailed(format!(
+                    "{location} exceeds maxProperties {max_properties}"
+                )));
+            }
+        }
         if let Some(required) = schema_object.get("required").and_then(Value::as_array) {
             for field in required.iter().filter_map(Value::as_str) {
                 if !value_object.contains_key(field) {
@@ -1283,11 +1720,19 @@ struct BuiltinOpsCommand {
     mutating: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinOpsRecovery {
+    Deterministic(&'static str),
+    Irreversible(&'static str),
+    None,
+}
+
 fn execute_builtin_ops_tool(
     plugin_id: &str,
     tool_name: &str,
     permission: PluginToolPermission,
     input: &Value,
+    context: Option<&PluginToolExecutionContext>,
 ) -> Result<Value, PluginError> {
     let plugin_name = plugin_id.split('@').next().unwrap_or(plugin_id);
     let action = input
@@ -1300,7 +1745,20 @@ fn execute_builtin_ops_tool(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if action == "rollback" {
-        return execute_builtin_ops_rollback(plugin_id, tool_name, permission, input, confirmed);
+        let id = input
+            .get("checkpointId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_ops_input("rollback requires checkpointId"))?;
+        let plan = serde_json::json!([{ "step": "rollback", "checkpointId": id }]);
+        let authorized =
+            builtin_ops_context_authorized(plugin_id, tool_name, input, &plan, context);
+        return execute_builtin_ops_rollback(plugin_id, tool_name, permission, input, authorized);
+    }
+    if plugin_name == "log_analyzer" && is_log_alert_state_action(action) {
+        return execute_log_alert_state_action(plugin_id, tool_name, permission, input, context);
+    }
+    if plugin_name == "cron_manager" && matches!(action, "create" | "modify" | "delete") {
+        return execute_cron_file_action(plugin_id, tool_name, permission, input, context);
     }
     let command = build_builtin_ops_command(plugin_name, action, input)?;
     let target = input.get("target").cloned().unwrap_or(Value::Null);
@@ -1309,24 +1767,62 @@ fn execute_builtin_ops_tool(
         "args": command.args,
         "shell": false
     });
+    let plan = serde_json::json!([{ "step": "execute", "command": command_json.clone(), "target": target.clone() }]);
+    let authorized = builtin_ops_context_authorized(plugin_id, tool_name, input, &plan, context);
+    let recovery = builtin_ops_recovery(plugin_name, action);
 
-    if command.mutating && !confirmed {
+    if command.mutating && !dry_run && !authorized {
         return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": false,
             "status": "requires_confirmation",
             "mode": "apply",
             "plugin": plugin_id,
             "tool": tool_name,
             "permission": permission.as_str(),
             "dryRun": dry_run,
-            "confirmed": false,
-            "audit": { "mutationPerformed": false, "reason": "confirm=true is required before any mutation" },
-            "plan": [{ "step": "execute", "command": command_json, "target": target }],
-            "rollback": { "available": rollback_action(plugin_name, action).is_some(), "performed": false }
+            "confirmed": confirmed,
+            "confirmation": { "required": true, "level": "L3", "satisfied": false, "trustedAuthorization": false },
+            "audit": { "mutationPerformed": false, "reason": "trusted runtime authorization is required before any mutation" },
+            "plan": plan,
+            "error": {
+                "kind": "confirmation_required",
+                "message": "trusted runtime L3 authorization is required before any mutation"
+            },
+            "rollback": {
+                "available": matches!(recovery, BuiltinOpsRecovery::Deterministic(_)),
+                "performed": false,
+                "irreversible": matches!(recovery, BuiltinOpsRecovery::Irreversible(_))
+            }
         }));
     }
 
+    let missing_program = missing_builtin_command(&command);
     if dry_run {
+        if let Some(missing_program) = missing_program {
+            return Ok(builtin_ops_unsupported_result(
+                BuiltinOpsUnsupportedRequest {
+                    plugin_id,
+                    tool_name,
+                    permission,
+                    command: &command,
+                    missing_program: &missing_program,
+                    command_json,
+                    target,
+                    mode: if command.mutating { "apply" } else { "inspect" },
+                    step: "execute",
+                    checkpoint_id: None,
+                    dry_run: Some(true),
+                    confirmed,
+                    trusted_authorized: authorized,
+                    rollback_available: matches!(recovery, BuiltinOpsRecovery::Deterministic(_)),
+                    irreversible: matches!(recovery, BuiltinOpsRecovery::Irreversible(_)),
+                },
+            ));
+        }
         return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": true,
             "status": "dry_run",
             "mode": if command.mutating { "apply" } else { "inspect" },
             "plugin": plugin_id,
@@ -1334,27 +1830,60 @@ fn execute_builtin_ops_tool(
             "permission": permission.as_str(),
             "dryRun": true,
             "confirmed": confirmed,
-            "audit": { "mutationPerformed": false, "reason": "validated fixed argv; dry-run does not spawn a process" },
-            "plan": [{ "step": "execute", "command": command_json, "target": target }],
-            "rollback": { "available": rollback_action(plugin_name, action).is_some(), "performed": false }
+            "confirmation": { "required": command.mutating, "level": if command.mutating { "L3" } else { "none" }, "satisfied": !command.mutating || authorized, "trustedAuthorization": authorized },
+            "audit": { "mutationPerformed": false, "reason": "validated fixed argv and executable availability; dry-run does not spawn a process" },
+            "plan": plan,
+            "error": null,
+            "rollback": {
+                "available": matches!(recovery, BuiltinOpsRecovery::Deterministic(_)),
+                "performed": false,
+                "irreversible": matches!(recovery, BuiltinOpsRecovery::Irreversible(_))
+            }
         }));
     }
 
+    if let Some(missing_program) = missing_program {
+        return Ok(builtin_ops_unsupported_result(
+            BuiltinOpsUnsupportedRequest {
+                plugin_id,
+                tool_name,
+                permission,
+                command: &command,
+                missing_program: &missing_program,
+                command_json,
+                target,
+                mode: if command.mutating { "apply" } else { "inspect" },
+                step: "execute",
+                checkpoint_id: None,
+                dry_run: Some(false),
+                confirmed,
+                trusted_authorized: authorized,
+                rollback_available: false,
+                irreversible: matches!(recovery, BuiltinOpsRecovery::Irreversible(_)),
+            },
+        ));
+    }
+
     let checkpoint = if command.mutating {
-        let rollback = rollback_action(plugin_name, action).ok_or_else(|| {
-            PluginError::CommandFailed(format!(
-                "{plugin_name} action `{action}` was refused because no deterministic rollback is available"
-            ))
-        })?;
-        Some(write_builtin_ops_checkpoint(
-            plugin_id, tool_name, action, input, rollback,
-        )?)
+        match recovery {
+            BuiltinOpsRecovery::Deterministic(rollback) => Some(write_builtin_ops_checkpoint(
+                plugin_id, tool_name, action, input, rollback,
+            )?),
+            BuiltinOpsRecovery::Irreversible(_) => None,
+            BuiltinOpsRecovery::None => {
+                return Err(PluginError::CommandFailed(format!(
+                    "{plugin_name} action `{action}` was refused because no recovery policy is declared"
+                )))
+            }
+        }
     } else {
         None
     };
     let output = run_fixed_builtin_command(&command)?;
     let success = output.status.success();
     Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": success,
         "status": if success { "ok" } else { "command_failed" },
         "mode": if command.mutating { "apply" } else { "inspect" },
         "plugin": plugin_id,
@@ -1362,6 +1891,7 @@ fn execute_builtin_ops_tool(
         "permission": permission.as_str(),
         "dryRun": false,
         "confirmed": confirmed,
+        "confirmation": { "required": command.mutating, "level": if command.mutating { "L3" } else { "none" }, "satisfied": !command.mutating || authorized, "trustedAuthorization": authorized },
         "audit": {
             "mutationPerformed": command.mutating && success,
             "program": command.program,
@@ -1374,12 +1904,468 @@ fn execute_builtin_ops_tool(
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr)
         },
+        "error": if success {
+            Value::Null
+        } else {
+            serde_json::json!({
+                "kind": "command_failed",
+                "message": "fixed command exited with non-zero status"
+            })
+        },
         "rollback": {
             "available": checkpoint.is_some(),
             "checkpoint": checkpoint,
-            "performed": false
+            "performed": false,
+            "irreversible": matches!(recovery, BuiltinOpsRecovery::Irreversible(_))
         }
     }))
+}
+
+struct BuiltinOpsUnsupportedRequest<'a> {
+    plugin_id: &'a str,
+    tool_name: &'a str,
+    permission: PluginToolPermission,
+    command: &'a BuiltinOpsCommand,
+    missing_program: &'a str,
+    command_json: Value,
+    target: Value,
+    mode: &'a str,
+    step: &'a str,
+    checkpoint_id: Option<&'a str>,
+    dry_run: Option<bool>,
+    confirmed: bool,
+    trusted_authorized: bool,
+    rollback_available: bool,
+    irreversible: bool,
+}
+
+fn builtin_ops_unsupported_result(request: BuiltinOpsUnsupportedRequest<'_>) -> Value {
+    let mut plan = serde_json::json!({
+        "step": request.step,
+        "command": request.command_json,
+        "target": request.target
+    });
+    if let Some(checkpoint_id) = request.checkpoint_id {
+        plan["checkpointId"] = Value::String(checkpoint_id.to_string());
+    }
+    let mut value = serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": false,
+        "status": "unsupported",
+        "mode": request.mode,
+        "plugin": request.plugin_id,
+        "tool": request.tool_name,
+        "permission": request.permission.as_str(),
+        "confirmed": request.confirmed,
+        "confirmation": {
+            "required": request.command.mutating,
+            "level": if request.command.mutating { "L3" } else { "none" },
+            "satisfied": !request.command.mutating || request.trusted_authorized,
+            "trustedAuthorization": request.trusted_authorized
+        },
+        "audit": {
+            "mutationPerformed": false,
+            "program": request.command.program,
+            "reason": "required Kylin/Linux executable is unavailable"
+        },
+        "plan": [plan],
+        "error": {
+            "kind": "unsupported",
+            "message": format!("required Kylin/Linux executable `{}` is unavailable", request.missing_program)
+        },
+        "rollback": {
+            "available": request.rollback_available,
+            "performed": false,
+            "irreversible": request.irreversible
+        }
+    });
+    if let Some(dry_run) = request.dry_run {
+        value["dryRun"] = Value::Bool(dry_run);
+    }
+    value
+}
+
+fn is_log_alert_state_action(action: &str) -> bool {
+    matches!(
+        action,
+        "alert_list" | "alert_validate" | "alert_create" | "alert_update" | "alert_delete"
+    )
+}
+
+fn execute_log_alert_state_action(
+    plugin_id: &str,
+    tool_name: &str,
+    permission: PluginToolPermission,
+    input: &Value,
+    context: Option<&PluginToolExecutionContext>,
+) -> Result<Value, PluginError> {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("alert_list");
+    let dry_run = input.get("dryRun").and_then(Value::as_bool).unwrap_or(true);
+    let confirmed = input
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let command = build_builtin_ops_command("log_analyzer", action, input)?;
+    let target = input.get("target").cloned().unwrap_or(Value::Null);
+    let command_json = serde_json::json!({
+        "program": "builtin:log-alert-rules",
+        "args": command.args,
+        "shell": false
+    });
+    let plan = serde_json::json!([{ "step": "execute", "command": command_json.clone(), "target": target.clone() }]);
+    let recovery = builtin_ops_recovery("log_analyzer", action);
+    let authorized = builtin_ops_context_authorized(plugin_id, tool_name, input, &plan, context);
+    let mutating = matches!(action, "alert_create" | "alert_update" | "alert_delete");
+    if mutating && !dry_run && !authorized {
+        return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": false,
+            "status": "requires_confirmation",
+            "mode": "apply",
+            "plugin": plugin_id,
+            "tool": tool_name,
+            "permission": permission.as_str(),
+            "dryRun": dry_run,
+            "confirmed": confirmed,
+            "confirmation": { "required": true, "level": "L3", "satisfied": false, "trustedAuthorization": false },
+            "audit": { "mutationPerformed": false, "reason": "trusted runtime authorization is required before log alert rule mutation" },
+            "plan": plan,
+            "error": { "kind": "confirmation_required", "message": "trusted runtime L3 authorization is required before log alert rule mutation" },
+            "rollback": { "available": matches!(recovery, BuiltinOpsRecovery::Deterministic(_)), "performed": false, "irreversible": false }
+        }));
+    }
+    if dry_run {
+        return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": true,
+            "status": "dry_run",
+            "mode": if mutating { "apply" } else { "inspect" },
+            "plugin": plugin_id,
+            "tool": tool_name,
+            "permission": permission.as_str(),
+            "dryRun": true,
+            "confirmed": confirmed,
+            "confirmation": { "required": mutating, "level": if mutating { "L3" } else { "none" }, "satisfied": !mutating || authorized, "trustedAuthorization": authorized },
+            "audit": { "mutationPerformed": false, "reason": "validated bounded log alert rule operation; dry-run does not mutate files" },
+            "plan": plan,
+            "error": null,
+            "rollback": { "available": matches!(recovery, BuiltinOpsRecovery::Deterministic(_)), "performed": false, "irreversible": false }
+        }));
+    }
+
+    let checkpoint = if mutating {
+        match recovery {
+            BuiltinOpsRecovery::Deterministic(rollback) => Some(write_builtin_ops_checkpoint(
+                plugin_id, tool_name, action, input, rollback,
+            )?),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let rule_path = log_alert_rule_file(input)?;
+    let result = match action {
+        "alert_list" => {
+            let root = log_alert_rule_root()?;
+            let mut rules = Vec::new();
+            if root.exists() {
+                for entry in fs::read_dir(root)?.take(128) {
+                    let entry = entry?;
+                    if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                        rules.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+            }
+            serde_json::json!({ "rules": rules })
+        }
+        "alert_validate" => {
+            let bytes = fs::read(&rule_path)?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| invalid_ops_input(&format!("invalid alert rule JSON: {error}")))?;
+            serde_json::json!({ "valid": true, "rule": value })
+        }
+        "alert_create" => {
+            if rule_path.exists() {
+                return Err(invalid_ops_input("alert rule already exists"));
+            }
+            let rule = validate_log_alert_rule_document(input)?;
+            atomic_write_ops_file(&rule_path, serde_json::to_vec_pretty(&rule)?.as_slice())?;
+            serde_json::json!({ "path": rule_path, "created": true })
+        }
+        "alert_update" => {
+            if !rule_path.exists() {
+                return Err(invalid_ops_input("alert rule does not exist"));
+            }
+            let rule = validate_log_alert_rule_document(input)?;
+            atomic_write_ops_file(&rule_path, serde_json::to_vec_pretty(&rule)?.as_slice())?;
+            serde_json::json!({ "path": rule_path, "updated": true })
+        }
+        "alert_delete" => {
+            remove_ops_file(&rule_path)?;
+            serde_json::json!({ "path": rule_path, "deleted": true })
+        }
+        _ => return Err(unsupported_ops_action("log_analyzer", action)),
+    };
+    Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": true,
+        "status": "ok",
+        "mode": if mutating { "apply" } else { "inspect" },
+        "plugin": plugin_id,
+        "tool": tool_name,
+        "permission": permission.as_str(),
+        "dryRun": false,
+        "confirmed": confirmed,
+        "confirmation": { "required": mutating, "level": if mutating { "L3" } else { "none" }, "satisfied": !mutating || authorized, "trustedAuthorization": authorized },
+        "audit": { "mutationPerformed": mutating, "program": "builtin:log-alert-rules", "stdoutTruncated": false, "stderrTruncated": false },
+        "plan": [{ "step": "execute", "command": command_json, "target": target }],
+        "result": { "stdout": result.to_string(), "stderr": "" },
+        "error": null,
+        "rollback": { "available": checkpoint.is_some(), "checkpoint": checkpoint, "performed": false, "irreversible": false }
+    }))
+}
+
+fn execute_cron_file_action(
+    plugin_id: &str,
+    tool_name: &str,
+    permission: PluginToolPermission,
+    input: &Value,
+    context: Option<&PluginToolExecutionContext>,
+) -> Result<Value, PluginError> {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("create");
+    let dry_run = input.get("dryRun").and_then(Value::as_bool).unwrap_or(true);
+    let confirmed = input
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let command = build_builtin_ops_command("cron_manager", action, input)?;
+    let target = input
+        .get("target")
+        .or_else(|| input.get("unit"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let command_json = serde_json::json!({
+        "program": command.program,
+        "args": command.args,
+        "shell": false
+    });
+    let plan = serde_json::json!([{ "step": "execute", "command": command_json.clone(), "target": target.clone() }]);
+    let authorized = builtin_ops_context_authorized(plugin_id, tool_name, input, &plan, context);
+    let recovery = builtin_ops_recovery("cron_manager", action);
+    if !dry_run && !authorized {
+        return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": false,
+            "status": "requires_confirmation",
+            "mode": "apply",
+            "plugin": plugin_id,
+            "tool": tool_name,
+            "permission": permission.as_str(),
+            "dryRun": dry_run,
+            "confirmed": confirmed,
+            "confirmation": { "required": true, "level": "L3", "satisfied": false, "trustedAuthorization": false },
+            "audit": { "mutationPerformed": false, "reason": "trusted runtime authorization is required before cron mutation" },
+            "plan": plan,
+            "error": { "kind": "confirmation_required", "message": "trusted runtime L3 authorization is required before cron mutation" },
+            "rollback": { "available": true, "performed": false, "irreversible": false }
+        }));
+    }
+    let timer_path = cron_timer_file(input)?;
+    let timer_contents = if matches!(action, "create" | "modify") {
+        Some(cron_timer_contents(input)?)
+    } else {
+        None
+    };
+    if let Some(missing_program) = missing_builtin_command(&command) {
+        return Ok(builtin_ops_unsupported_result(
+            BuiltinOpsUnsupportedRequest {
+                plugin_id,
+                tool_name,
+                permission,
+                command: &command,
+                missing_program: &missing_program,
+                command_json,
+                target,
+                mode: "apply",
+                step: "execute",
+                checkpoint_id: None,
+                dry_run: Some(dry_run),
+                confirmed,
+                trusted_authorized: authorized,
+                rollback_available: matches!(recovery, BuiltinOpsRecovery::Deterministic(_)),
+                irreversible: false,
+            },
+        ));
+    }
+    if dry_run {
+        return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": true,
+            "status": "dry_run",
+            "mode": "apply",
+            "plugin": plugin_id,
+            "tool": tool_name,
+            "permission": permission.as_str(),
+            "dryRun": true,
+            "confirmed": confirmed,
+            "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
+            "audit": { "mutationPerformed": false, "reason": "validated systemd timer file mutation; dry-run does not write files" },
+            "plan": plan,
+            "error": null,
+            "rollback": { "available": true, "performed": false, "irreversible": false }
+        }));
+    }
+    let checkpoint = match recovery {
+        BuiltinOpsRecovery::Deterministic(rollback) => Some(write_builtin_ops_checkpoint(
+            plugin_id, tool_name, action, input, rollback,
+        )?),
+        _ => None,
+    };
+    let previous_timer = match fs::read(&timer_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(PluginError::Io(error)),
+    };
+    match action {
+        "create" => {
+            if timer_path.exists() {
+                return Err(invalid_ops_input("timer unit already exists"));
+            }
+            atomic_write_ops_file(&timer_path, timer_contents.as_deref().expect("contents"))?;
+        }
+        "modify" => {
+            if !timer_path.exists() {
+                return Err(invalid_ops_input("timer unit does not exist"));
+            }
+            atomic_write_ops_file(&timer_path, timer_contents.as_deref().expect("contents"))?;
+        }
+        "delete" => {
+            remove_ops_file(&timer_path)?;
+        }
+        _ => return Err(unsupported_ops_action("cron_manager", action)),
+    }
+    let output = run_fixed_builtin_command(&command)?;
+    let success = output.status.success();
+    let mut recovery_error = None;
+    if !success {
+        let restore_result = match previous_timer {
+            Some(bytes) => atomic_write_ops_file(&timer_path, &bytes),
+            None => remove_ops_file(&timer_path),
+        }
+        .and_then(|()| {
+            run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/systemctl",
+                vec!["daemon-reload".into()],
+                true,
+            ))
+            .map(|_| ())
+        });
+        if let Err(error) = restore_result {
+            recovery_error = Some(error.to_string());
+        }
+    }
+    Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": success,
+        "status": if success { "ok" } else { "command_failed" },
+        "mode": "apply",
+        "plugin": plugin_id,
+        "tool": tool_name,
+        "permission": permission.as_str(),
+        "dryRun": false,
+        "confirmed": confirmed,
+        "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
+        "audit": { "mutationPerformed": true, "program": command.program, "exitCode": output.status.code(), "stdoutTruncated": output.stdout_truncated, "stderrTruncated": output.stderr_truncated, "rollbackAttemptedOnFailure": !success, "rollbackError": recovery_error },
+        "plan": [{ "step": "execute", "command": command_json, "target": target }],
+        "result": { "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr) },
+        "error": if success { Value::Null } else { serde_json::json!({ "kind": "command_failed", "message": "systemctl daemon-reload failed" }) },
+        "rollback": { "available": checkpoint.is_some(), "checkpoint": checkpoint, "performed": false, "irreversible": false }
+    }))
+}
+
+fn prepare_builtin_ops_authorization_request(
+    plugin_id: &str,
+    tool_name: &str,
+    input: &Value,
+) -> Result<Option<PluginToolAuthorizationRequest>, PluginError> {
+    let plugin_name = plugin_id.split('@').next().unwrap_or(plugin_id);
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("inspect");
+    let dry_run = input.get("dryRun").and_then(Value::as_bool).unwrap_or(true);
+    if action != "rollback" && dry_run {
+        return Ok(None);
+    }
+    let plan = if action == "rollback" {
+        let id = input
+            .get("checkpointId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_ops_input("rollback requires checkpointId"))?;
+        serde_json::json!([{ "step": "rollback", "checkpointId": id }])
+    } else {
+        let command = build_builtin_ops_command(plugin_name, action, input)?;
+        if !command.mutating {
+            return Ok(None);
+        }
+        let program = if plugin_name == "log_analyzer" && is_log_alert_state_action(action) {
+            "builtin:log-alert-rules"
+        } else {
+            command.program
+        };
+        let target = input.get("target").cloned().unwrap_or(Value::Null);
+        serde_json::json!([{
+            "step": "execute",
+            "command": {
+                "program": program,
+                "args": command.args,
+                "shell": false
+            },
+            "target": target
+        }])
+    };
+    Ok(Some(PluginToolAuthorizationRequest {
+        plugin_id: plugin_id.to_string(),
+        tool_name: tool_name.to_string(),
+        input_hash: canonical_value_hash(input),
+        plan_hash: canonical_value_hash(&plan),
+        plan,
+        reason: "built-in operations mutation requires trusted L3 human authorization".to_string(),
+    }))
+}
+
+fn builtin_ops_context_authorized(
+    plugin_id: &str,
+    tool_name: &str,
+    input: &Value,
+    plan: &Value,
+    context: Option<&PluginToolExecutionContext>,
+) -> bool {
+    let Some(authorization) =
+        context.and_then(|context| context.builtin_ops_authorization.as_ref())
+    else {
+        return false;
+    };
+    authorization.matches_and_consume(
+        plugin_id,
+        tool_name,
+        &canonical_value_hash(input),
+        &canonical_value_hash(plan),
+    )
+}
+
+fn canonical_value_hash(value: &Value) -> String {
+    let mut encoded = String::new();
+    write_canonical_json(value, &mut encoded);
+    let mut hasher = Sha256::new();
+    hasher.update(encoded.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn build_builtin_ops_command(
@@ -1390,11 +2376,26 @@ fn build_builtin_ops_command(
     let target = input.get("target").and_then(Value::as_str);
     let command = match plugin {
         "disk_cleaner" => {
-            require_action(action, &["inspect", "plan"])?;
+            require_action(
+                action,
+                &[
+                    "inspect",
+                    "plan",
+                    "archive_logs",
+                    "clean_temp",
+                    "clean_package_cache",
+                    "remove_archive",
+                ],
+            )?;
             let root = target.unwrap_or("/tmp");
             if !matches!(
                 root,
-                "/tmp" | "/var/tmp" | "/var/cache/dnf" | "/var/log/journal"
+                "/tmp"
+                    | "/var/tmp"
+                    | "/var/cache/dnf"
+                    | "/var/cache/yum"
+                    | "/var/log"
+                    | "/var/log/journal"
             ) {
                 return Err(invalid_ops_input(
                     "disk target is not in the Kylin cleanup allowlist",
@@ -1407,20 +2408,67 @@ fn build_builtin_ops_command(
             if !(1..=365).contains(&days) {
                 return Err(invalid_ops_input("olderThanDays must be between 1 and 365"));
             }
-            fixed_command(
-                "/usr/bin/find",
-                [root, "-xdev", "-type", "f", "-mtime"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .chain([format!("+{days}"), "-print".to_string()])
-                    .collect(),
-                false,
-            )
+            match action {
+                "inspect" | "plan" => fixed_command(
+                    "/usr/bin/find",
+                    [root, "-xdev", "-type", "f", "-mtime"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain([format!("+{days}"), "-print".to_string()])
+                        .collect(),
+                    false,
+                ),
+                "archive_logs" => {
+                    if !matches!(root, "/var/log" | "/var/log/journal") {
+                        return Err(invalid_ops_input(
+                            "archive_logs is limited to /var/log or /var/log/journal",
+                        ));
+                    }
+                    let destination = input
+                        .get("destination")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid_ops_input("archive_logs requires destination"))?;
+                    fixed_command(
+                        "/usr/bin/tar",
+                        vec![
+                            "--create".into(),
+                            "--file".into(),
+                            validate_workspace_path(destination, true)?,
+                            "--".into(),
+                            root.to_string(),
+                        ],
+                        true,
+                    )
+                }
+                "clean_temp" | "clean_package_cache" => fixed_command(
+                    "/usr/bin/find",
+                    [root, "-xdev", "-type", "f", "-mtime"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain([format!("+{days}"), "-delete".to_string()])
+                        .collect(),
+                    true,
+                ),
+                "remove_archive" => {
+                    let destination = input
+                        .get("destination")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            invalid_ops_input("archive rollback requires destination")
+                        })?;
+                    fixed_command(
+                        "/usr/bin/rm",
+                        vec!["--".into(), validate_workspace_path(destination, false)?],
+                        true,
+                    )
+                }
+                _ => return Err(unsupported_ops_action(plugin, action)),
+            }
         }
         "service_manager" => {
             let unit = validate_systemd_unit(require_target(target)?, ".service")?;
             match action {
-                "inspect" | "plan" => fixed_command(
+                "inspect" | "plan" | "status" => fixed_command(
                     "/usr/bin/systemctl",
                     vec![
                         "show".into(),
@@ -1431,11 +2479,34 @@ fn build_builtin_ops_command(
                     ],
                     false,
                 ),
+                "log" => fixed_command(
+                    "/usr/bin/journalctl",
+                    vec![
+                        "--no-pager".into(),
+                        "--output=short-iso".into(),
+                        "--lines=200".into(),
+                        format!("--unit={unit}"),
+                    ],
+                    false,
+                ),
                 "start" | "stop" | "restart" => fixed_command(
                     "/usr/bin/systemctl",
                     vec![action.into(), "--".into(), unit],
                     true,
                 ),
+                "restore_service_state" => {
+                    let old_active = require_string_field(input, "oldActiveState")?;
+                    let restore_action = if old_active == "active" {
+                        "start"
+                    } else {
+                        "stop"
+                    };
+                    fixed_command(
+                        "/usr/bin/systemctl",
+                        vec![restore_action.into(), "--".into(), unit],
+                        true,
+                    )
+                }
                 _ => return Err(unsupported_ops_action(plugin, action)),
             }
         }
@@ -1445,13 +2516,134 @@ fn build_builtin_ops_command(
                 "inspect" | "plan" => {
                     fixed_command("/usr/bin/getent", vec!["passwd".into(), user], false)
                 }
+                "permissions" => fixed_command("/usr/bin/id", vec!["--".into(), user], false),
+                "sessions" => fixed_command(
+                    "/usr/bin/loginctl",
+                    vec!["user-status".into(), "--".into(), user],
+                    false,
+                ),
+                "terminate_session" => fixed_command(
+                    "/usr/bin/loginctl",
+                    vec!["terminate-user".into(), "--".into(), user],
+                    true,
+                ),
+                "password_policy" => {
+                    fixed_command("/usr/bin/chage", vec!["--list".into(), user], false)
+                }
+                "set_password_policy" => fixed_command(
+                    "/usr/bin/chage",
+                    vec![
+                        "-M".into(),
+                        validate_policy_day(input, "maxDays", 1, 99999)?,
+                        "-m".into(),
+                        validate_policy_day(input, "minDays", 0, 99999)?,
+                        "-W".into(),
+                        validate_policy_day(input, "warnDays", 0, 999)?,
+                        user,
+                    ],
+                    true,
+                ),
+                "create" => fixed_command("/usr/sbin/useradd", vec!["--".into(), user], true),
+                "delete" => fixed_command("/usr/sbin/userdel", vec!["--".into(), user], true),
                 "lock" => fixed_command("/usr/sbin/usermod", vec!["--lock".into(), user], true),
                 "unlock" => fixed_command("/usr/sbin/usermod", vec!["--unlock".into(), user], true),
+                "modify_permissions" => fixed_command(
+                    "/usr/sbin/usermod",
+                    vec![
+                        "--append".into(),
+                        "--groups".into(),
+                        validate_account_name(
+                            input
+                                .get("group")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| invalid_ops_input("group is required"))?,
+                        )?,
+                        "--".into(),
+                        user,
+                    ],
+                    true,
+                ),
+                "restore_permissions" => fixed_command(
+                    "/usr/sbin/usermod",
+                    vec![
+                        "--groups".into(),
+                        require_string_field(input, "oldGroups")?,
+                        "--".into(),
+                        user,
+                    ],
+                    true,
+                ),
+                "restore_password_policy" => fixed_command(
+                    "/usr/bin/chage",
+                    vec![
+                        "-M".into(),
+                        require_string_field(input, "oldMaxDays")?,
+                        "-m".into(),
+                        require_string_field(input, "oldMinDays")?,
+                        "-W".into(),
+                        require_string_field(input, "oldWarnDays")?,
+                        user,
+                    ],
+                    true,
+                ),
                 _ => return Err(unsupported_ops_action(plugin, action)),
             }
         }
         "log_analyzer" => {
-            require_action(action, &["inspect", "plan"])?;
+            require_action(
+                action,
+                &[
+                    "inspect",
+                    "plan",
+                    "search",
+                    "pattern",
+                    "alert",
+                    "alert_list",
+                    "alert_validate",
+                    "alert_create",
+                    "alert_update",
+                    "alert_delete",
+                    "restore_alert_rule",
+                ],
+            )?;
+            if matches!(
+                action,
+                "alert_list"
+                    | "alert_validate"
+                    | "alert_create"
+                    | "alert_update"
+                    | "alert_delete"
+                    | "restore_alert_rule"
+            ) {
+                let rule_path =
+                    validate_log_alert_rule_path(input, !matches!(action, "alert_delete"))?;
+                return Ok(match action {
+                    "alert_list" => fixed_command(
+                        "/usr/bin/find",
+                        vec![
+                            log_alert_rule_root()?.display().to_string(),
+                            "-maxdepth".into(),
+                            "1".into(),
+                            "-type".into(),
+                            "f".into(),
+                            "-name".into(),
+                            "*.json".into(),
+                            "-print".into(),
+                        ],
+                        false,
+                    ),
+                    "alert_validate" => {
+                        fixed_command("/usr/bin/test", vec!["-f".into(), rule_path], false)
+                    }
+                    "alert_create" | "alert_update" => {
+                        fixed_command("/usr/bin/true", vec![rule_path], true)
+                    }
+                    "alert_delete" | "restore_alert_rule" => {
+                        fixed_command("/usr/bin/true", vec![rule_path], true)
+                    }
+                    _ => unreachable!("alert action matched above"),
+                });
+            }
             let limit = input
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -1468,6 +2660,12 @@ fn build_builtin_ops_command(
                     validate_systemd_unit(unit, ".service")?
                 ));
             }
+            if matches!(action, "search" | "pattern" | "alert") {
+                args.push(format!("--grep={}", validate_log_pattern(input)?));
+            }
+            if action == "alert" {
+                args.push("--priority=warning..alert".into());
+            }
             fixed_command("/usr/bin/journalctl", args, false)
         }
         "package_manager" => {
@@ -1478,29 +2676,118 @@ fn build_builtin_ops_command(
                     vec!["--query".into(), "--".into(), package],
                     false,
                 ),
-                "install" | "remove" => fixed_command(
+                "install" | "remove" | "update" => fixed_command(
                     "/usr/bin/dnf",
                     vec!["--assumeyes".into(), action.into(), "--".into(), package],
                     true,
                 ),
+                "restore_package_state" => {
+                    let old_installed = input
+                        .get("oldInstalled")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| invalid_ops_input("checkpoint missing package state"))?;
+                    if old_installed {
+                        fixed_command(
+                            "/usr/bin/dnf",
+                            vec!["--assumeyes".into(), "install".into(), "--".into(), package],
+                            true,
+                        )
+                    } else {
+                        fixed_command(
+                            "/usr/bin/dnf",
+                            vec!["--assumeyes".into(), "remove".into(), "--".into(), package],
+                            true,
+                        )
+                    }
+                }
+                "deps" | "dependencies" => fixed_command(
+                    "/usr/bin/dnf",
+                    vec![
+                        "repoquery".into(),
+                        "--requires".into(),
+                        "--resolve".into(),
+                        "--".into(),
+                        package,
+                    ],
+                    false,
+                ),
                 _ => return Err(unsupported_ops_action(plugin, action)),
             }
         }
-        "firewall_manager" => {
-            require_action(action, &["inspect", "plan"])?;
-            fixed_command(
+        "firewall_manager" => match action {
+            "inspect" | "plan" | "list" => fixed_command(
                 "/usr/sbin/nft",
                 vec!["--json".into(), "list".into(), "ruleset".into()],
                 false,
-            )
-        }
+            ),
+            "add_rule" => fixed_command(
+                "/usr/sbin/nft",
+                vec![
+                    "add".into(),
+                    "rule".into(),
+                    "inet".into(),
+                    "filter".into(),
+                    "input".into(),
+                    validate_firewall_protocol(input)?,
+                    "dport".into(),
+                    validate_port(input)?,
+                    "accept".into(),
+                ],
+                true,
+            ),
+            "update_rule" => fixed_command(
+                "/usr/sbin/nft",
+                vec![
+                    "replace".into(),
+                    "rule".into(),
+                    "inet".into(),
+                    "filter".into(),
+                    "input".into(),
+                    "handle".into(),
+                    validate_firewall_handle(input)?,
+                    validate_firewall_protocol(input)?,
+                    "dport".into(),
+                    validate_port(input)?,
+                    "accept".into(),
+                ],
+                true,
+            ),
+            "delete_rule" => fixed_command(
+                "/usr/sbin/nft",
+                vec![
+                    "delete".into(),
+                    "rule".into(),
+                    "inet".into(),
+                    "filter".into(),
+                    "input".into(),
+                    "handle".into(),
+                    validate_firewall_handle(input)?,
+                ],
+                true,
+            ),
+            "validate_policy" => fixed_command(
+                "/usr/sbin/nft",
+                vec![
+                    "--check".into(),
+                    "--file".into(),
+                    validate_workspace_path(require_target(target)?, false)?,
+                ],
+                false,
+            ),
+            "restore_firewall_ruleset" => fixed_command(
+                "/usr/sbin/nft",
+                vec!["--file".into(), require_string_field(input, "rulesetPath")?],
+                true,
+            ),
+            _ => return Err(unsupported_ops_action(plugin, action)),
+        },
         "cron_manager" => match action {
-            "inspect" | "plan" if target.is_none() => fixed_command(
+            "inspect" | "plan" | "list" if target.is_none() => fixed_command(
                 "/usr/bin/systemctl",
                 vec!["list-timers".into(), "--all".into(), "--no-pager".into()],
                 false,
             ),
-            "inspect" | "plan" => fixed_command(
+            "inspect" | "plan" | "status" => fixed_command(
                 "/usr/bin/systemctl",
                 vec![
                     "show".into(),
@@ -1510,10 +2797,36 @@ fn build_builtin_ops_command(
                 ],
                 false,
             ),
+            "execution_records" | "log" => fixed_command(
+                "/usr/bin/journalctl",
+                vec![
+                    "--no-pager".into(),
+                    "--output=short-iso".into(),
+                    "--lines=200".into(),
+                    format!(
+                        "--unit={}",
+                        validate_systemd_unit(require_target(target)?, ".timer")?
+                    ),
+                ],
+                false,
+            ),
+            "create" | "modify" | "delete" => {
+                let _unit = validate_systemd_unit(require_target(target)?, ".timer")?;
+                fixed_command("/usr/bin/systemctl", vec!["daemon-reload".into()], true)
+            }
             "enable" | "disable" | "start" | "stop" | "restart" => fixed_command(
                 "/usr/bin/systemctl",
                 vec![
                     action.into(),
+                    "--".into(),
+                    validate_systemd_unit(require_target(target)?, ".timer")?,
+                ],
+                true,
+            ),
+            "restore_cron_state" => fixed_command(
+                "/usr/bin/systemctl",
+                vec![
+                    "daemon-reload".into(),
                     "--".into(),
                     validate_systemd_unit(require_target(target)?, ".timer")?,
                 ],
@@ -1549,12 +2862,30 @@ fn build_builtin_ops_command(
                 ],
                 false,
             ),
+            "traceroute" => fixed_command(
+                "/usr/bin/traceroute",
+                vec!["--".into(), validate_host(require_target(target)?)?],
+                false,
+            ),
+            "port_scan" => fixed_command(
+                "/usr/bin/timeout",
+                vec![
+                    "5".into(),
+                    "/usr/bin/nc".into(),
+                    "-zv".into(),
+                    "-w".into(),
+                    "2".into(),
+                    validate_host(require_target(target)?)?,
+                    validate_port(input)?,
+                ],
+                false,
+            ),
             _ => return Err(unsupported_ops_action(plugin, action)),
         },
         "backup_manager" => {
             let path = validate_workspace_path(require_target(target)?, false)?;
             match action {
-                "inspect" | "plan" => fixed_command(
+                "inspect" | "plan" | "config" => fixed_command(
                     "/usr/bin/find",
                     vec![
                         path,
@@ -1565,21 +2896,87 @@ fn build_builtin_ops_command(
                     ],
                     false,
                 ),
-                "backup" => {
+                "backup" | "snapshot" => {
                     let destination = input
                         .get("destination")
                         .and_then(Value::as_str)
                         .ok_or_else(|| invalid_ops_input("backup requires destination"))?;
                     let destination = validate_workspace_path(destination, true)?;
+                    if Path::new(&destination).exists() {
+                        return Err(invalid_ops_input(
+                            "backup destination already exists; refusing to overwrite",
+                        ));
+                    }
+                    let source = Path::new(&path);
+                    let parent = source
+                        .parent()
+                        .ok_or_else(|| invalid_ops_input("backup source requires a parent"))?;
+                    let basename = source
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| invalid_ops_input("backup source requires a file name"))?;
                     fixed_command(
                         "/usr/bin/tar",
                         vec![
                             "--create".into(),
                             "--file".into(),
                             destination,
+                            "-C".into(),
+                            parent.display().to_string(),
                             "--".into(),
-                            path,
+                            basename.to_string(),
                         ],
+                        true,
+                    )
+                }
+                "restore" => {
+                    let archive = input
+                        .get("archive")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid_ops_input("restore requires archive"))?;
+                    let target = PathBuf::from(path);
+                    let parent = target
+                        .parent()
+                        .ok_or_else(|| invalid_ops_input("restore target requires a parent"))?;
+                    let basename = target
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| invalid_ops_input("restore target requires a file name"))?;
+                    fixed_command(
+                        "/usr/bin/tar",
+                        vec![
+                            "--extract".into(),
+                            "--file".into(),
+                            validate_workspace_path(archive, false)?,
+                            "-C".into(),
+                            parent.display().to_string(),
+                            "--".into(),
+                            basename.to_string(),
+                        ],
+                        true,
+                    )
+                }
+                "restore_backup_snapshot" => fixed_command(
+                    "/usr/bin/tar",
+                    vec![
+                        "--extract".into(),
+                        "--file".into(),
+                        require_string_field(input, "preRestoreSnapshot")?,
+                        "-C".into(),
+                        require_string_field(input, "restoreParent")?,
+                        "--".into(),
+                        require_string_field(input, "restoreBasename")?,
+                    ],
+                    true,
+                ),
+                "remove_backup" => {
+                    let destination = input
+                        .get("destination")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid_ops_input("backup rollback requires destination"))?;
+                    fixed_command(
+                        "/usr/bin/rm",
+                        vec!["--".into(), validate_workspace_path(destination, false)?],
                         true,
                     )
                 }
@@ -1665,6 +3062,419 @@ fn validate_host(value: &str) -> Result<String, PluginError> {
         .ok_or_else(|| invalid_ops_input("invalid DNS host or address"))
 }
 
+fn validate_log_pattern(input: &Value) -> Result<String, PluginError> {
+    let pattern = input
+        .get("pattern")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("target").and_then(Value::as_str))
+        .ok_or_else(|| invalid_ops_input("log search requires pattern or target"))?;
+    let valid = (1..=256).contains(&pattern.len())
+        && !pattern.starts_with('-')
+        && !contains_control_character(pattern)
+        && !pattern.contains('\0');
+    valid
+        .then(|| pattern.to_string())
+        .ok_or_else(|| invalid_ops_input("invalid log search pattern"))
+}
+
+fn validate_port(input: &Value) -> Result<String, PluginError> {
+    let port = input
+        .get("port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_ops_input("port is required"))?;
+    if (1..=65_535).contains(&port) {
+        Ok(port.to_string())
+    } else {
+        Err(invalid_ops_input("port must be between 1 and 65535"))
+    }
+}
+
+fn require_string_field(input: &Value, field: &str) -> Result<String, PluginError> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 1024 && !contains_control_character(value)
+        })
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| invalid_ops_input("checkpoint field is missing or invalid"))
+}
+
+fn validate_policy_day(
+    input: &Value,
+    field: &str,
+    min: u64,
+    max: u64,
+) -> Result<String, PluginError> {
+    let value = input
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_ops_input("password policy day field is required"))?;
+    if (min..=max).contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(invalid_ops_input(
+            "password policy day field is out of range",
+        ))
+    }
+}
+
+fn log_alert_rule_root() -> Result<PathBuf, PluginError> {
+    let root = std::env::var_os("CLAW_OPS_ALERT_RULE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".claw").join("log-alerts"));
+    if root.is_absolute() {
+        validate_injected_ops_root(&root)
+    } else {
+        Ok(fs::canonicalize(std::env::current_dir()?)?.join(root))
+    }
+}
+
+fn validate_log_alert_rule_path(
+    input: &Value,
+    require_pattern: bool,
+) -> Result<String, PluginError> {
+    let id = input
+        .get("ruleId")
+        .or_else(|| input.get("target"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_ops_input("alert ruleId is required"))?;
+    let valid = (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'));
+    if !valid {
+        return Err(invalid_ops_input("invalid alert ruleId"));
+    }
+    if require_pattern {
+        let _ = validate_log_pattern(input)?;
+    }
+    let root = log_alert_rule_root()?;
+    Ok(root.join(format!("{id}.json")).display().to_string())
+}
+
+fn validate_log_alert_rule_id(input: &Value) -> Result<String, PluginError> {
+    let id = input
+        .get("ruleId")
+        .or_else(|| input.get("target"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_ops_input("alert ruleId is required"))?;
+    let valid = (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'));
+    valid
+        .then(|| id.to_string())
+        .ok_or_else(|| invalid_ops_input("invalid alert ruleId"))
+}
+
+fn log_alert_rule_file(input: &Value) -> Result<PathBuf, PluginError> {
+    Ok(log_alert_rule_root()?.join(format!("{}.json", validate_log_alert_rule_id(input)?)))
+}
+
+fn validate_log_alert_rule_document(input: &Value) -> Result<Value, PluginError> {
+    let rule_id = validate_log_alert_rule_id(input)?;
+    let pattern = validate_log_pattern(input)?;
+    let mut rule = Map::new();
+    rule.insert(
+        "schema".to_string(),
+        Value::String("claw.ops.log_alert_rule.v1".to_string()),
+    );
+    rule.insert("ruleId".to_string(), Value::String(rule_id));
+    rule.insert("pattern".to_string(), Value::String(pattern));
+    if let Some(unit) = input
+        .get("unit")
+        .or_else(|| input.get("target"))
+        .and_then(Value::as_str)
+    {
+        if unit
+            != rule
+                .get("ruleId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        {
+            rule.insert(
+                "unit".to_string(),
+                Value::String(validate_systemd_unit(unit, ".service")?),
+            );
+        }
+    }
+    Ok(Value::Object(rule))
+}
+
+fn ensure_safe_ops_file_parent(path: &Path) -> Result<(), PluginError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_ops_input("managed path requires a parent"))?;
+    create_safe_ops_directories(parent)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(invalid_ops_input("managed parent must be a real directory"));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink()
+            || is_reparse_point(&metadata)
+            || !(metadata.is_file() || metadata.is_dir())
+        {
+            return Err(invalid_ops_input(
+                "managed path must not be a symlink or special file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_safe_ops_directories(path: &Path) -> Result<(), PluginError> {
+    let mut directories = path
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    directories.reverse();
+    for directory in directories {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || is_reparse_point(&metadata)
+                    || !metadata.is_dir()
+                {
+                    return Err(invalid_ops_input(
+                        "managed path ancestors must be real directories",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(directory) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(PluginError::Io(error)),
+                }
+                let metadata = fs::symlink_metadata(directory)?;
+                if metadata.file_type().is_symlink()
+                    || is_reparse_point(&metadata)
+                    || !metadata.is_dir()
+                {
+                    return Err(invalid_ops_input(
+                        "managed path ancestors must be real directories",
+                    ));
+                }
+            }
+            Err(error) => return Err(PluginError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_ops_ancestor_directories(path: &Path) -> Result<(), PluginError> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(PluginError::Io(error)),
+        };
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+            return Err(invalid_ops_input(
+                "managed path ancestors must be real directories",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn atomic_write_ops_file(path: &Path, contents: &[u8]) -> Result<(), PluginError> {
+    ensure_safe_ops_file_parent(path)?;
+    let temp = path.with_extension(format!("tmp-{}-{}", std::process::id(), next_unique_id()));
+    let result = (|| -> Result<(), PluginError> {
+        create_new_private_ops_file(&temp, contents)?;
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn ensure_private_ops_directory(path: &Path) -> Result<(), PluginError> {
+    let existing_anchor = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .ok_or_else(|| invalid_ops_input("managed directory requires a parent"))?
+    };
+    ensure_real_ops_ancestor_directories(existing_anchor)?;
+    create_safe_ops_directories(path)?;
+    ensure_real_ops_ancestor_directories(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(invalid_ops_input("managed directory must be real"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_new_private_ops_file(path: &Path, contents: &[u8]) -> Result<(), PluginError> {
+    ensure_safe_ops_file_parent(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let result = (|| -> Result<(), PluginError> {
+        file.write_all(contents)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn reserve_private_ops_file(path: &Path) -> Result<(), PluginError> {
+    create_new_private_ops_file(path, &[])
+}
+
+fn remove_ops_file(path: &Path) -> Result<(), PluginError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid_ops_input(
+                "managed delete target must be a regular file",
+            ));
+        }
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn systemd_unit_root() -> Result<PathBuf, PluginError> {
+    if let Some(root) = std::env::var_os("CLAW_OPS_SYSTEMD_ROOT").filter(|value| !value.is_empty())
+    {
+        let root = PathBuf::from(root);
+        return validate_injected_ops_root(&root);
+    }
+    Ok(PathBuf::from("/etc/systemd/system"))
+}
+
+fn validate_injected_ops_root(root: &Path) -> Result<PathBuf, PluginError> {
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        fs::canonicalize(std::env::current_dir()?)?.join(root)
+    };
+    let cwd = fs::canonicalize(std::env::current_dir()?)?;
+    let temp = std::env::temp_dir();
+    if !absolute.starts_with(&cwd) && !absolute.starts_with(&temp) {
+        return Err(invalid_ops_input(
+            "injected operations root must stay inside the workspace or temp directory",
+        ));
+    }
+    let ancestor_root = if absolute.exists() {
+        absolute.as_path()
+    } else {
+        absolute
+            .parent()
+            .ok_or_else(|| invalid_ops_input("injected operations root requires a parent"))?
+    };
+    ensure_real_ops_ancestor_directories(ancestor_root)?;
+    Ok(absolute)
+}
+
+fn cron_timer_file(input: &Value) -> Result<PathBuf, PluginError> {
+    let unit = validate_systemd_unit(
+        input
+            .get("unit")
+            .or_else(|| input.get("target"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_ops_input("cron unit is required"))?,
+        ".timer",
+    )?;
+    Ok(systemd_unit_root()?.join(unit))
+}
+
+fn cron_service_unit(input: &Value) -> Result<String, PluginError> {
+    validate_systemd_unit(
+        input
+            .get("serviceUnit")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_ops_input("serviceUnit is required for cron create/modify"))?,
+        ".service",
+    )
+}
+
+fn validate_systemd_calendar(input: &Value) -> Result<String, PluginError> {
+    let calendar = input
+        .get("calendar")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_ops_input("calendar is required"))?;
+    let valid = (1..=128).contains(&calendar.len())
+        && !calendar.starts_with('-')
+        && !contains_control_character(calendar)
+        && calendar.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, ' ' | '*' | ':' | '-' | '_' | ',' | '.' | '/')
+        });
+    valid
+        .then(|| calendar.to_string())
+        .ok_or_else(|| invalid_ops_input("invalid systemd calendar expression"))
+}
+
+fn cron_timer_contents(input: &Value) -> Result<Vec<u8>, PluginError> {
+    let service = cron_service_unit(input)?;
+    let calendar = validate_systemd_calendar(input)?;
+    Ok(format!(
+        "[Unit]\nDescription=Claw managed timer for {service}\n\n[Timer]\nOnCalendar={calendar}\nUnit={service}\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    )
+    .into_bytes())
+}
+
+fn validate_firewall_protocol(input: &Value) -> Result<String, PluginError> {
+    let protocol = input
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    if matches!(protocol, "tcp" | "udp") {
+        Ok(protocol.to_string())
+    } else {
+        Err(invalid_ops_input("firewall protocol must be tcp or udp"))
+    }
+}
+
+fn validate_firewall_handle(input: &Value) -> Result<String, PluginError> {
+    let handle = input
+        .get("handle")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_ops_input("firewall handle is required"))?;
+    if (1..=u64::from(u32::MAX)).contains(&handle) {
+        Ok(handle.to_string())
+    } else {
+        Err(invalid_ops_input("invalid firewall handle"))
+    }
+}
+
 fn validate_workspace_path(value: &str, allow_missing: bool) -> Result<String, PluginError> {
     let cwd = fs::canonicalize(std::env::current_dir()?)?;
     let candidate = PathBuf::from(value);
@@ -1710,20 +3520,66 @@ struct BuiltinOpsCheckpoint {
 
 fn rollback_action(plugin: &str, action: &str) -> Option<&'static str> {
     match (plugin, action) {
-        ("service_manager", "start") => Some("stop"),
-        ("service_manager", "stop") => Some("start"),
-        ("service_manager", "restart") => Some("restart"),
+        ("disk_cleaner", "archive_logs") => Some("remove_archive"),
+        ("service_manager", "start") => Some("restore_service_state"),
+        ("service_manager", "stop") => Some("restore_service_state"),
+        ("service_manager", "restart") => Some("restore_service_state"),
+        ("user_manager", "create") => Some("delete"),
         ("user_manager", "lock") => Some("unlock"),
         ("user_manager", "unlock") => Some("lock"),
-        ("package_manager", "install") => Some("remove"),
-        ("package_manager", "remove") => Some("install"),
-        ("cron_manager", "enable") => Some("disable"),
-        ("cron_manager", "disable") => Some("enable"),
-        ("cron_manager", "start") => Some("stop"),
-        ("cron_manager", "stop") => Some("start"),
-        ("cron_manager", "restart") => Some("restart"),
+        ("user_manager", "modify_permissions") => Some("restore_permissions"),
+        ("user_manager", "set_password_policy") => Some("restore_password_policy"),
+        ("log_analyzer", "alert_create") => Some("restore_alert_rule"),
+        ("log_analyzer", "alert_update") => Some("restore_alert_rule"),
+        ("log_analyzer", "alert_delete") => Some("restore_alert_rule"),
+        ("firewall_manager", "add_rule") => Some("restore_firewall_ruleset"),
+        ("firewall_manager", "delete_rule") => Some("restore_firewall_ruleset"),
+        ("firewall_manager", "update_rule") => Some("restore_firewall_ruleset"),
+        ("backup_manager", "backup") => Some("remove_backup"),
+        ("backup_manager", "snapshot") => Some("remove_backup"),
+        ("backup_manager", "restore") => Some("restore_backup_snapshot"),
+        ("cron_manager", "create") => Some("restore_cron_unit"),
+        ("cron_manager", "modify") => Some("restore_cron_unit"),
+        ("cron_manager", "delete") => Some("restore_cron_unit"),
+        ("cron_manager", "enable") => Some("restore_cron_state"),
+        ("cron_manager", "disable") => Some("restore_cron_state"),
+        ("cron_manager", "start") => Some("restore_cron_state"),
+        ("cron_manager", "stop") => Some("restore_cron_state"),
+        ("cron_manager", "restart") => Some("restore_cron_state"),
         _ => None,
     }
+}
+
+fn builtin_ops_recovery(plugin: &str, action: &str) -> BuiltinOpsRecovery {
+    if matches!(
+        (plugin, action),
+        ("user_manager", "terminate_session")
+            | ("user_manager", "delete")
+            | ("package_manager", "install")
+            | ("package_manager", "remove")
+            | ("package_manager", "update")
+            | ("disk_cleaner", "clean_temp")
+            | ("disk_cleaner", "clean_package_cache")
+    ) {
+        let reason = match (plugin, action) {
+            ("disk_cleaner", _) => {
+                "cleaning selected files is destructive and cannot be deterministically undone"
+            }
+            ("user_manager", "delete") => {
+                "deleting a local account cannot be deterministically undone from the manifest"
+            }
+            ("package_manager", "update") => {
+                "package update rollback requires a concrete dnf transaction id and is not deterministic here"
+            }
+            ("package_manager", _) => {
+                "package install/remove rollback depends on repository state and exact solver results, so it is not deterministic here"
+            }
+            _ => "terminating active login sessions cannot be undone",
+        };
+        return BuiltinOpsRecovery::Irreversible(reason);
+    }
+    rollback_action(plugin, action)
+        .map_or(BuiltinOpsRecovery::None, BuiltinOpsRecovery::Deterministic)
 }
 
 fn checkpoint_root() -> PathBuf {
@@ -1746,12 +3602,7 @@ fn write_builtin_ops_checkpoint(
     rollback_action: &str,
 ) -> Result<Value, PluginError> {
     let root = checkpoint_root();
-    fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-    }
+    ensure_private_ops_directory(&root)?;
     let created_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -1767,15 +3618,10 @@ fn write_builtin_ops_checkpoint(
         tool_name: tool_name.to_string(),
         action: action.to_string(),
         rollback_action: rollback_action.to_string(),
-        input: input.clone(),
+        input: prepare_builtin_ops_checkpoint_input(plugin_id, action, input)?,
         created_at_ms,
     };
-    fs::write(&path, serde_json::to_vec_pretty(&checkpoint)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
+    create_new_private_ops_file(&path, &serde_json::to_vec_pretty(&checkpoint)?)?;
     Ok(serde_json::json!({
         "id": id,
         "path": path,
@@ -1784,13 +3630,358 @@ fn write_builtin_ops_checkpoint(
     }))
 }
 
+fn sanitize_builtin_ops_checkpoint_input(input: &Value) -> Value {
+    let mut sanitized = input.clone();
+    if let Some(object) = sanitized.as_object_mut() {
+        object.remove("confirm");
+        object.remove("authorizationNonce");
+    }
+    sanitized
+}
+
+fn prepare_builtin_ops_checkpoint_input(
+    plugin_id: &str,
+    action: &str,
+    input: &Value,
+) -> Result<Value, PluginError> {
+    let plugin_name = plugin_id.split('@').next().unwrap_or(plugin_id);
+    let mut sanitized = sanitize_builtin_ops_checkpoint_input(input);
+    let Some(object) = sanitized.as_object_mut() else {
+        return Ok(sanitized);
+    };
+    match (plugin_name, action) {
+        ("service_manager", "start" | "stop" | "restart") => {
+            let unit = validate_systemd_unit(
+                require_target(input.get("target").and_then(Value::as_str))?,
+                ".service",
+            )?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/systemctl",
+                vec!["is-active".into(), "--".into(), unit],
+                false,
+            ))?;
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            object.insert(
+                "oldActiveState".to_string(),
+                Value::String(if state == "active" {
+                    state
+                } else {
+                    "inactive".to_string()
+                }),
+            );
+        }
+        ("user_manager", "create") => {
+            let user = validate_account_name(require_target(
+                input.get("target").and_then(Value::as_str),
+            )?)?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/getent",
+                vec!["passwd".into(), user],
+                false,
+            ))?;
+            if output.status.success() {
+                return Err(invalid_ops_input(
+                    "user already exists; refusing create with destructive rollback semantics",
+                ));
+            }
+            object.insert("oldUserExisted".to_string(), Value::Bool(false));
+        }
+        ("user_manager", "modify_permissions") => {
+            let user = validate_account_name(require_target(
+                input.get("target").and_then(Value::as_str),
+            )?)?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/id",
+                vec!["-nG".into(), "--".into(), user],
+                false,
+            ))?;
+            if !output.status.success() {
+                return Err(invalid_ops_input("failed to capture existing user groups"));
+            }
+            let groups = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",");
+            if groups.is_empty() {
+                return Err(invalid_ops_input("existing user groups were empty"));
+            }
+            object.insert("oldGroups".to_string(), Value::String(groups));
+        }
+        ("user_manager", "set_password_policy") => {
+            let user = validate_account_name(require_target(
+                input.get("target").and_then(Value::as_str),
+            )?)?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/chage",
+                vec!["--list".into(), user],
+                false,
+            ))?;
+            if !output.status.success() {
+                return Err(invalid_ops_input(
+                    "failed to capture existing password policy",
+                ));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            object.insert(
+                "oldMinDays".to_string(),
+                Value::String(
+                    parse_chage_days(&text, "Minimum").unwrap_or_else(|| "0".to_string()),
+                ),
+            );
+            object.insert(
+                "oldMaxDays".to_string(),
+                Value::String(
+                    parse_chage_days(&text, "Maximum").unwrap_or_else(|| "99999".to_string()),
+                ),
+            );
+            object.insert(
+                "oldWarnDays".to_string(),
+                Value::String(
+                    parse_chage_days(&text, "warning").unwrap_or_else(|| "7".to_string()),
+                ),
+            );
+        }
+        ("log_analyzer", "alert_create" | "alert_update" | "alert_delete") => {
+            let path = log_alert_rule_file(input)?;
+            object.insert(
+                "rulePath".to_string(),
+                Value::String(path.display().to_string()),
+            );
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                        invalid_ops_input(&format!("invalid existing alert rule JSON: {error}"))
+                    })?;
+                    object.insert("oldRuleExists".to_string(), Value::Bool(true));
+                    object.insert("oldRule".to_string(), value);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    object.insert("oldRuleExists".to_string(), Value::Bool(false));
+                }
+                Err(error) => return Err(PluginError::Io(error)),
+            }
+        }
+        ("cron_manager", "create" | "modify" | "delete") => {
+            let path = cron_timer_file(input)?;
+            object.insert(
+                "timerPath".to_string(),
+                Value::String(path.display().to_string()),
+            );
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    object.insert("oldTimerExists".to_string(), Value::Bool(true));
+                    object.insert("oldTimerContents".to_string(), Value::String(contents));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    object.insert("oldTimerExists".to_string(), Value::Bool(false));
+                }
+                Err(error) => return Err(PluginError::Io(error)),
+            }
+            let unit = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if Path::new("/usr/bin/systemctl").is_file() {
+                let enabled = run_fixed_builtin_command(&fixed_command(
+                    "/usr/bin/systemctl",
+                    vec!["is-enabled".into(), "--".into(), unit],
+                    false,
+                ))?;
+                let enabled_state = String::from_utf8_lossy(&enabled.stdout).trim().to_string();
+                if !enabled_state.is_empty() {
+                    object.insert("oldEnabledState".to_string(), Value::String(enabled_state));
+                }
+                let active = run_fixed_builtin_command(&fixed_command(
+                    "/usr/bin/systemctl",
+                    vec![
+                        "is-active".into(),
+                        "--".into(),
+                        path.file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ],
+                    false,
+                ))?;
+                let active_state = String::from_utf8_lossy(&active.stdout).trim().to_string();
+                if !active_state.is_empty() {
+                    object.insert("oldActiveState".to_string(), Value::String(active_state));
+                }
+            }
+        }
+        ("firewall_manager", "add_rule" | "delete_rule" | "update_rule") => {
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/sbin/nft",
+                vec!["list".into(), "ruleset".into()],
+                false,
+            ))?;
+            if !output.status.success() {
+                return Err(invalid_ops_input(
+                    "failed to capture existing firewall ruleset",
+                ));
+            }
+            let path = checkpoint_sidecar_path("nft-ruleset", "nft")?;
+            create_new_private_ops_file(&path, &output.stdout)?;
+            object.insert(
+                "rulesetPath".to_string(),
+                Value::String(path.display().to_string()),
+            );
+        }
+        ("package_manager", "install" | "remove") => {
+            let package = validate_package_name(require_target(
+                input.get("target").and_then(Value::as_str),
+            )?)?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/rpm",
+                vec!["--query".into(), "--".into(), package],
+                false,
+            ))?;
+            object.insert(
+                "oldInstalled".to_string(),
+                Value::Bool(output.status.success()),
+            );
+            if output.status.success() {
+                object.insert(
+                    "oldPackageQuery".to_string(),
+                    Value::String(String::from_utf8_lossy(&output.stdout).trim().to_string()),
+                );
+            }
+        }
+        ("package_manager", "update") => {
+            object.insert(
+                "dnfHistoryTransaction".to_string(),
+                Value::String("last".to_string()),
+            );
+        }
+        ("backup_manager", "backup" | "snapshot") => {
+            let destination = input
+                .get("destination")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_ops_input("backup requires destination"))?;
+            let destination = validate_workspace_path(destination, true)?;
+            if Path::new(&destination).exists() {
+                return Err(invalid_ops_input(
+                    "backup destination already exists; rollback can only remove create-new archives",
+                ));
+            }
+            object.insert("destinationPreExisted".to_string(), Value::Bool(false));
+        }
+        ("backup_manager", "restore") => {
+            let target = PathBuf::from(validate_workspace_path(
+                require_target(input.get("target").and_then(Value::as_str))?,
+                false,
+            )?);
+            let parent = target
+                .parent()
+                .ok_or_else(|| invalid_ops_input("restore target requires a parent"))?
+                .to_path_buf();
+            let basename = target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| invalid_ops_input("restore target requires a file name"))?
+                .to_string();
+            let snapshot = checkpoint_sidecar_path("pre-restore", "tar")?;
+            reserve_private_ops_file(&snapshot)?;
+            let output = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/tar",
+                vec![
+                    "--create".into(),
+                    "--file".into(),
+                    snapshot.display().to_string(),
+                    "-C".into(),
+                    parent.display().to_string(),
+                    "--".into(),
+                    basename.clone(),
+                ],
+                true,
+            ))?;
+            if !output.status.success() {
+                let _ = fs::remove_file(&snapshot);
+                return Err(invalid_ops_input(
+                    "failed to capture pre-restore backup snapshot",
+                ));
+            }
+            object.insert(
+                "preRestoreSnapshot".to_string(),
+                Value::String(snapshot.display().to_string()),
+            );
+            object.insert(
+                "restoreParent".to_string(),
+                Value::String(parent.display().to_string()),
+            );
+            object.insert("restoreBasename".to_string(), Value::String(basename));
+        }
+        ("cron_manager", "enable" | "disable" | "start" | "stop" | "restart") => {
+            let unit = validate_systemd_unit(
+                require_target(input.get("target").and_then(Value::as_str))?,
+                ".timer",
+            )?;
+            if Path::new("/usr/bin/systemctl").is_file() {
+                let enabled = run_fixed_builtin_command(&fixed_command(
+                    "/usr/bin/systemctl",
+                    vec!["is-enabled".into(), "--".into(), unit.clone()],
+                    false,
+                ))?;
+                let active = run_fixed_builtin_command(&fixed_command(
+                    "/usr/bin/systemctl",
+                    vec!["is-active".into(), "--".into(), unit],
+                    false,
+                ))?;
+                object.insert(
+                    "oldEnabledState".to_string(),
+                    Value::String(String::from_utf8_lossy(&enabled.stdout).trim().to_string()),
+                );
+                object.insert(
+                    "oldActiveState".to_string(),
+                    Value::String(String::from_utf8_lossy(&active.stdout).trim().to_string()),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(sanitized)
+}
+
+fn checkpoint_sidecar_path(prefix: &str, extension: &str) -> Result<PathBuf, PluginError> {
+    let root = checkpoint_root();
+    ensure_private_ops_directory(&root)?;
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    Ok(root.join(format!(
+        "{prefix}-{created_at_ms}-{}-{}.{}",
+        std::process::id(),
+        next_unique_id(),
+        extension
+    )))
+}
+
+fn parse_chage_days(text: &str, needle: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        if !line
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+        {
+            return None;
+        }
+        let value = line.split(':').nth(1)?.trim();
+        value.parse::<u64>().ok().map(|number| number.to_string())
+    })
+}
+
 fn execute_builtin_ops_rollback(
     plugin_id: &str,
     tool_name: &str,
     permission: PluginToolPermission,
     input: &Value,
-    confirmed: bool,
+    authorized: bool,
 ) -> Result<Value, PluginError> {
+    let confirmed = input
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let id = input
         .get("checkpointId")
         .and_then(Value::as_str)
@@ -1803,15 +3994,23 @@ fn execute_builtin_ops_rollback(
     {
         return Err(invalid_ops_input("invalid rollback checkpointId"));
     }
-    if !confirmed {
+    if !authorized {
         return Ok(serde_json::json!({
+            "schema": BUILTIN_OPS_RESULT_SCHEMA,
+            "ok": false,
             "status": "requires_confirmation",
             "mode": "rollback",
             "plugin": plugin_id,
             "tool": tool_name,
             "permission": permission.as_str(),
-            "audit": { "mutationPerformed": false },
+            "confirmed": confirmed,
+            "confirmation": { "required": true, "level": "L3", "satisfied": false, "trustedAuthorization": false },
+            "audit": { "mutationPerformed": false, "reason": "trusted runtime authorization is required before rollback" },
             "plan": [{ "step": "rollback", "checkpointId": id }],
+            "error": {
+                "kind": "confirmation_required",
+                "message": "trusted runtime L3 authorization is required before rollback"
+            },
             "rollback": { "available": true, "performed": false }
         }));
     }
@@ -1823,6 +4022,39 @@ fn execute_builtin_ops_rollback(
         ));
     }
     let plugin_name = plugin_id.split('@').next().unwrap_or(plugin_id);
+    if checkpoint.rollback_action == "restore_alert_rule" {
+        return execute_log_alert_restore(
+            plugin_id,
+            tool_name,
+            permission,
+            id,
+            &checkpoint,
+            authorized,
+            confirmed,
+        );
+    }
+    if checkpoint.rollback_action == "restore_cron_unit" {
+        return execute_cron_restore(
+            plugin_id,
+            tool_name,
+            permission,
+            id,
+            &checkpoint,
+            authorized,
+            confirmed,
+        );
+    }
+    if checkpoint.rollback_action == "restore_cron_state" {
+        return execute_cron_state_restore(
+            plugin_id,
+            tool_name,
+            permission,
+            id,
+            &checkpoint,
+            authorized,
+            confirmed,
+        );
+    }
     let command =
         build_builtin_ops_command(plugin_name, &checkpoint.rollback_action, &checkpoint.input)?;
     if !command.mutating {
@@ -1830,13 +4062,42 @@ fn execute_builtin_ops_rollback(
             "checkpoint rollback did not resolve to a mutation",
         ));
     }
+    if let Some(missing_program) = missing_builtin_command(&command) {
+        return Ok(builtin_ops_unsupported_result(
+            BuiltinOpsUnsupportedRequest {
+                plugin_id,
+                tool_name,
+                permission,
+                command: &command,
+                missing_program: &missing_program,
+                command_json: serde_json::json!({
+                    "program": command.program,
+                    "args": command.args.clone(),
+                    "shell": false
+                }),
+                target: Value::Null,
+                mode: "rollback",
+                step: "rollback",
+                checkpoint_id: Some(id),
+                dry_run: None,
+                confirmed,
+                trusted_authorized: authorized,
+                rollback_available: true,
+                irreversible: false,
+            },
+        ));
+    }
     let output = run_fixed_builtin_command(&command)?;
     Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": output.status.success(),
         "status": if output.status.success() { "rolled_back" } else { "rollback_failed" },
         "mode": "rollback",
         "plugin": plugin_id,
         "tool": tool_name,
         "permission": permission.as_str(),
+        "confirmed": confirmed,
+        "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
         "audit": {
             "mutationPerformed": output.status.success(),
             "program": command.program,
@@ -1849,7 +4110,236 @@ fn execute_builtin_ops_rollback(
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr)
         },
+        "error": if output.status.success() {
+            Value::Null
+        } else {
+            serde_json::json!({
+                "kind": "rollback_failed",
+                "message": "rollback command exited with non-zero status"
+            })
+        },
         "rollback": { "available": true, "performed": output.status.success() }
+    }))
+}
+
+fn execute_log_alert_restore(
+    plugin_id: &str,
+    tool_name: &str,
+    permission: PluginToolPermission,
+    checkpoint_id: &str,
+    checkpoint: &BuiltinOpsCheckpoint,
+    authorized: bool,
+    confirmed: bool,
+) -> Result<Value, PluginError> {
+    let path = PathBuf::from(require_string_field(&checkpoint.input, "rulePath")?);
+    let existed = checkpoint
+        .input
+        .get("oldRuleExists")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if existed {
+        let old_rule = checkpoint
+            .input
+            .get("oldRule")
+            .cloned()
+            .ok_or_else(|| invalid_ops_input("checkpoint missing old alert rule"))?;
+        atomic_write_ops_file(&path, serde_json::to_vec_pretty(&old_rule)?.as_slice())?;
+    } else {
+        remove_ops_file(&path)?;
+    }
+    Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": true,
+        "status": "rolled_back",
+        "mode": "rollback",
+        "plugin": plugin_id,
+        "tool": tool_name,
+        "permission": permission.as_str(),
+        "confirmed": confirmed,
+        "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
+        "audit": { "mutationPerformed": true, "program": "builtin:log-alert-rules", "stdoutTruncated": false, "stderrTruncated": false },
+        "plan": [{ "step": "rollback", "checkpointId": checkpoint_id, "program": "builtin:log-alert-rules", "args": [path.display().to_string()], "shell": false }],
+        "result": { "stdout": serde_json::json!({ "restored": existed, "path": path }).to_string(), "stderr": "" },
+        "error": null,
+        "rollback": { "available": true, "performed": true, "irreversible": false }
+    }))
+}
+
+fn execute_cron_restore(
+    plugin_id: &str,
+    tool_name: &str,
+    permission: PluginToolPermission,
+    checkpoint_id: &str,
+    checkpoint: &BuiltinOpsCheckpoint,
+    authorized: bool,
+    confirmed: bool,
+) -> Result<Value, PluginError> {
+    let path = PathBuf::from(require_string_field(&checkpoint.input, "timerPath")?);
+    let existed = checkpoint
+        .input
+        .get("oldTimerExists")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if existed {
+        let contents = checkpoint
+            .input
+            .get("oldTimerContents")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= 64 * 1024 && !value.contains('\0'))
+            .ok_or_else(|| invalid_ops_input("checkpoint missing old timer contents"))?;
+        atomic_write_ops_file(&path, contents.as_bytes())?;
+    } else {
+        remove_ops_file(&path)?;
+    }
+    let output = run_fixed_builtin_command(&fixed_command(
+        "/usr/bin/systemctl",
+        vec!["daemon-reload".into()],
+        true,
+    ))?;
+    let unit = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut outputs = vec![("daemon-reload".to_string(), output)];
+    if outputs[0].1.status.success() {
+        if let Some(enabled) = checkpoint
+            .input
+            .get("oldEnabledState")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            let action = if enabled == "enabled" {
+                "enable"
+            } else {
+                "disable"
+            };
+            let state = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/systemctl",
+                vec![action.into(), "--".into(), unit.clone()],
+                true,
+            ))?;
+            outputs.push((action.to_string(), state));
+        }
+        if let Some(active) = checkpoint
+            .input
+            .get("oldActiveState")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            let action = if active == "active" { "start" } else { "stop" };
+            let state = run_fixed_builtin_command(&fixed_command(
+                "/usr/bin/systemctl",
+                vec![action.into(), "--".into(), unit.clone()],
+                true,
+            ))?;
+            outputs.push((action.to_string(), state));
+        }
+    }
+    let success = outputs.iter().all(|(_, output)| output.status.success());
+    let stdout = outputs
+        .iter()
+        .map(|(label, output)| {
+            format!(
+                "{label}:{}\n{}",
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = outputs
+        .iter()
+        .map(|(label, output)| {
+            format!(
+                "{label}:{}\n{}",
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": success,
+        "status": if success { "rolled_back" } else { "rollback_failed" },
+        "mode": "rollback",
+        "plugin": plugin_id,
+        "tool": tool_name,
+        "permission": permission.as_str(),
+        "confirmed": confirmed,
+        "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
+        "audit": { "mutationPerformed": true, "program": "/usr/bin/systemctl", "exitCode": outputs.last().and_then(|(_, output)| output.status.code()), "stdoutTruncated": outputs.iter().any(|(_, output)| output.stdout_truncated), "stderrTruncated": outputs.iter().any(|(_, output)| output.stderr_truncated), "steps": outputs.iter().map(|(label, output)| serde_json::json!({"action": label, "ok": output.status.success(), "exitCode": output.status.code()})).collect::<Vec<_>>() },
+        "plan": [{ "step": "rollback", "checkpointId": checkpoint_id, "program": "/usr/bin/systemctl", "args": ["daemon-reload"], "shell": false }],
+        "result": { "stdout": stdout, "stderr": stderr },
+        "error": if success { Value::Null } else { serde_json::json!({ "kind": "rollback_failed", "message": "systemctl cron unit restore failed" }) },
+        "rollback": { "available": true, "performed": success, "irreversible": false }
+    }))
+}
+
+fn execute_cron_state_restore(
+    plugin_id: &str,
+    tool_name: &str,
+    permission: PluginToolPermission,
+    checkpoint_id: &str,
+    checkpoint: &BuiltinOpsCheckpoint,
+    authorized: bool,
+    confirmed: bool,
+) -> Result<Value, PluginError> {
+    let unit = validate_systemd_unit(
+        require_target(checkpoint.input.get("target").and_then(Value::as_str))?,
+        ".timer",
+    )?;
+    let old_enabled = checkpoint
+        .input
+        .get("oldEnabledState")
+        .and_then(Value::as_str)
+        .unwrap_or("disabled");
+    let old_active = checkpoint
+        .input
+        .get("oldActiveState")
+        .and_then(Value::as_str)
+        .unwrap_or("inactive");
+    let mut outputs = Vec::new();
+    let enabled_action = if old_enabled == "enabled" {
+        "enable"
+    } else {
+        "disable"
+    };
+    outputs.push(run_fixed_builtin_command(&fixed_command(
+        "/usr/bin/systemctl",
+        vec![enabled_action.into(), "--".into(), unit.clone()],
+        true,
+    ))?);
+    let active_action = if old_active == "active" {
+        "start"
+    } else {
+        "stop"
+    };
+    outputs.push(run_fixed_builtin_command(&fixed_command(
+        "/usr/bin/systemctl",
+        vec![active_action.into(), "--".into(), unit.clone()],
+        true,
+    ))?);
+    let success = outputs.iter().all(|output| output.status.success());
+    Ok(serde_json::json!({
+        "schema": BUILTIN_OPS_RESULT_SCHEMA,
+        "ok": success,
+        "status": if success { "rolled_back" } else { "rollback_failed" },
+        "mode": "rollback",
+        "plugin": plugin_id,
+        "tool": tool_name,
+        "permission": permission.as_str(),
+        "confirmed": confirmed,
+        "confirmation": { "required": true, "level": "L3", "satisfied": authorized, "trustedAuthorization": authorized },
+        "audit": { "mutationPerformed": success, "program": "/usr/bin/systemctl", "stdoutTruncated": outputs.iter().any(|output| output.stdout_truncated), "stderrTruncated": outputs.iter().any(|output| output.stderr_truncated) },
+        "plan": [{ "step": "rollback", "checkpointId": checkpoint_id, "program": "/usr/bin/systemctl", "args": [enabled_action, active_action, "--", unit], "shell": false }],
+        "result": {
+            "stdout": outputs.iter().map(|output| String::from_utf8_lossy(&output.stdout).to_string()).collect::<Vec<_>>().join("\n"),
+            "stderr": outputs.iter().map(|output| String::from_utf8_lossy(&output.stderr).to_string()).collect::<Vec<_>>().join("\n")
+        },
+        "error": if success { Value::Null } else { serde_json::json!({ "kind": "rollback_failed", "message": "systemctl state restore failed" }) },
+        "rollback": { "available": true, "performed": success, "irreversible": false }
     }))
 }
 
@@ -1865,10 +4355,9 @@ fn run_fixed_builtin_command(
     command: &BuiltinOpsCommand,
 ) -> Result<FixedCommandOutput, PluginError> {
     const OUTPUT_LIMIT: usize = 1024 * 1024;
-    if !Path::new(command.program).is_file() {
+    if let Some(missing_program) = missing_builtin_command(command) {
         return Err(PluginError::CommandFailed(format!(
-            "required Kylin/Linux executable `{}` is unavailable",
-            command.program
+            "required Kylin/Linux executable `{missing_program}` is unavailable"
         )));
     }
     let mut process = Command::new(command.program);
@@ -1919,6 +4408,20 @@ fn run_fixed_builtin_command(
         stdout_truncated,
         stderr_truncated,
     })
+}
+
+fn missing_builtin_command(command: &BuiltinOpsCommand) -> Option<String> {
+    if !Path::new(command.program).is_file() {
+        return Some(command.program.to_string());
+    }
+    command
+        .args
+        .iter()
+        .filter(|arg| {
+            arg.starts_with("/usr/") || arg.starts_with("/bin/") || arg.starts_with("/sbin/")
+        })
+        .find(|arg| !Path::new(arg.as_str()).is_file())
+        .cloned()
 }
 
 fn read_pipe_capped(
@@ -3165,6 +5668,34 @@ impl PluginRegistry {
         Ok(resources)
     }
 
+    pub fn read_resource(&self, uri: &str, input: &Value) -> Result<Value, PluginError> {
+        let resource = self
+            .plugins
+            .iter()
+            .find_map(|plugin| {
+                plugin
+                    .resources()
+                    .iter()
+                    .find(|resource| resource.uri == uri)
+                    .map(|resource| (plugin, resource))
+            })
+            .ok_or_else(|| PluginError::NotFound(format!("plugin resource `{uri}` not found")))?;
+        let (plugin, _) = resource;
+        plugin.validate()?;
+        match uri {
+            "claw://builtin/log_analyzer/journal" => execute_builtin_ops_tool(
+                "log_analyzer@builtin",
+                "ops_log_analyzer",
+                PluginToolPermission::ReadOnly,
+                &bounded_log_resource_input(input),
+                None,
+            ),
+            _ => Err(PluginError::CommandFailed(format!(
+                "plugin resource `{uri}` is listed but has no reader"
+            ))),
+        }
+    }
+
     pub fn aggregated_prompts(&self) -> Result<Vec<PluginPromptManifest>, PluginError> {
         let mut prompts = Vec::new();
         let mut seen_names = BTreeMap::new();
@@ -3449,6 +5980,7 @@ fn runtime_status_with_cleanup_warning(
 #[derive(Debug)]
 struct PluginRuntimeInner {
     snapshot: Arc<PluginRegistry>,
+    approval_verifier: PluginApprovalVerifier,
     generation: u64,
     phase: String,
     mutating: bool,
@@ -3465,12 +5997,30 @@ pub struct PluginRuntimeRegistry {
 }
 
 impl PluginRuntimeRegistry {
-    #[must_use]
     pub fn new(registry: PluginRegistry) -> Self {
+        let verifier = plugin_approval_channel()
+            .map(|(_, verifier)| verifier)
+            .unwrap_or_else(|_| PluginApprovalVerifier::disabled());
+        Self::new_with_approval_verifier(registry, verifier)
+    }
+
+    pub fn new_with_approval_channel(
+        registry: PluginRegistry,
+    ) -> Result<(Self, PluginApprovalIssuer), PluginError> {
+        let (issuer, verifier) = plugin_approval_channel()?;
+        Ok((Self::new_with_approval_verifier(registry, verifier), issuer))
+    }
+
+    #[must_use]
+    pub fn new_with_approval_verifier(
+        registry: PluginRegistry,
+        approval_verifier: PluginApprovalVerifier,
+    ) -> Self {
         Self {
             inner: Arc::new((
                 Mutex::new(PluginRuntimeInner {
                     snapshot: Arc::new(registry),
+                    approval_verifier,
                     generation: 0,
                     phase: "ready".to_string(),
                     mutating: false,
@@ -3504,6 +6054,38 @@ impl PluginRuntimeRegistry {
     }
 
     pub fn execute_tool(&self, tool_name: &str, input: &Value) -> Result<String, PluginError> {
+        self.execute_tool_inner(tool_name, input, None)
+    }
+
+    pub fn execute_tool_with_grant(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        grant: Option<&PluginApprovalGrant>,
+    ) -> Result<String, PluginError> {
+        self.execute_tool_inner(tool_name, input, grant)
+    }
+
+    pub fn authorization_request(
+        &self,
+        tool_name: &str,
+        input: &Value,
+    ) -> Result<Option<PluginToolAuthorizationRequest>, PluginError> {
+        let tool = self
+            .snapshot()
+            .aggregated_tools()?
+            .into_iter()
+            .find(|tool| tool.definition().name == tool_name)
+            .ok_or_else(|| PluginError::NotFound(format!("plugin tool `{tool_name}` not found")))?;
+        tool.authorization_request(input)
+    }
+
+    fn execute_tool_inner(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        grant: Option<&PluginApprovalGrant>,
+    ) -> Result<String, PluginError> {
         let (lock, cvar) = &*self.inner;
         let mut inner = lock
             .lock()
@@ -3521,9 +6103,23 @@ impl PluginRuntimeRegistry {
             )));
         }
         *inner.in_flight.entry(plugin_id.clone()).or_default() += 1;
+        let context = grant.and_then(|grant| {
+            tool.authorization_request(input)
+                .ok()
+                .flatten()
+                .and_then(|request| {
+                    inner.approval_verifier.verify_and_consume(
+                        grant,
+                        &request.plugin_id,
+                        &request.tool_name,
+                        &request.input_hash,
+                        &request.plan_hash,
+                    )
+                })
+        });
         drop(inner);
 
-        let result = tool.execute(input);
+        let result = tool.execute_with_context(input, context.as_ref());
         let mut inner = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4738,8 +7334,59 @@ pub enum PluginError {
     ManifestValidation(Vec<PluginManifestValidationError>),
     LoadFailures(Vec<PluginLoadFailure>),
     InvalidManifest(String),
+    SourceNotReady {
+        message: String,
+        build_required: bool,
+        source_only: bool,
+        registration_ready: bool,
+    },
+    BuildRequired {
+        message: String,
+        build_required: bool,
+        source_only: bool,
+        registration_ready: bool,
+    },
     NotFound(String),
     CommandFailed(String),
+}
+
+impl PluginError {
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SourceNotReady { .. } => "plugin_source_not_ready",
+            Self::BuildRequired { .. } => "plugin_build_required",
+            Self::InvalidManifest(_) | Self::ManifestValidation(_) => "plugin_manifest_invalid",
+            Self::LoadFailures(_) => "plugin_load_failures",
+            Self::NotFound(_) => "plugin_not_found",
+            Self::CommandFailed(_) => "plugin_command_failed",
+            Self::Io(_) => "plugin_io_error",
+            Self::Json(_) => "plugin_json_error",
+        }
+    }
+
+    #[must_use]
+    pub fn details(&self) -> Option<Value> {
+        match self {
+            Self::SourceNotReady {
+                build_required,
+                source_only,
+                registration_ready,
+                ..
+            }
+            | Self::BuildRequired {
+                build_required,
+                source_only,
+                registration_ready,
+                ..
+            } => Some(serde_json::json!({
+                "buildRequired": build_required,
+                "sourceOnly": source_only,
+                "registrationReady": registration_ready,
+            })),
+            _ => None,
+        }
+    }
 }
 
 impl Display for PluginError {
@@ -4768,6 +7415,24 @@ impl Display for PluginError {
             Self::InvalidManifest(message)
             | Self::NotFound(message)
             | Self::CommandFailed(message) => write!(f, "{message}"),
+            Self::SourceNotReady {
+                message,
+                build_required,
+                source_only,
+                registration_ready,
+            } => write!(
+                f,
+                "plugin_source_not_ready: {message} (buildRequired={build_required}, sourceOnly={source_only}, registrationReady={registration_ready})"
+            ),
+            Self::BuildRequired {
+                message,
+                build_required,
+                source_only,
+                registration_ready,
+            } => write!(
+                f,
+                "plugin_build_required: {message} (buildRequired={build_required}, sourceOnly={source_only}, registrationReady={registration_ready})"
+            ),
         }
     }
 }
@@ -4807,16 +7472,16 @@ impl PluginManager {
     /// Returns the default bundled plugins root directory.
     ///
     /// Resolution order (first existing path wins):
-    /// 1. `<exe_dir>/../share/claw/plugins/bundled` — standard install layout
-    /// 2. `<exe_dir>/bundled` — simple relocated layout
-    /// 3. `CARGO_MANIFEST_DIR/bundled` — dev/source-tree fallback (only if it exists)
-    /// 4. `<exe_dir>/../share/claw/plugins/bundled` — canonical default even if missing
+    /// 1. `<exe_dir>/../share/claw/plugins/bundled` -?standard install layout
+    /// 2. `<exe_dir>/bundled` -?simple relocated layout
+    /// 3. `CARGO_MANIFEST_DIR/bundled` -?dev/source-tree fallback (only if it exists)
+    /// 4. `<exe_dir>/../share/claw/plugins/bundled` -?canonical default even if missing
     ///
     /// This avoids baking in a compile-time source-tree path that may be
     /// inaccessible at runtime (e.g. a root-owned repo directory).
     #[must_use]
     pub fn bundled_root() -> PathBuf {
-        // Candidate 1: standard FHS install layout — <prefix>/bin/claw -> <prefix>/share/claw/plugins/bundled
+        // Candidate 1: standard FHS install layout -?<prefix>/bin/claw -> <prefix>/share/claw/plugins/bundled
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 let share_path = exe_dir
@@ -4829,7 +7494,7 @@ impl PluginManager {
                     return share_path;
                 }
 
-                // Candidate 2: simple adjacent layout — <exe_dir>/bundled
+                // Candidate 2: simple adjacent layout -?<exe_dir>/bundled
                 let adjacent = exe_dir.join("bundled");
                 if adjacent.exists() {
                     return adjacent;
@@ -4837,7 +7502,7 @@ impl PluginManager {
             }
         }
 
-        // Candidate 3: dev/source-tree fallback — only if the directory actually exists
+        // Candidate 3: dev/source-tree fallback -?only if the directory actually exists
         let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
         if dev_path.exists() {
             return dev_path;
@@ -4929,6 +7594,10 @@ impl PluginManager {
 
     pub fn aggregated_resources(&self) -> Result<Vec<PluginResourceManifest>, PluginError> {
         self.plugin_registry()?.aggregated_resources()
+    }
+
+    pub fn read_resource(&self, uri: &str, input: &Value) -> Result<Value, PluginError> {
+        self.plugin_registry()?.read_resource(uri, input)
     }
 
     pub fn aggregated_prompts(&self) -> Result<Vec<PluginPromptManifest>, PluginError> {
@@ -6654,7 +9323,7 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
             "disk_cleaner",
             "Disk cleanup planning and dry-run reporting.",
             "ops_disk_cleaner",
-            PluginToolPermission::WorkspaceWrite,
+            PluginToolPermission::DangerFullAccess,
             PluginRiskLevel::High,
         ),
         (
@@ -6696,7 +9365,7 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
             "cron_manager",
             "Cron and scheduled task management planning.",
             "ops_cron_manager",
-            PluginToolPermission::WorkspaceWrite,
+            PluginToolPermission::DangerFullAccess,
             PluginRiskLevel::High,
         ),
         (
@@ -6717,16 +9386,19 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
     .into_iter()
     .map(|(name, description, tool_name, permission, risk)| {
         let high_risk = matches!(risk, PluginRiskLevel::High | PluginRiskLevel::Critical);
+        let permission_declarations = builtin_ops_permission_declarations(name, permission);
+        let mut permissions = BTreeSet::from([manifest_permission_for_tool(permission)]);
+        for declaration in &permission_declarations {
+            permissions.insert(manifest_permission_for_declaration(declaration));
+        }
         PluginManifest {
             schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION,
             id: None,
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: description.to_string(),
-            permissions: vec![manifest_permission_for_tool(permission)],
-            permission_declarations: vec![PluginPermissionDeclaration::Legacy {
-                permission: manifest_permission_for_tool(permission),
-            }],
+            permissions: permissions.into_iter().collect(),
+            permission_declarations,
             entrypoint: None,
             manifest_metadata: PluginManifestMetadata::builtin(),
             default_enabled: false,
@@ -6737,20 +9409,7 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
                 name: tool_name.to_string(),
                 description: format!("{description} Uses fixed Kylin/Linux executables without a shell; dry-run returns validated argv and mutations require confirmation plus a rollback checkpoint."),
                 input_schema: builtin_ops_input_schema(name),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "required": ["status", "plugin", "tool", "audit", "plan", "rollback"],
-                    "properties": {
-                        "status": { "type": "string" },
-                        "plugin": { "type": "string" },
-                        "tool": { "type": "string" },
-                        "mode": { "type": "string" },
-                        "audit": { "type": "object" },
-                        "plan": { "type": "array" },
-                        "rollback": { "type": "object" }
-                    },
-                    "additionalProperties": true
-                })),
+                output_schema: Some(builtin_ops_output_schema()),
                 command: BUILTIN_OPS_EXECUTOR_COMMAND.to_string(),
                 args: Vec::new(),
                 required_permission: permission,
@@ -6758,7 +9417,7 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
             commands: Vec::new(),
             capabilities: PluginCapabilities {
                 tools: true,
-                resources: false,
+                resources: name == "log_analyzer",
                 prompts: false,
                 workflows: true,
                 hot_reload: true,
@@ -6780,43 +9439,488 @@ pub fn builtin_ops_manifests() -> Vec<PluginManifest> {
                 scope: format!("ops.{name}"),
                 risk,
                 reason: "Built-in operations plugin capability declaration.".to_string(),
+                actions: builtin_ops_action_names(name)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                irreversible_actions: builtin_ops_action_names(name)
+                    .into_iter()
+                    .filter(|action| {
+                        matches!(
+                            builtin_ops_recovery(name, action),
+                            BuiltinOpsRecovery::Irreversible(_)
+                        )
+                    })
+                    .map(str::to_string)
+                    .collect(),
                 rollback_required: high_risk,
                 rollback_command: high_risk
                     .then(|| "restore from captured pre-change checkpoint".to_string()),
             }],
-            resources: Vec::new(),
+            resources: builtin_ops_resources(name),
             prompts: Vec::new(),
         }
     })
     .collect()
 }
 
-fn builtin_ops_input_schema(plugin: &str) -> Value {
-    let actions = match plugin {
-        "disk_cleaner" | "log_analyzer" | "firewall_manager" => {
-            vec!["inspect", "plan"]
-        }
-        "service_manager" => vec!["inspect", "plan", "start", "stop", "restart", "rollback"],
-        "user_manager" => vec!["inspect", "plan", "lock", "unlock", "rollback"],
-        "package_manager" => vec!["inspect", "plan", "install", "remove", "rollback"],
-        "cron_manager" => vec![
-            "inspect", "plan", "enable", "disable", "start", "stop", "restart", "rollback",
+fn builtin_ops_permission_declarations(
+    plugin: &str,
+    permission: PluginToolPermission,
+) -> Vec<PluginPermissionDeclaration> {
+    match plugin {
+        "disk_cleaner" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["find".to_string(), "tar".to_string(), "rm".to_string()],
+            },
+            PluginPermissionDeclaration::Filesystem {
+                paths: vec![
+                    "/tmp".to_string(),
+                    "/var/tmp".to_string(),
+                    "/var/cache/dnf".to_string(),
+                    "/var/cache/yum".to_string(),
+                    "/var/log".to_string(),
+                    "/var/log/journal".to_string(),
+                    ".".to_string(),
+                ],
+                mode: PluginFilesystemPermissionMode::ReadWrite,
+            },
         ],
-        "network_diagnostics" => vec!["inspect", "plan", "dns", "ping"],
-        "backup_manager" => vec!["inspect", "plan", "backup"],
+        "service_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["systemctl".to_string(), "journalctl".to_string()],
+            },
+            PluginPermissionDeclaration::Systemd {
+                units: vec!["validated-service-units".to_string()],
+                actions: vec![
+                    "show".to_string(),
+                    "status".to_string(),
+                    "logs".to_string(),
+                    "start".to_string(),
+                    "stop".to_string(),
+                    "restart".to_string(),
+                ],
+            },
+        ],
+        "user_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec![
+                    "getent".to_string(),
+                    "id".to_string(),
+                    "loginctl".to_string(),
+                    "chage".to_string(),
+                    "useradd".to_string(),
+                    "userdel".to_string(),
+                    "usermod".to_string(),
+                ],
+            },
+            PluginPermissionDeclaration::User {
+                users: vec!["validated-linux-accounts".to_string()],
+                actions: vec![
+                    "inspect".to_string(),
+                    "create".to_string(),
+                    "delete".to_string(),
+                    "lock".to_string(),
+                    "unlock".to_string(),
+                    "permissions".to_string(),
+                    "sessions".to_string(),
+                    "terminate_session".to_string(),
+                    "password_policy".to_string(),
+                    "set_password_policy".to_string(),
+                    "modify_permissions".to_string(),
+                ],
+            },
+        ],
+        "log_analyzer" => vec![PluginPermissionDeclaration::Process {
+            commands: vec!["journalctl".to_string()],
+        }],
+        "package_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["rpm".to_string(), "dnf".to_string()],
+            },
+            PluginPermissionDeclaration::Package {
+                managers: vec!["rpm".to_string(), "dnf".to_string()],
+                actions: vec![
+                    "query".to_string(),
+                    "install".to_string(),
+                    "remove".to_string(),
+                    "update".to_string(),
+                    "dependencies".to_string(),
+                ],
+                packages: vec!["named-rpm-packages".to_string()],
+            },
+        ],
+        "firewall_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["nft".to_string()],
+            },
+            PluginPermissionDeclaration::Firewall {
+                scopes: vec!["nftables".to_string()],
+                actions: vec![
+                    "inspect".to_string(),
+                    "plan".to_string(),
+                    "add_rule".to_string(),
+                    "update_rule".to_string(),
+                    "delete_rule".to_string(),
+                    "validate_policy".to_string(),
+                ],
+            },
+        ],
+        "cron_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["systemctl".to_string(), "journalctl".to_string()],
+            },
+            PluginPermissionDeclaration::Systemd {
+                units: vec!["validated-timer-units".to_string()],
+                actions: vec![
+                    "show".to_string(),
+                    "list-timers".to_string(),
+                    "logs".to_string(),
+                    "create".to_string(),
+                    "modify".to_string(),
+                    "delete".to_string(),
+                    "enable".to_string(),
+                    "disable".to_string(),
+                    "start".to_string(),
+                    "stop".to_string(),
+                    "restart".to_string(),
+                ],
+            },
+        ],
+        "network_diagnostics" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec![
+                    "ss".to_string(),
+                    "getent".to_string(),
+                    "ping".to_string(),
+                    "traceroute".to_string(),
+                    "timeout".to_string(),
+                    "nc".to_string(),
+                ],
+            },
+            PluginPermissionDeclaration::Network {
+                origins: vec!["validated-host-or-ip:any-port".to_string()],
+            },
+        ],
+        "backup_manager" => vec![
+            PluginPermissionDeclaration::Process {
+                commands: vec!["find".to_string(), "tar".to_string(), "rm".to_string()],
+            },
+            PluginPermissionDeclaration::Filesystem {
+                paths: vec![".".to_string()],
+                mode: PluginFilesystemPermissionMode::ReadWrite,
+            },
+        ],
+        _ => vec![PluginPermissionDeclaration::Legacy {
+            permission: manifest_permission_for_tool(permission),
+        }],
+    }
+}
+
+fn builtin_ops_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": [
+            "schema",
+            "ok",
+            "status",
+            "plugin",
+            "tool",
+            "audit",
+            "plan",
+            "rollback",
+            "confirmation",
+            "error"
+        ],
+        "properties": {
+            "schema": { "type": "string", "enum": [BUILTIN_OPS_RESULT_SCHEMA] },
+            "ok": { "type": "boolean" },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "ok",
+                    "dry_run",
+                    "unsupported",
+                    "requires_confirmation",
+                    "command_failed",
+                    "rolled_back",
+                    "rollback_failed"
+                ]
+            },
+            "plugin": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tool": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "permission": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"] },
+            "mode": { "type": "string", "enum": ["inspect", "apply", "rollback"] },
+            "dryRun": { "type": "boolean" },
+            "confirmed": { "type": "boolean" },
+            "audit": {
+                "type": "object",
+                "required": ["mutationPerformed"],
+                "properties": {
+                    "mutationPerformed": { "type": "boolean" },
+                    "reason": { "type": "string", "maxLength": 512 },
+                    "program": { "type": "string", "maxLength": 256 },
+                    "exitCode": { "type": ["integer", "null"] },
+                    "stdoutTruncated": { "type": "boolean" },
+                    "stderrTruncated": { "type": "boolean" },
+                    "rollbackAttemptedOnFailure": { "type": "boolean" },
+                    "rollbackError": { "type": ["string", "null"], "maxLength": 1024 },
+                    "steps": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "required": ["action", "ok"],
+                            "properties": {
+                                "action": { "type": "string", "maxLength": 64 },
+                                "ok": { "type": "boolean" },
+                                "exitCode": { "type": ["integer", "null"] }
+                            },
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            "plan": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "required": ["step"],
+                    "properties": {
+                        "step": { "type": "string", "maxLength": 64 },
+                        "target": {},
+                        "checkpointId": { "type": "string", "maxLength": 128 },
+                        "command": {
+                            "type": "object",
+                            "required": ["program", "args", "shell"],
+                            "properties": {
+                                "program": { "type": "string", "maxLength": 256 },
+                                "args": {
+                                    "type": "array",
+                                    "maxItems": 64,
+                                    "items": { "type": "string", "maxLength": 512 }
+                                },
+                                "shell": { "type": "boolean" }
+                            },
+                            "additionalProperties": false
+                        },
+                        "program": { "type": "string", "maxLength": 256 },
+                        "args": {
+                            "type": "array",
+                            "maxItems": 64,
+                            "items": { "type": "string", "maxLength": 512 }
+                        },
+                        "shell": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "result": {
+                "type": "object",
+                "required": ["stdout", "stderr"],
+                "properties": {
+                    "stdout": { "type": "string", "maxLength": 1048576 },
+                    "stderr": { "type": "string", "maxLength": 1048576 }
+                },
+                "additionalProperties": false
+            },
+            "rollback": {
+                "type": "object",
+                "required": ["available", "performed"],
+                "properties": {
+                    "available": { "type": "boolean" },
+                    "performed": { "type": "boolean" },
+                    "irreversible": { "type": "boolean" },
+                    "checkpoint": {},
+                    "checkpointId": { "type": "string", "maxLength": 128 }
+                },
+                "additionalProperties": false
+            },
+            "confirmation": {
+                "type": "object",
+                "required": ["required", "level", "satisfied", "trustedAuthorization"],
+                "properties": {
+                    "required": { "type": "boolean" },
+                    "level": { "type": "string", "enum": ["none", "L3"] },
+                    "satisfied": { "type": "boolean" },
+                    "trustedAuthorization": { "type": "boolean" }
+                },
+                "additionalProperties": false
+            },
+            "error": {
+                "type": ["object", "null"],
+                "properties": {
+                    "kind": { "type": "string", "maxLength": 128 },
+                    "message": { "type": "string", "maxLength": 1024 }
+                },
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn builtin_ops_resources(plugin: &str) -> Vec<PluginResourceManifest> {
+    if plugin == "log_analyzer" {
+        vec![PluginResourceManifest {
+            uri: "claw://builtin/log_analyzer/journal".to_string(),
+            name: "Kylin/Linux journal view".to_string(),
+            description: Some(
+                "Bounded journal source exposed through the ops_log_analyzer tool.".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn bounded_log_resource_input(input: &Value) -> Value {
+    let mut object = Map::new();
+    object.insert("action".to_string(), Value::String("inspect".to_string()));
+    object.insert("dryRun".to_string(), Value::Bool(false));
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 1_000);
+    object.insert("limit".to_string(), Value::Number(limit.into()));
+    if let Some(target) = input
+        .get("target")
+        .or_else(|| input.get("unit"))
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 256 && !value.starts_with('-'))
+    {
+        object.insert("target".to_string(), Value::String(target.to_string()));
+    }
+    if let Some(pattern) = input
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() <= 256 && !value.starts_with('-') && !contains_control_character(value)
+        })
+    {
+        object.insert("action".to_string(), Value::String("search".to_string()));
+        object.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    }
+    Value::Object(object)
+}
+
+fn builtin_ops_action_names(plugin: &str) -> Vec<&'static str> {
+    match plugin {
+        "disk_cleaner" => vec![
+            "inspect",
+            "plan",
+            "archive_logs",
+            "clean_temp",
+            "clean_package_cache",
+            "rollback",
+        ],
+        "service_manager" => vec![
+            "inspect", "plan", "status", "log", "start", "stop", "restart", "rollback",
+        ],
+        "user_manager" => vec![
+            "inspect",
+            "plan",
+            "permissions",
+            "sessions",
+            "terminate_session",
+            "password_policy",
+            "set_password_policy",
+            "modify_permissions",
+            "create",
+            "delete",
+            "lock",
+            "unlock",
+            "rollback",
+        ],
+        "log_analyzer" => vec![
+            "inspect",
+            "plan",
+            "search",
+            "pattern",
+            "alert",
+            "alert_list",
+            "alert_validate",
+            "alert_create",
+            "alert_update",
+            "alert_delete",
+            "rollback",
+        ],
+        "package_manager" => vec![
+            "inspect",
+            "plan",
+            "deps",
+            "dependencies",
+            "install",
+            "remove",
+            "update",
+            "rollback",
+        ],
+        "firewall_manager" => vec![
+            "inspect",
+            "plan",
+            "list",
+            "add_rule",
+            "update_rule",
+            "delete_rule",
+            "validate_policy",
+            "rollback",
+        ],
+        "cron_manager" => vec![
+            "inspect",
+            "plan",
+            "list",
+            "status",
+            "execution_records",
+            "log",
+            "create",
+            "modify",
+            "delete",
+            "enable",
+            "disable",
+            "start",
+            "stop",
+            "restart",
+            "rollback",
+        ],
+        "network_diagnostics" => vec!["inspect", "plan", "dns", "ping", "traceroute", "port_scan"],
+        "backup_manager" => vec![
+            "inspect", "plan", "config", "backup", "snapshot", "restore", "rollback",
+        ],
         _ => vec!["inspect"],
-    };
+    }
+}
+
+fn builtin_ops_input_schema(plugin: &str) -> Value {
+    let actions = builtin_ops_action_names(plugin);
     serde_json::json!({
         "type": "object",
         "properties": {
             "target": { "type": "string", "maxLength": 512 },
+            "unit": { "type": "string", "maxLength": 256 },
+            "serviceUnit": { "type": "string", "maxLength": 256 },
+            "calendar": { "type": "string", "maxLength": 128 },
             "destination": { "type": "string", "maxLength": 512 },
+            "archive": { "type": "string", "maxLength": 512 },
             "action": { "type": "string", "enum": actions },
             "dryRun": { "type": "boolean" },
             "confirm": { "type": "boolean" },
             "checkpointId": { "type": "string", "maxLength": 128 },
             "olderThanDays": { "type": "integer", "minimum": 1, "maximum": 365 },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+            "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "pattern": { "type": "string", "maxLength": 256 },
+            "ruleId": { "type": "string", "maxLength": 64 },
+            "group": { "type": "string", "maxLength": 32 },
+            "maxDays": { "type": "integer", "minimum": 1, "maximum": 99999 },
+            "minDays": { "type": "integer", "minimum": 0, "maximum": 99999 },
+            "warnDays": { "type": "integer", "minimum": 0, "maximum": 999 },
+            "protocol": { "type": "string", "enum": ["tcp", "udp"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "handle": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u64 }
         },
         "additionalProperties": false
     })
@@ -7271,6 +10375,7 @@ fn known_manifest_fields_for_path(path: &[&str]) -> Option<&'static [&'static st
             "description",
             "permissions",
             "signature",
+            "manifestMetadata",
             "entrypoint",
             "defaultEnabled",
             "hooks",
@@ -7290,6 +10395,20 @@ fn known_manifest_fields_for_path(path: &[&str]) -> Option<&'static [&'static st
         ["hooks"] => Some(&["PreToolUse", "PostToolUse", "PostToolUseFailure"]),
         ["lifecycle"] => Some(&["Init", "Shutdown"]),
         ["executionPolicy"] => Some(&["allowExternalSubprocess", "reason"]),
+        ["manifestMetadata"] => Some(&[
+            "schemaVersion",
+            "legacy",
+            "hash",
+            "signature",
+            "signatureVerified",
+            "signatureWarning",
+            "declaredId",
+            "entrypoint",
+            "sourceOnly",
+            "buildRequired",
+            "registrationReady",
+            "warnings",
+        ]),
         ["entrypoint"] => Some(&["command", "args"]),
         ["tools", "[]"] => Some(&[
             "name",
@@ -7337,6 +10456,8 @@ fn known_manifest_fields_for_path(path: &[&str]) -> Option<&'static [&'static st
             "scope",
             "risk",
             "reason",
+            "actions",
+            "irreversibleActions",
             "rollbackRequired",
             "rollbackCommand",
         ]),
@@ -7496,6 +10617,26 @@ fn build_plugin_manifest(
             &mut errors,
         );
     }
+    if raw.manifest_metadata.source_only
+        || raw.manifest_metadata.build_required
+        || !raw.manifest_metadata.registration_ready
+    {
+        let message = "plugin manifest is source-only and not registration-ready; run the scaffold build/finalize step so manifestMetadata.registrationReady=true and fixed bin entrypoints are executable".to_string();
+        if raw.manifest_metadata.build_required {
+            return Err(PluginError::BuildRequired {
+                message,
+                build_required: raw.manifest_metadata.build_required,
+                source_only: raw.manifest_metadata.source_only,
+                registration_ready: raw.manifest_metadata.registration_ready,
+            });
+        }
+        return Err(PluginError::SourceNotReady {
+            message,
+            build_required: raw.manifest_metadata.build_required,
+            source_only: raw.manifest_metadata.source_only,
+            registration_ready: raw.manifest_metadata.registration_ready,
+        });
+    }
 
     validate_collection_limit("permissions", raw.permissions.len(), &mut errors);
     validate_collection_limit("tools", raw.tools.len(), &mut errors);
@@ -7571,6 +10712,9 @@ fn build_plugin_manifest(
             .map(|_| "manifest signature is present but has not been verified".to_string()),
         declared_id: raw.id.clone(),
         entrypoint: raw.entrypoint.clone(),
+        source_only: raw.manifest_metadata.source_only,
+        build_required: raw.manifest_metadata.build_required,
+        registration_ready: raw.manifest_metadata.registration_ready,
         warnings: schema.warnings,
     };
 
@@ -8027,6 +11171,7 @@ fn build_manifest_tools(
             });
         } else {
             validate_command_entry(root, &tool.command, "tool", errors);
+            validate_command_args(root, &tool.command, &tool.args, "tool", errors);
         }
         if !tool.input_schema.is_object() {
             errors.push(PluginManifestValidationError::InvalidToolInputSchema {
@@ -8268,6 +11413,7 @@ fn build_manifest_mcp_servers(
                         });
                     }
                     validate_command_entry(root, &command, "mcp server", errors);
+                    validate_command_args(root, &command, &server.args, "mcp server", errors);
                     if !is_literal_command(&command) {
                         server.command = Some(resolve_hook_entry(root, &command));
                     }
@@ -8381,16 +11527,12 @@ fn permission_declaration_statuses_for_plugin(
         .permission_declarations()
         .iter()
         .enumerate()
-        .map(|(index, declaration)| {
-            let enforced = matches!(declaration, PluginPermissionDeclaration::Legacy { .. });
-            PluginPermissionDeclarationStatus {
-                index,
-                permission_type: permission_declaration_type(declaration).to_string(),
-                enforced,
-                declaration_only: !enforced,
-                enforced_permission: enforced
-                    .then(|| manifest_permission_for_declaration(declaration)),
-            }
+        .map(|(index, declaration)| PluginPermissionDeclarationStatus {
+            index,
+            permission_type: permission_declaration_type(declaration).to_string(),
+            enforced: true,
+            declaration_only: false,
+            enforced_permission: Some(manifest_permission_for_declaration(declaration)),
         })
         .collect()
 }
@@ -8617,6 +11759,29 @@ fn validate_ops_permissions(
                 ),
             });
         }
+        validate_collection_limit("ops permission actions", permission.actions.len(), errors);
+        validate_collection_limit(
+            "ops permission irreversibleActions",
+            permission.irreversible_actions.len(),
+            errors,
+        );
+        for action in permission
+            .actions
+            .iter()
+            .chain(permission.irreversible_actions.iter())
+        {
+            let valid = (1..=64).contains(&action.len())
+                && action
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+            if !valid {
+                errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                    detail: format!(
+                        "plugin ops permission action `{action}` must be a bounded snake_case action"
+                    ),
+                });
+            }
+        }
         if matches!(
             permission.risk,
             PluginRiskLevel::High | PluginRiskLevel::Critical
@@ -8664,8 +11829,52 @@ fn validate_command_entry(
         });
         return;
     }
+    if is_allowed_fixed_external_runner(entry) && matches!(kind, "tool" | "mcp server") {
+        return;
+    }
 
     validate_contained_file_path(root, entry, kind, errors);
+}
+
+fn validate_command_args(
+    root: &Path,
+    command: &str,
+    args: &[String],
+    kind: &'static str,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    validate_collection_limit(kind, args.len(), errors);
+    for arg in args {
+        if arg.chars().count() > PLUGIN_PERMISSION_VALUE_MAX_CHARS
+            || contains_control_character(arg)
+        {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} args must be bounded and contain no control characters"
+                ),
+            });
+            return;
+        }
+    }
+    if command == "/usr/bin/python3" {
+        if args.len() != 1 || !args[0].ends_with(".py") || args[0].starts_with('-') {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} using /usr/bin/python3 must pass exactly one plugin-contained .py script"
+                ),
+            });
+            return;
+        }
+        validate_contained_file_path(root, &args[0], kind, errors);
+    } else if args.iter().any(|arg| arg == "--" || arg == "-c") {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!("plugin {kind} args must not inject shell-style command separators"),
+        });
+    }
+}
+
+fn is_allowed_fixed_external_runner(entry: &str) -> bool {
+    matches!(entry, "/usr/bin/python3")
 }
 
 fn validate_contained_file_path(
@@ -8724,6 +11933,26 @@ fn validate_contained_file_path(
             });
         }
         return;
+    }
+    #[cfg(unix)]
+    if matches!(
+        kind,
+        "tool" | "mcp server" | "entrypoint" | "command" | "hook" | "lifecycle command"
+    ) && Path::new(entry)
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some("py")
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: format!(
+                    "plugin {kind} path `{}` must have a POSIX executable bit set",
+                    path.display()
+                ),
+            });
+            return;
+        }
     }
     if let Err(error) = validate_canonical_containment(root, &path, kind) {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
@@ -8868,6 +12097,9 @@ fn validate_command_path(root: &Path, entry: &str, kind: &str) -> Result<(), Plu
         return Err(PluginError::InvalidManifest(format!(
             "{kind} command `{entry}` must be a plugin-contained file path, not a bare command"
         )));
+    }
+    if is_allowed_fixed_external_runner(entry) && matches!(kind, "tool" | "mcp server") {
+        return Ok(());
     }
     let path = if Path::new(entry).is_absolute() {
         PathBuf::from(entry)
@@ -11883,6 +15115,121 @@ mod tests {
     }
 
     #[test]
+    fn load_plugin_from_directory_rejects_cargo_as_runtime_entrypoint() {
+        let root = temp_dir("manifest-cargo-runtime");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "cargo-runtime",
+  "version": "1.0.0",
+  "description": "Cargo must remain a build step",
+  "permissions": ["read"],
+  "tools": [
+    {
+      "name": "cargo_tool",
+      "description": "Invalid cargo runtime",
+      "inputSchema": {"type": "object"},
+      "command": "/usr/bin/cargo",
+      "args": ["run", "--quiet", "--manifest-path", "./Cargo.toml", "--bin", "tool"],
+      "requiredPermission": "read-only"
+    }
+  ]
+}"#,
+        );
+
+        let error =
+            load_plugin_from_directory(&root).expect_err("cargo runtime should fail closed");
+        assert!(error.to_string().contains("cargo"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_source_only_scaffold_as_not_ready() {
+        let root = temp_dir("source-only-scaffold");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "name": "source-only-demo",
+  "version": "1.0.0",
+  "description": "Source only demo",
+  "manifestMetadata": {
+    "sourceOnly": true,
+    "buildRequired": true,
+    "registrationReady": false
+  },
+  "capabilities": { "tools": true },
+  "tools": [{
+    "name": "demo",
+    "description": "Demo",
+    "inputSchema": { "type": "object", "additionalProperties": false },
+    "command": "./bin/tool",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+        write_file(root.join("bin").join("tool").as_path(), "not built\n");
+        let error =
+            load_plugin_from_directory(&root).expect_err("source-only scaffold should not load");
+        let rendered = error.to_string();
+        match &error {
+            PluginError::BuildRequired {
+                build_required,
+                source_only,
+                registration_ready,
+                ..
+            } => {
+                assert!(*build_required);
+                assert!(*source_only);
+                assert!(!*registration_ready);
+            }
+            other => panic!("expected build-required error, got {other}"),
+        }
+        assert!(rendered.contains("plugin_build_required"));
+        assert!(rendered.contains("source-only"));
+        assert!(rendered.contains("registration-ready"));
+        assert_eq!(error.code(), "plugin_build_required");
+        assert_eq!(
+            error.details().expect("details")["registrationReady"],
+            Value::Bool(false)
+        );
+
+        let _ = fs::remove_dir_all(root);
+
+        let root = temp_dir("source-not-ready-scaffold");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "name": "source-not-ready-demo",
+  "version": "1.0.0",
+  "description": "Source not ready demo",
+  "manifestMetadata": {
+    "sourceOnly": true,
+    "buildRequired": false,
+    "registrationReady": false
+  },
+  "capabilities": { "tools": true },
+  "tools": [{
+    "name": "demo",
+    "description": "Demo",
+    "inputSchema": { "type": "object", "additionalProperties": false },
+    "command": "./bin/tool",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+        write_file(root.join("bin").join("tool").as_path(), "not ready\n");
+        let error = load_plugin_from_directory(&root)
+            .expect_err("source-not-ready scaffold should not load");
+        assert!(matches!(&error, PluginError::SourceNotReady { .. }));
+        assert_eq!(error.code(), "plugin_source_not_ready");
+        assert!(error.to_string().contains("plugin_source_not_ready"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn load_plugin_from_directory_rejects_missing_lifecycle_paths() {
         // given
         let root = temp_dir("manifest-lifecycle-paths");
@@ -12083,7 +15430,14 @@ mod tests {
         assert!(structured_summary
             .permission_declaration_statuses
             .iter()
-            .all(|status| !status.enforced && status.declaration_only));
+            .all(|status| status.enforced && !status.declaration_only));
+        assert_eq!(
+            structured_summary.permission_declaration_statuses[0]
+                .enforced_permission
+                .as_ref()
+                .map(|permission| permission.as_str()),
+            Some("read")
+        );
 
         let legacy_root = temp_dir("summary-legacy-permissions");
         write_file(
@@ -13324,7 +16678,7 @@ mod tests {
             assert_ne!(
                 resolved, compile_time_path,
                 "bundled_root() must not fall back to CARGO_MANIFEST_DIR when that path \
-                 does not exist — this would regress the root-owned-dir permission bug"
+                 does not exist -?this would regress the root-owned-dir permission bug"
             );
         }
         // Either the path exists (dev scenario) or we got a runtime-relative path.
@@ -13408,7 +16762,7 @@ mod tests {
         let _guard = env_guard();
         let config_home = temp_dir("auto-detect-bundled-home");
 
-        // No bundled_root set — forces auto-detection in bundled_root().
+        // No bundled_root set -?forces auto-detection in bundled_root().
         let config = PluginManagerConfig::new(&config_home);
         let manager = PluginManager::new(config);
 
@@ -15575,9 +18929,11 @@ mod tests {
             "type": "object",
             "required": ["name", "ports", "mode", "count"],
             "properties": {
-                "name": { "type": "string", "pattern": "^svc" },
+                "name": { "type": "string", "pattern": "^svc", "minLength": 3, "maxLength": 8 },
                 "ports": {
                     "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
                     "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
                 },
                 "mode": { "enum": ["inspect", "plan"] },
@@ -15630,6 +18986,15 @@ mod tests {
                 || rendered.contains("minimum"),
             "schema failure should cite the violated keyword, got: {rendered}"
         );
+        let too_long = serde_json::json!({
+            "name": "svc-name-too-long",
+            "ports": [80],
+            "mode": "inspect",
+            "count": 1
+        });
+        let error = validate_json_schema_value(&schema, &too_long, "input")
+            .expect_err("maxLength should fail");
+        assert!(error.to_string().contains("maxLength"));
     }
 
     #[test]
@@ -16444,6 +19809,97 @@ mod tests {
         assert!(ops
             .iter()
             .any(|plugin| plugin.ops_permissions[0].rollback_required));
+        let log_analyzer = ops
+            .iter()
+            .find(|plugin| plugin.name == "log_analyzer")
+            .expect("log analyzer");
+        assert!(log_analyzer.capabilities.resources);
+        assert_eq!(log_analyzer.resources.len(), 1);
+        assert_eq!(
+            log_analyzer.resources[0].uri,
+            "claw://builtin/log_analyzer/journal"
+        );
+        let disk = ops
+            .iter()
+            .find(|plugin| plugin.name == "disk_cleaner")
+            .expect("disk cleaner");
+        assert_eq!(
+            disk.tools[0].required_permission,
+            PluginToolPermission::DangerFullAccess
+        );
+        assert!(disk.ops_permissions[0]
+            .irreversible_actions
+            .iter()
+            .any(|action| action == "clean_temp"));
+        assert!(disk
+            .permission_declarations
+            .iter()
+            .any(|declaration| matches!(
+                declaration,
+                PluginPermissionDeclaration::Filesystem { paths, .. }
+                    if paths.iter().any(|path| path == "/var/cache/dnf")
+                        && paths.iter().any(|path| path == "/var/log/journal")
+            )));
+        let cron = ops
+            .iter()
+            .find(|plugin| plugin.name == "cron_manager")
+            .expect("cron manager");
+        assert_eq!(
+            cron.tools[0].required_permission,
+            PluginToolPermission::DangerFullAccess
+        );
+        assert!(cron.ops_permissions[0]
+            .actions
+            .iter()
+            .any(|action| action == "create"));
+        let user = ops
+            .iter()
+            .find(|plugin| plugin.name == "user_manager")
+            .expect("user manager");
+        assert!(user.ops_permissions[0]
+            .irreversible_actions
+            .iter()
+            .any(|action| action == "delete"));
+        let package = ops
+            .iter()
+            .find(|plugin| plugin.name == "package_manager")
+            .expect("package manager");
+        assert!(package.ops_permissions[0]
+            .irreversible_actions
+            .iter()
+            .any(|action| action == "update"));
+        let network = ops
+            .iter()
+            .find(|plugin| plugin.name == "network_diagnostics")
+            .expect("network diagnostics");
+        assert!(network
+            .permission_declarations
+            .iter()
+            .any(|declaration| matches!(
+                declaration,
+                PluginPermissionDeclaration::Network { origins }
+                    if origins == &vec!["validated-host-or-ip:any-port".to_string()]
+            )));
+        for plugin in &ops {
+            assert!(
+                plugin
+                    .permission_declarations
+                    .iter()
+                    .any(|declaration| matches!(
+                        declaration,
+                        PluginPermissionDeclaration::Process { .. }
+                    )),
+                "{} should declare process commands",
+                plugin.name
+            );
+            assert_eq!(
+                plugin.tools[0]
+                    .output_schema
+                    .as_ref()
+                    .expect("output schema")["properties"]["schema"]["enum"][0],
+                BUILTIN_OPS_RESULT_SCHEMA
+            );
+        }
     }
 
     #[test]
@@ -16462,9 +19918,602 @@ mod tests {
             }))
             .expect("builtin ops execution should return plan");
         let value: Value = serde_json::from_str(&output).expect("json output");
+        assert_eq!(value["schema"], BUILTIN_OPS_RESULT_SCHEMA);
+        assert_eq!(value["ok"], false);
         assert_eq!(value["status"], "requires_confirmation");
         assert_eq!(value["audit"]["mutationPerformed"], false);
+        assert_eq!(value["confirmation"]["trustedAuthorization"], false);
         assert_eq!(value["rollback"]["available"], true);
+    }
+
+    #[test]
+    fn builtin_ops_mutation_does_not_trust_confirm_json_without_runtime_authorization() {
+        let _guard = env_guard();
+        let plugin = builtin_plugins()
+            .into_iter()
+            .find(|plugin| plugin.metadata().id == "service_manager@builtin")
+            .expect("service manager builtin");
+        let output = plugin.tools()[0]
+            .execute(&serde_json::json!({
+                "target": "demo",
+                "action": "restart",
+                "dryRun": false,
+                "confirm": true
+            }))
+            .expect("confirmation failure is structured output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+        assert_eq!(value["status"], "requires_confirmation");
+        assert_eq!(value["confirmed"], true);
+        assert_eq!(value["confirmation"]["trustedAuthorization"], false);
+        assert_eq!(value["audit"]["mutationPerformed"], false);
+    }
+
+    #[test]
+    fn approval_capabilities_redact_secrets_and_disabled_verifier_fails_closed() {
+        let (issuer, verifier) = plugin_approval_channel().expect("approval channel");
+        let grant = issuer
+            .issue("plugin@builtin", "ops_plugin", "input-hash", "plan-hash")
+            .expect("approval grant");
+        let secret = hex_encode(issuer.secret.as_ref());
+        let signature = hex_encode(&grant.signature);
+        for rendered in [
+            format!("{issuer:?}"),
+            format!("{verifier:?}"),
+            format!("{grant:?}"),
+        ] {
+            assert!(rendered.contains("[redacted]"));
+            assert!(!rendered.contains(&secret));
+            assert!(!rendered.contains(&grant.nonce));
+            assert!(!rendered.contains(&signature));
+        }
+
+        assert!(PluginApprovalVerifier::disabled()
+            .verify_and_consume(
+                &grant,
+                "plugin@builtin",
+                "ops_plugin",
+                "input-hash",
+                "plan-hash",
+            )
+            .is_none());
+        assert!(!grant.is_consumed());
+    }
+
+    #[test]
+    fn builtin_ops_authorization_context_is_bound_and_one_time() {
+        let plugin = builtin_plugins()
+            .into_iter()
+            .find(|plugin| plugin.metadata().id == "firewall_manager@builtin")
+            .expect("firewall builtin");
+        let (runtime, issuer) =
+            PluginRuntimeRegistry::new_with_approval_channel(PluginRegistry::new(vec![
+                RegisteredPlugin::new(plugin, true),
+            ]))
+            .expect("approval channel");
+        let input = serde_json::json!({
+            "action": "update_rule",
+            "dryRun": false,
+            "confirm": true,
+            "handle": 1,
+            "protocol": "tcp",
+            "port": 22
+        });
+        let direct = runtime
+            .execute_tool("ops_firewall_manager", &input)
+            .expect("direct call should return structured denial");
+        let direct: Value = serde_json::from_str(&direct).expect("json");
+        assert_eq!(direct["status"], "requires_confirmation");
+        assert_eq!(direct["confirmation"]["trustedAuthorization"], false);
+
+        let request = runtime
+            .authorization_request("ops_firewall_manager", &input)
+            .expect("auth request")
+            .expect("mutation requires auth");
+        let grant = issuer
+            .issue(
+                &request.plugin_id,
+                &request.tool_name,
+                &request.input_hash,
+                &request.plan_hash,
+            )
+            .expect("grant");
+        let (_other_issuer, _other_verifier) =
+            plugin_approval_channel().expect("second channel should build");
+        let mismatched_channel_grant = _other_issuer
+            .issue(
+                &request.plugin_id,
+                &request.tool_name,
+                &request.input_hash,
+                &request.plan_hash,
+            )
+            .expect("mismatched grant");
+        let tampered = serde_json::json!({
+            "action": "update_rule",
+            "dryRun": false,
+            "confirm": true,
+            "handle": 2,
+            "protocol": "tcp",
+            "port": 22
+        });
+        let tampered = runtime
+            .execute_tool_with_grant("ops_firewall_manager", &tampered, Some(&grant))
+            .expect("mismatched context should be a structured denial");
+        let tampered: Value = serde_json::from_str(&tampered).expect("json");
+        assert_eq!(tampered["status"], "requires_confirmation");
+        assert!(!grant.is_consumed());
+
+        let mismatched = runtime
+            .execute_tool_with_grant(
+                "ops_firewall_manager",
+                &input,
+                Some(&mismatched_channel_grant),
+            )
+            .expect("mismatched channel should be denied without mutation");
+        let mismatched: Value = serde_json::from_str(&mismatched).expect("json");
+        assert_eq!(mismatched["status"], "requires_confirmation");
+
+        let authorized = runtime
+            .execute_tool_with_grant("ops_firewall_manager", &input, Some(&grant))
+            .expect("authorized call should return bounded structured output");
+        let authorized: Value = serde_json::from_str(&authorized).expect("json");
+        assert_eq!(authorized["status"], "unsupported");
+        assert_eq!(authorized["confirmation"]["trustedAuthorization"], true);
+        assert!(grant.is_consumed());
+        let reused = runtime
+            .execute_tool_with_grant("ops_firewall_manager", &input, Some(&grant))
+            .expect("used context should be denied without mutation");
+        let reused: Value = serde_json::from_str(&reused).expect("json");
+        assert_eq!(reused["status"], "requires_confirmation");
+    }
+
+    #[test]
+    fn builtin_ops_checkpoint_input_redacts_confirmation_fields() {
+        let sanitized = sanitize_builtin_ops_checkpoint_input(&serde_json::json!({
+            "action": "restart",
+            "target": "demo",
+            "confirm": true,
+            "authorizationNonce": "SECRET"
+        }));
+        assert!(sanitized.get("confirm").is_none());
+        assert!(sanitized.get("authorizationNonce").is_none());
+        assert_eq!(sanitized["action"], "restart");
+    }
+
+    #[test]
+    fn private_ops_file_create_new_refuses_existing_target() {
+        let root = temp_dir("private-ops-file-conflict");
+        let path = root.join("checkpoint.json");
+        create_new_private_ops_file(&path, b"first").expect("first create");
+        let error =
+            create_new_private_ops_file(&path, b"second").expect_err("existing target refused");
+        assert!(matches!(
+            error,
+            PluginError::Io(ref io_error)
+                if io_error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&path).expect("original survives"), b"first");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_ops_file_uses_0600_and_checkpoint_root_rejects_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let _guard = env_guard();
+        let root = temp_dir("private-ops-file-mode");
+        let path = root.join("checkpoint.json");
+        create_new_private_ops_file(&path, b"{}").expect("private file");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+
+        let real = root.join("real");
+        let link = root.join("link");
+        fs::create_dir_all(&real).expect("real checkpoint dir");
+        symlink(&real, &link).expect("checkpoint symlink");
+        let previous = std::env::var_os("CLAW_OPS_CHECKPOINT_DIR");
+        std::env::set_var("CLAW_OPS_CHECKPOINT_DIR", &link);
+        let error = checkpoint_sidecar_path("sidecar", "json")
+            .expect_err("checkpoint root symlink refused");
+        assert!(
+            error.to_string().contains("real"),
+            "unexpected error: {error}"
+        );
+        match previous {
+            Some(value) => std::env::set_var("CLAW_OPS_CHECKPOINT_DIR", value),
+            None => std::env::remove_var("CLAW_OPS_CHECKPOINT_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_alert_mutation_uses_runtime_authorization_and_checkpointed_rollback() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let previous_rules = std::env::var_os("CLAW_OPS_ALERT_RULE_DIR");
+        let previous_checkpoints = std::env::var_os("CLAW_OPS_CHECKPOINT_DIR");
+        let workspace = temp_dir("log-alert-authorized");
+        let rules = workspace.join("rules");
+        let checkpoints = workspace.join("checkpoints");
+        fs::create_dir_all(&workspace).expect("workspace");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        std::env::set_var("CLAW_OPS_ALERT_RULE_DIR", &rules);
+        std::env::set_var("CLAW_OPS_CHECKPOINT_DIR", &checkpoints);
+
+        let plugin = builtin_plugins()
+            .into_iter()
+            .find(|plugin| plugin.metadata().id == "log_analyzer@builtin")
+            .expect("log analyzer builtin");
+        let (runtime, issuer) =
+            PluginRuntimeRegistry::new_with_approval_channel(PluginRegistry::new(vec![
+                RegisteredPlugin::new(plugin, true),
+            ]))
+            .expect("approval channel");
+        assert!(runtime
+            .authorization_request(
+                "ops_log_analyzer",
+                &serde_json::json!({
+                    "action": "alert_create",
+                    "ruleId": "error_burst",
+                    "pattern": "error",
+                    "dryRun": false,
+                    "confirm": true,
+                    "authorizationNonce": "SECRET"
+                })
+            )
+            .is_err());
+        let input = serde_json::json!({
+            "action": "alert_create",
+            "ruleId": "error_burst",
+            "pattern": "error",
+            "dryRun": false,
+            "confirm": true
+        });
+        let request = runtime
+            .authorization_request("ops_log_analyzer", &input)
+            .expect("auth request")
+            .expect("mutation requires auth");
+        assert_eq!(
+            request.plan[0]["command"]["program"],
+            "builtin:log-alert-rules"
+        );
+        let grant = issuer
+            .issue(
+                &request.plugin_id,
+                &request.tool_name,
+                &request.input_hash,
+                &request.plan_hash,
+            )
+            .expect("grant");
+        let output = runtime
+            .execute_tool_with_grant("ops_log_analyzer", &input, Some(&grant))
+            .expect("authorized create");
+        let value: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["confirmation"]["trustedAuthorization"], true);
+        assert!(rules.join("error_burst.json").is_file());
+        let checkpoint_id = value["rollback"]["checkpoint"]["id"]
+            .as_str()
+            .expect("checkpoint id")
+            .to_string();
+        let checkpoint_path = checkpoints.join(&checkpoint_id);
+        let checkpoint: Value =
+            serde_json::from_slice(&fs::read(&checkpoint_path).expect("checkpoint"))
+                .expect("checkpoint json");
+        assert!(checkpoint["input"].get("confirm").is_none());
+        assert!(checkpoint["input"].get("authorizationNonce").is_none());
+
+        let rollback_input = serde_json::json!({
+            "action": "rollback",
+            "checkpointId": checkpoint_id,
+            "confirm": true,
+            "dryRun": false
+        });
+        let rollback_request = runtime
+            .authorization_request("ops_log_analyzer", &rollback_input)
+            .expect("rollback auth request")
+            .expect("rollback requires auth");
+        let rollback_grant = issuer
+            .issue(
+                &rollback_request.plugin_id,
+                &rollback_request.tool_name,
+                &rollback_request.input_hash,
+                &rollback_request.plan_hash,
+            )
+            .expect("rollback grant");
+        let rollback = runtime
+            .execute_tool_with_grant("ops_log_analyzer", &rollback_input, Some(&rollback_grant))
+            .expect("authorized rollback");
+        let rollback: Value = serde_json::from_str(&rollback).expect("rollback json");
+        assert_eq!(rollback["status"], "rolled_back");
+        assert!(!rules.join("error_burst.json").exists());
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_rules {
+            Some(value) => std::env::set_var("CLAW_OPS_ALERT_RULE_DIR", value),
+            None => std::env::remove_var("CLAW_OPS_ALERT_RULE_DIR"),
+        }
+        match previous_checkpoints {
+            Some(value) => std::env::set_var("CLAW_OPS_CHECKPOINT_DIR", value),
+            None => std::env::remove_var("CLAW_OPS_CHECKPOINT_DIR"),
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_contained_entrypoint_requires_posix_exec_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = env_guard();
+        let root = temp_dir("entrypoint-exec-bit");
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "exec-bit-demo",
+  "version": "1.0.0",
+  "description": "Entrypoint exec bit demo",
+  "capabilities": { "tools": true },
+  "tools": [{
+    "name": "demo",
+    "description": "Demo tool",
+    "inputSchema": { "type": "object", "additionalProperties": false },
+    "command": "./bin/tool",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+        let binary = root.join("bin").join("tool");
+        write_file(binary.as_path(), "#!/bin/sh\nprintf ok\n");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let error = load_plugin_from_directory(&root).expect_err("missing exec bit should fail");
+        assert!(error.to_string().contains("POSIX executable bit"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_timer_file_helpers_validate_injected_root_and_calendar() {
+        let _guard = env_guard();
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        let previous_root = std::env::var_os("CLAW_OPS_SYSTEMD_ROOT");
+        let workspace = temp_dir("cron-helper-root");
+        let systemd_root = workspace.join("systemd");
+        fs::create_dir_all(&systemd_root).expect("systemd root");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        std::env::set_var("CLAW_OPS_SYSTEMD_ROOT", &systemd_root);
+
+        let input = serde_json::json!({
+            "action": "create",
+            "unit": "backup.timer",
+            "serviceUnit": "backup.service",
+            "calendar": "*-*-* 03:00:00"
+        });
+        assert_eq!(
+            cron_timer_file(&input).expect("timer path"),
+            systemd_root.join("backup.timer")
+        );
+        let contents = String::from_utf8(cron_timer_contents(&input).expect("timer contents"))
+            .expect("utf8 timer");
+        assert!(contents.contains("OnCalendar=*-*-* 03:00:00"));
+        assert!(contents.contains("Unit=backup.service"));
+        assert!(cron_timer_file(&serde_json::json!({
+            "unit": "../escape.timer",
+            "serviceUnit": "backup.service",
+            "calendar": "*-*-* 03:00:00"
+        }))
+        .is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let real_root = workspace.join("real-systemd");
+            let link_root = workspace.join("linked-systemd");
+            fs::create_dir_all(&real_root).expect("real root");
+            symlink(&real_root, &link_root).expect("symlink root");
+            std::env::set_var("CLAW_OPS_SYSTEMD_ROOT", &link_root);
+            let error = cron_timer_file(&input).expect_err("symlink root should fail closed");
+            assert!(error.to_string().contains("real directories"), "{error}");
+        }
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_root {
+            Some(value) => std::env::set_var("CLAW_OPS_SYSTEMD_ROOT", value),
+            None => std::env::remove_var("CLAW_OPS_SYSTEMD_ROOT"),
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn builtin_ops_added_surfaces_resolve_to_fixed_argv() {
+        let _guard = env_guard();
+        let workspace = temp_dir("builtin-added-surfaces");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let previous_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("enter workspace");
+        write_file(
+            workspace.join("rule.json").as_path(),
+            r#"{"pattern":"error"}"#,
+        );
+
+        let user = build_builtin_ops_command(
+            "user_manager",
+            "modify_permissions",
+            &serde_json::json!({"target": "alice", "group": "wheel"}),
+        )
+        .expect("user command");
+        assert_eq!(user.program, "/usr/sbin/usermod");
+        assert_eq!(
+            user.args,
+            ["--append", "--groups", "wheel", "--", "alice"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(user.mutating);
+
+        let firewall = build_builtin_ops_command(
+            "firewall_manager",
+            "update_rule",
+            &serde_json::json!({"handle": 7, "protocol": "tcp", "port": 443}),
+        )
+        .expect("firewall command");
+        assert_eq!(firewall.program, "/usr/sbin/nft");
+        assert!(firewall
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "handle" && pair[1] == "7"));
+        assert!(firewall.mutating);
+
+        let cron = build_builtin_ops_command(
+            "cron_manager",
+            "create",
+            &serde_json::json!({"target": "backup.timer"}),
+        )
+        .expect("cron command");
+        assert_eq!(cron.program, "/usr/bin/systemctl");
+        assert_eq!(cron.args, vec!["daemon-reload".to_string()]);
+        assert!(cron.mutating);
+
+        let alert = build_builtin_ops_command(
+            "log_analyzer",
+            "alert_create",
+            &serde_json::json!({
+                "target": "rule.json",
+                "ruleId": "error_burst",
+                "pattern": "error"
+            }),
+        )
+        .expect("alert command");
+        assert_eq!(alert.program, "/usr/bin/true");
+        assert!(alert
+            .args
+            .iter()
+            .any(|arg| arg.ends_with(".claw\\log-alerts\\error_burst.json")
+                || arg.ends_with(".claw/log-alerts/error_burst.json")));
+        assert!(alert.mutating);
+
+        let data_dir = workspace.join("data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        write_file(data_dir.join("state.txt").as_path(), "state");
+        write_file(workspace.join("backup.tar").as_path(), "not a tar");
+        let restore = build_builtin_ops_command(
+            "backup_manager",
+            "restore",
+            &serde_json::json!({
+                "target": data_dir.join("state.txt").display().to_string(),
+                "archive": workspace.join("backup.tar").display().to_string()
+            }),
+        )
+        .expect("backup restore command");
+        assert_eq!(restore.program, "/usr/bin/tar");
+        let canonical_data_dir = fs::canonicalize(&data_dir)
+            .expect("canonical data dir")
+            .display()
+            .to_string();
+        assert!(restore
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-C" && pair[1] == canonical_data_dir));
+        assert_eq!(
+            restore
+                .args
+                .iter()
+                .rev()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            vec!["--".to_string(), "state.txt".to_string()]
+        );
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn builtin_ops_mutating_actions_have_recovery_or_explicit_irreversible_policy() {
+        let deterministic = [
+            ("disk_cleaner", "archive_logs"),
+            ("service_manager", "start"),
+            ("service_manager", "stop"),
+            ("service_manager", "restart"),
+            ("user_manager", "create"),
+            ("user_manager", "modify_permissions"),
+            ("user_manager", "set_password_policy"),
+            ("firewall_manager", "add_rule"),
+            ("firewall_manager", "delete_rule"),
+            ("firewall_manager", "update_rule"),
+            ("cron_manager", "create"),
+            ("cron_manager", "modify"),
+            ("cron_manager", "delete"),
+            ("cron_manager", "enable"),
+            ("cron_manager", "disable"),
+            ("backup_manager", "restore"),
+            ("log_analyzer", "alert_create"),
+            ("log_analyzer", "alert_update"),
+            ("log_analyzer", "alert_delete"),
+        ];
+        for (plugin, action) in deterministic {
+            assert!(
+                matches!(
+                    builtin_ops_recovery(plugin, action),
+                    BuiltinOpsRecovery::Deterministic(_)
+                ),
+                "{plugin}:{action} should declare deterministic recovery"
+            );
+        }
+        assert!(matches!(
+            builtin_ops_recovery("user_manager", "terminate_session"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("user_manager", "delete"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("package_manager", "install"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("package_manager", "remove"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("package_manager", "update"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("disk_cleaner", "clean_temp"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+        assert!(matches!(
+            builtin_ops_recovery("disk_cleaner", "clean_package_cache"),
+            BuiltinOpsRecovery::Irreversible(_)
+        ));
+    }
+
+    #[test]
+    fn builtin_ops_executable_check_reports_nested_fixed_argv_programs() {
+        let current_exe = std::env::current_exe().expect("current exe");
+        let program: &'static str = Box::leak(current_exe.display().to_string().into_boxed_str());
+        let command = BuiltinOpsCommand {
+            program,
+            args: vec![
+                "5".to_string(),
+                "/usr/bin/nc".to_string(),
+                "-zv".to_string(),
+                "localhost".to_string(),
+            ],
+            mutating: false,
+        };
+        assert_eq!(
+            missing_builtin_command(&command),
+            Some("/usr/bin/nc".to_string())
+        );
     }
 
     #[test]
@@ -16505,7 +20554,10 @@ mod tests {
                 .execute(&input)
                 .unwrap_or_else(|error| panic!("{name} dry-run failed: {error}"));
             let value: Value = serde_json::from_str(&output).expect("json");
-            assert_eq!(value["status"], "dry_run", "{name}");
+            assert!(
+                value["status"] == "dry_run" || value["status"] == "unsupported",
+                "{name}: {value}"
+            );
             assert_eq!(value["audit"]["mutationPerformed"], false, "{name}");
             assert_eq!(value["plan"][0]["command"]["shell"], false, "{name}");
             let program = value["plan"][0]["command"]["program"]
@@ -16514,6 +20566,88 @@ mod tests {
             assert!(program.starts_with("/usr/"), "{name}: {program}");
             assert!(!output.contains("cmd.exe"), "{name}");
             assert!(!output.contains("PowerShell"), "{name}");
+        }
+    }
+
+    #[test]
+    fn builtin_ops_action_matrix_uses_fixed_argv_without_shell() {
+        let cases = [
+            (
+                "disk_cleaner",
+                serde_json::json!({"action": "archive_logs", "target": "/var/log", "destination": "./logs.tar", "dryRun": true}),
+                "/usr/bin/tar",
+            ),
+            (
+                "service_manager",
+                serde_json::json!({"action": "log", "target": "sshd", "dryRun": true}),
+                "/usr/bin/journalctl",
+            ),
+            (
+                "user_manager",
+                serde_json::json!({"action": "password_policy", "target": "root", "dryRun": true}),
+                "/usr/bin/chage",
+            ),
+            (
+                "log_analyzer",
+                serde_json::json!({"action": "search", "pattern": "error", "dryRun": true}),
+                "/usr/bin/journalctl",
+            ),
+            (
+                "package_manager",
+                serde_json::json!({"action": "dependencies", "target": "bash", "dryRun": true}),
+                "/usr/bin/dnf",
+            ),
+            (
+                "firewall_manager",
+                serde_json::json!({"action": "add_rule", "protocol": "tcp", "port": 22, "dryRun": true}),
+                "/usr/sbin/nft",
+            ),
+            (
+                "cron_manager",
+                serde_json::json!({"action": "execution_records", "target": "demo", "dryRun": true}),
+                "/usr/bin/journalctl",
+            ),
+            (
+                "network_diagnostics",
+                serde_json::json!({"action": "port_scan", "target": "localhost", "port": 22, "dryRun": true}),
+                "/usr/bin/timeout",
+            ),
+            (
+                "backup_manager",
+                serde_json::json!({"action": "snapshot", "target": ".", "destination": "./snapshot.tar", "dryRun": true}),
+                "/usr/bin/tar",
+            ),
+        ];
+        let plugins = builtin_plugins();
+        for (name, input, expected_program) in cases {
+            let plugin = plugins
+                .iter()
+                .find(|plugin| plugin.metadata().id == format!("{name}@builtin"))
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let output = plugin.tools()[0]
+                .execute(&input)
+                .unwrap_or_else(|error| panic!("{name} dry-run failed: {error}"));
+            let value: Value = serde_json::from_str(&output).expect("json");
+            assert_eq!(value["schema"], BUILTIN_OPS_RESULT_SCHEMA, "{name}");
+            assert_eq!(
+                value["plan"][0]["command"]["program"], expected_program,
+                "{name}"
+            );
+            assert_eq!(value["plan"][0]["command"]["shell"], false, "{name}");
+            let program_name = Path::new(expected_program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("program basename");
+            assert!(
+                plugin.permission_declarations().iter().any(|declaration| {
+                    matches!(
+                        declaration,
+                        PluginPermissionDeclaration::Process { commands }
+                            if commands.iter().any(|command| command == program_name)
+                    )
+                }),
+                "{name} should declare process command {program_name}"
+            );
         }
     }
 
@@ -16530,5 +20664,42 @@ mod tests {
             }))
             .expect_err("option-like target must fail");
         assert!(error.to_string().contains("invalid systemd unit"));
+    }
+
+    #[test]
+    fn builtin_ops_input_schema_enforces_string_bounds() {
+        let plugin = builtin_plugins()
+            .into_iter()
+            .find(|plugin| plugin.metadata().id == "network_diagnostics@builtin")
+            .expect("network diagnostics");
+        let error = plugin.tools()[0]
+            .execute(&serde_json::json!({
+                "action": "dns",
+                "target": "a".repeat(600)
+            }))
+            .expect_err("schema should reject oversized target");
+        assert!(error.to_string().contains("maxLength"));
+    }
+
+    #[test]
+    fn log_analyzer_resource_reads_with_bounded_envelope() {
+        let registry = PluginRegistry::new(
+            builtin_plugins()
+                .into_iter()
+                .map(|plugin| RegisteredPlugin::new(plugin, true))
+                .collect(),
+        );
+        let value = registry
+            .read_resource(
+                "claw://builtin/log_analyzer/journal",
+                &serde_json::json!({"limit": 1}),
+            )
+            .expect("resource read should return structured ok or unsupported envelope");
+        assert_eq!(value["schema"], BUILTIN_OPS_RESULT_SCHEMA);
+        assert!(matches!(
+            value["status"].as_str(),
+            Some("ok" | "command_failed" | "unsupported")
+        ));
+        assert_eq!(value["audit"]["mutationPerformed"], false);
     }
 }

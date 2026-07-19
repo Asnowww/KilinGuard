@@ -81,7 +81,7 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, SystemPromptProvider,
-    ToolError, ToolExecutor, TurnSummary,
+    ToolAuthorizationRequest, ToolError, ToolExecutor, ToolInvocationAuthorization, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_with_policy, glob_search,

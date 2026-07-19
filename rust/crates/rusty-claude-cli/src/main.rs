@@ -52,7 +52,7 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{
-    sanitize_plugin_error, PluginHooks, PluginManager, PluginManagerConfig,
+    sanitize_plugin_error, PluginApprovalIssuer, PluginHooks, PluginManager, PluginManagerConfig,
     PluginMcpServerManifest, PluginMcpTransport, PluginRegistry, PluginRuntimeRegistry,
     PluginRuntimeStatus, PluginTool, PreparedPluginHotReload,
 };
@@ -65,8 +65,8 @@ use runtime::{
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime,
     JsonValue as RuntimeJsonValue, McpServer, McpServerManager, McpServerSpec, McpTool,
     MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolAuthorizationRequest, ToolError,
+    ToolExecutor, ToolInvocationAuthorization, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -281,6 +281,14 @@ fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
     if message.contains("missing Anthropic credentials") {
         "missing_credentials"
+    } else if message.starts_with("plugin_build_required:")
+        || message.contains("plugin_build_required")
+    {
+        "plugin_build_required"
+    } else if message.starts_with("plugin_source_not_ready:")
+        || message.contains("plugin_source_not_ready")
+    {
+        "plugin_source_not_ready"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
     } else if message.contains("no worker state file found") {
@@ -290,7 +298,7 @@ fn classify_error_kind(message: &str) -> &'static str {
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
     } else if message.contains("legacy session is missing workspace binding") {
-        // #780: must precede the generic "failed to restore session" arm — the full
+        // #780: must precede the generic "failed to restore session" arm -- the full
         // error message is "failed to restore session: legacy session is missing workspace
         // binding: ...", so the specific arm must be checked first.
         "legacy_session_no_workspace_binding"
@@ -364,7 +372,7 @@ fn classify_error_kind(message: &str) -> &'static str {
     } else if message.starts_with("missing_prompt:") {
         "missing_prompt"
     } else if message.contains("has been removed.") {
-        // #765: removed subcommands (login, logout) — hint contains migration guidance
+        // #765: removed subcommands (login, logout) -- hint contains migration guidance
         "removed_subcommand"
     } else if message.starts_with("unknown subcommand:") {
         // #785: typo/unknown top-level subcommand (e.g. `claw dump` → did you mean dump-manifests?)
@@ -594,6 +602,8 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
         "kind": failure.kind.to_string(),
         "source": plugins::sanitize_plugin_error(&failure.source),
         "lifecycle_state": "load_failed",
+        "error_code": failure.error().code(),
+        "error_details": failure.error().details(),
         "error": plugins::sanitize_plugin_error(&failure.error().to_string()),
     })
 }
@@ -955,7 +965,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor, init, state, export,
                 // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
+                // NOT be intercepted here -- they handle --help in their own
                 // dispatch paths via parse_local_help_action(). See #141.
                 wants_help = true;
                 index += 1;
@@ -1219,7 +1229,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // Skip this guard in test builds (parse_args tests run in non-TTY context).
             #[cfg(not(test))]
             // #746: newline before remediation so split_error_hint populates hint field
-            return Err("interactive_only: claw requires an interactive terminal.\nStdin is not a TTY and no prompt was provided — pipe a prompt with `echo 'task' | claw` or run `claw` in an interactive terminal.".into());
+            return Err("interactive_only: claw requires an interactive terminal.\nStdin is not a TTY and no prompt was provided -- pipe a prompt with `echo 'task' | claw` or run `claw` in an interactive terminal.".into());
         }
         return Ok(CliAction::Repl {
             model,
@@ -1355,7 +1365,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 .to_string(),
         ),
         // #767: `claw session bogus` bypassed parse_single_word_command_alias (rest.len()>1),
-        // had no match arm, and fell to CliAction::Prompt — reaching the credential gate
+        // had no match arm, and fell to CliAction::Prompt -- reaching the credential gate
         // instead of a structured error. Mirror the guard on `permissions`.
         "session" => {
             let action_hint = rest.get(1).map_or(String::new(), |a| format!(" (got: `{a}`)" ));
@@ -1363,7 +1373,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 "interactive_only: `claw session` is a slash command{action_hint}.\nUse `claw --resume SESSION.jsonl /session <action>` or start `claw` and run `/session [list|exists|switch|fork|delete]`."
             ))
         }
-        // #770: same fallthrough gap as #767 — these slash commands had no multi-arg match arm
+        // #770: same fallthrough gap as #767 -- these slash commands had no multi-arg match arm
         // and fell to CliAction::Prompt reaching the credential gate when called with args.
         "cost" => Err(
             "interactive_only: `claw cost` is a slash command.\nUse `claw --resume SESSION.jsonl /cost` or start `claw` and run `/cost`."
@@ -1430,7 +1440,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => {
-            // #771: extra positional args to `init` were silently ignored — now rejected
+            // #771: extra positional args to `init` were silently ignored -- now rejected
             if rest.len() > 1 {
                 let extra = rest[1..].join(" ");
                 return Err(format!(
@@ -1579,7 +1589,7 @@ fn parse_single_word_command_alias(
             // "doctor --help -h" is valid, routed to parse_local_help_action() instead
             return None;
         }
-        // #720: `claw help <topic>` — when the verb is "help" and exactly one
+        // #720: `claw help <topic>` -- when the verb is "help" and exactly one
         // non-flag argument follows, try to route to the topic's handler.
         if verb == "help" && rest.len() == 2 {
             let topic_name = rest[1].as_str();
@@ -1617,7 +1627,7 @@ fn parse_single_word_command_alias(
             "unrecognized argument `{}` for subcommand `{}`",
             rest[1], verb
         );
-        // #152: common mistake — users type `--json` expecting JSON output.
+        // #152: common mistake -- users type `--json` expecting JSON output.
         // Hint at the correct flag so they don't have to re-read --help.
         if rest[1] == "--json" {
             msg.push_str("\nDid you mean `--output-format json`?");
@@ -1628,7 +1638,7 @@ fn parse_single_word_command_alias(
         return Some(Err(msg));
     }
 
-    // #720: `claw help <topic>` — when `help` is the verb and a topic follows,
+    // #720: `claw help <topic>` -- when `help` is the verb and a topic follows,
     // try to route to the topic's help handler instead of erroring.
     if rest.len() == 2 && rest[0] == "help" {
         let topic_name = rest[1].as_str();
@@ -2469,7 +2479,7 @@ impl DiagnosticCheck {
             ),
             ("summary".to_string(), Value::String(self.summary.clone())),
             (
-                // #701 (complete): `details[]` is now the canonical structured form —
+                // #701 (complete): `details[]` is now the canonical structured form --
                 // `{key, value}` objects instead of padded prose strings. The legacy
                 // prose representation is preserved as `details_prose[]` for callers
                 // that still scrape the formatted strings.
@@ -3238,7 +3248,7 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
     )
     .with_details(details)
     .with_hint(
-        // #778: stable remediation hint — sandbox degraded on non-Linux hosts is expected, not an error
+        // #778: stable remediation hint -- sandbox degraded on non-Linux hosts is expected, not an error
         if degraded && !status.supported {
             "Sandbox namespace isolation requires Linux with `unshare`. On macOS/non-Linux hosts this warning is expected and can be ignored. Filesystem isolation is still active."
         } else if degraded {
@@ -3590,7 +3600,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     let mut session = session;
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
-        // SlashCommand::parse — they return Err(SlashCommandParseError) which
+        // SlashCommand::parse -- they return Err(SlashCommandParseError) which
         // formats as the confusing circular "Did you mean /X?" message.
         // STUB_COMMANDS covers both completions-filtered stubs and parse-less
         // spec entries; treat both as unsupported in resume mode.
@@ -5263,6 +5273,7 @@ struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugin_supervisor: PluginRuntimeRegistry,
+    plugin_approval_issuer: Option<PluginApprovalIssuer>,
     owns_plugins: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
@@ -5273,12 +5284,14 @@ impl BuiltRuntime {
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         plugin_supervisor: PluginRuntimeRegistry,
+        plugin_approval_issuer: Option<PluginApprovalIssuer>,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
             plugin_registry,
             plugin_supervisor,
+            plugin_approval_issuer,
             owns_plugins: true,
             mcp_state,
             mcp_active: true,
@@ -6550,6 +6563,7 @@ impl LiveCli {
             runtime_plugin_state,
             false,
             Some(self.runtime.plugin_supervisor.clone()),
+            self.runtime.plugin_approval_issuer.clone(),
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         runtime.set_plugin_owner(false);
@@ -6668,9 +6682,9 @@ impl LiveCli {
                 // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
+                // ?? Thinking ??OpenAI ????????? reasoning_content ??
                 // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
+                // error when the request is too large to even parse -- treat that as context overflow too.
                 let is_context_window = error_str.contains("context_window")
                     || error_str.contains("Context window")
                     || error_str.contains("no parseable body");
@@ -6704,7 +6718,7 @@ impl LiveCli {
                         let removed = result.removed_message_count;
 
                         if removed == 0 && round > 0 {
-                            // No more messages to compact — further rounds won't help
+                            // No more messages to compact -- further rounds won't help
                             println!("  No further compaction possible.");
                             break;
                         }
@@ -6722,7 +6736,7 @@ impl LiveCli {
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
                         // which still holds the ORIGINAL un-compacted session, so every retry round
-                        // would send the same bloated request — compaction was wasted.
+                        // would send the same bloated request -- compaction was wasted.
                         *self.runtime.session_mut() = result.compacted_session.clone();
 
                         // Build a new runtime with the compacted session and retry
@@ -6762,7 +6776,7 @@ impl LiveCli {
                                 if still_context_window && round + 1 < max_compact_rounds {
                                     // The compacted session was still too large for the model's context.
                                     // Shut down the old runtime, adopt the partially-compacted one,
-                                    // and loop — the next round will compact more aggressively.
+                                    // and loop -- the next round will compact more aggressively.
                                     runtime.shutdown_plugins()?;
                                     runtime = new_runtime;
                                     continue;
@@ -7383,7 +7397,7 @@ impl LiveCli {
             CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
             CliOutputFormat::Json => {
                 let value = handle_agents_slash_command_json(args, &cwd)?;
-                // #789: parity with print_mcp/#788 print_skills — exit 1 when envelope
+                // #789: parity with print_mcp/#788 print_skills -- exit 1 when envelope
                 // reports an error so automation can rely on exit code instead of
                 // parsing the JSON status field.
                 let is_error = value.get("status").and_then(|v| v.as_str()) == Some("error");
@@ -7893,6 +7907,7 @@ impl LiveCli {
                 runtime_plugin_state,
                 false,
                 Some(self.runtime.plugin_supervisor.clone()),
+                self.runtime.plugin_approval_issuer.clone(),
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -7995,6 +8010,7 @@ impl LiveCli {
             runtime_plugin_state,
             false,
             Some(self.runtime.plugin_supervisor.clone()),
+            self.runtime.plugin_approval_issuer.clone(),
         )?;
         self.replace_runtime_after_plugin_hot_swap(runtime)?;
         self.persist_session()
@@ -8072,6 +8088,7 @@ impl LiveCli {
             runtime_plugin_state,
             false,
             Some(self.runtime.plugin_supervisor.clone()),
+            self.runtime.plugin_approval_issuer.clone(),
         )?;
         self.replace_runtime_after_plugin_hot_swap(runtime)
     }
@@ -8119,6 +8136,7 @@ impl LiveCli {
             runtime_plugin_state,
             false,
             Some(self.runtime.plugin_supervisor.clone()),
+            self.runtime.plugin_approval_issuer.clone(),
         )?;
         runtime.set_plugin_owner(false);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -9138,7 +9156,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
         LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
   Usage            claw bootstrap-plan [--output-format <format>]
   Purpose          list the ordered startup phases the CLI would execute before dispatch
-  Output           phase names (text) or structured phase list (json) — primary output is the plan itself
+  Output           phase names (text) or structured phase list (json) -- primary output is the plan itself
   Formats          text (default), json
   Related          claw doctor · claw status"
             .to_string(),
@@ -10183,7 +10201,7 @@ fn truncate_for_prompt(value: &str, limit: usize) -> String {
         value.trim().to_string()
     } else {
         let truncated = value.chars().take(limit).collect::<String>();
-        format!("{}\n…[truncated]", truncated.trim_end())
+        format!("{}\n-?[truncated]", truncated.trim_end())
     }
 }
 
@@ -10464,7 +10482,7 @@ fn short_tool_id(id: &str) -> String {
         return id.to_string();
     }
     let prefix: String = id.chars().take(12).collect();
-    format!("{prefix}…")
+    format!("{prefix}-?")
 }
 
 fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -11101,6 +11119,7 @@ fn build_runtime_with_plugin_state(
         runtime_plugin_state,
         true,
         None,
+        None,
     )
 }
 
@@ -11119,6 +11138,7 @@ fn build_runtime_with_plugin_state_inner(
     runtime_plugin_state: RuntimePluginState,
     initialize_plugins: bool,
     plugin_supervisor: Option<PluginRuntimeRegistry>,
+    plugin_approval_issuer: Option<PluginApprovalIssuer>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -11133,8 +11153,14 @@ fn build_runtime_with_plugin_state_inner(
     if initialize_plugins {
         plugin_registry.initialize()?;
     }
-    let plugin_supervisor =
-        plugin_supervisor.unwrap_or_else(|| PluginRuntimeRegistry::new(plugin_registry.clone()));
+    let (plugin_supervisor, plugin_approval_issuer) = match plugin_supervisor {
+        Some(supervisor) => (supervisor, plugin_approval_issuer),
+        None => {
+            let (supervisor, issuer) =
+                PluginRuntimeRegistry::new_with_approval_channel(plugin_registry.clone())?;
+            (supervisor, Some(issuer))
+        }
+    };
     start_os_sense_scheduler().map_err(std::io::Error::other)?;
     let os_sense_prompt_provider =
         os_sense_system_prompt_provider().map_err(std::io::Error::other)?;
@@ -11165,8 +11191,11 @@ fn build_runtime_with_plugin_state_inner(
         policy,
         system_prompt,
         &feature_config,
-    )
-    .with_system_prompt_provider(os_sense_prompt_provider);
+    );
+    if let Some(issuer) = plugin_approval_issuer.clone() {
+        runtime = runtime.with_plugin_approval_issuer(issuer);
+    }
+    runtime = runtime.with_system_prompt_provider(os_sense_prompt_provider);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -11174,6 +11203,7 @@ fn build_runtime_with_plugin_state_inner(
         runtime,
         plugin_registry,
         plugin_supervisor,
+        plugin_approval_issuer,
         mcp_state,
     ))
 }
@@ -11262,7 +11292,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
+// ?? Thinking ??OpenAI ????????? reasoning_content ??
 // `detect_provider_kind(&model)`. The struct name is kept to avoid
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
@@ -11291,8 +11321,8 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
+        // ?? Thinking ??OpenAI ????????? reasoning_content ??
+        // ?? Thinking ??OpenAI ????????? reasoning_content ??
         // wire format under the hood. We consult
         // `detect_provider_kind(&resolved_model)` so model-name prefix
         // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
@@ -11300,7 +11330,7 @@ impl AnthropicRuntimeClient {
         //
         // For Anthropic we build the client directly instead of going
         // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
+        // so we can explicitly apply `api::read_base_url()` -- that
         // reads `ANTHROPIC_BASE_URL` and is required for the local
         // mock-server test harness
         // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
@@ -11324,9 +11354,9 @@ impl AnthropicRuntimeClient {
                 // `OpenAiCompatClient::from_env` with the matching
                 // `OpenAiCompatConfig` (openai / xai / dashscope).
                 // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
+                // ?? Thinking ??OpenAI ????????? reasoning_content ??
                 // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
+                // ?? Thinking ??OpenAI ????????? reasoning_content ??
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
@@ -11472,7 +11502,7 @@ impl ApiClient for AnthropicRuntimeClient {
                         if error.to_string().contains("post-tool stall")
                             && attempt < max_attempts =>
                     {
-                        // Stalled after tool completion — nudge the model by
+                        // Stalled after tool completion -- nudge the model by
                         // re-sending the same request.
                     }
                     Err(error) => return Err(error),
@@ -11554,7 +11584,7 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
-                    // 特判 Thinking 块：初始化 pending_thinking（用于累积后续 ThinkingDelta）
+                    // ?? Thinking ????? pending_thinking??????? ThinkingDelta?
                     if let OutputContentBlock::Thinking {
                         thinking,
                         signature,
@@ -11595,13 +11625,13 @@ impl AnthropicRuntimeClient {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
-                        // 累积 thinking 文本到 pending_thinking（让 session 持久化能拿到）
+                        // ?? Thinking ????? pending_thinking??????? ThinkingDelta?
                         if let Some((t, _)) = &mut pending_thinking {
                             t.push_str(&thinking);
                         }
                     }
                     ContentBlockDelta::SignatureDelta { signature } => {
-                        // 累积 signature 到 pending_thinking
+                        // ?? Thinking ????? pending_thinking??????? ThinkingDelta?
                         if let Some((_, sig)) = &mut pending_thinking {
                             sig.get_or_insert_with(String::new).push_str(&signature);
                         }
@@ -11895,10 +11925,10 @@ const STUB_COMMANDS: &[&str] = &[
     "tag",
     "output-style",
     "add-dir",
-    // Spec entries with no parse arm — produce circular "Did you mean" error
+    // Spec entries with no parse arm -- produce circular "Did you mean" error
     // without this guard. Adding here routes them to the proper unsupported
     // message and excludes them from REPL completions / help.
-    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
+    // NOTE: do NOT add "stats", "tokens", "cache" -- they are implemented.
     "allowed-tools",
     "bookmarks",
     "workspace",
@@ -12072,7 +12102,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         "bash" | "Bash" => format_bash_call(&parsed),
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            format!("\x1b[2m📄 Reading {path}-?\x1b[0m")
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -12146,7 +12176,7 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
 }
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
-    "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
+    "\x1b[2m-? output truncated for display; full result preserved in session.\x1b[0m";
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
 const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
@@ -12444,10 +12474,16 @@ fn summarize_tool_payload(payload: &str) -> String {
 }
 
 fn truncate_for_summary(value: &str, limit: usize) -> String {
+    const TRUNCATION_SUFFIX: &str = "-?";
     let mut chars = value.chars();
     let truncated = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
-        format!("{truncated}…")
+        let suffix_len = TRUNCATION_SUFFIX.chars().count();
+        if limit <= suffix_len {
+            return TRUNCATION_SUFFIX.chars().take(limit).collect();
+        }
+        let prefix: String = value.chars().take(limit - suffix_len).collect();
+        format!("{prefix}{TRUNCATION_SUFFIX}")
     } else {
         truncated
     }
@@ -12587,7 +12623,7 @@ fn response_to_events(
 
 fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
     // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
+    // ?? Thinking ??OpenAI ????????? reasoning_content ??
     // xAI variants, which do not have a prompt cache. So this helper
     // remains a no-op on non-Anthropic providers without any extra
     // branching here.
@@ -12729,6 +12765,42 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_authorization(tool_name, input, None)
+    }
+
+    fn authorization_request(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Option<ToolAuthorizationRequest> {
+        let value = serde_json::from_str(input).ok()?;
+        if let Some(supervisor) = &self.plugin_supervisor {
+            let request = supervisor
+                .authorization_request(tool_name, &value)
+                .ok()
+                .flatten()?;
+            return Some(ToolAuthorizationRequest {
+                tool_name: tool_name.to_string(),
+                plugin_id: Some(request.plugin_id),
+                input_hash: request.input_hash,
+                plan_hash: request.plan_hash,
+                plan: request.plan,
+                required_mode: PermissionMode::DangerFullAccess,
+                reason: request.reason,
+            });
+        }
+        self.tool_registry
+            .plugin_tool_authorization_request(tool_name, &value)
+            .ok()
+            .flatten()
+    }
+
+    fn execute_with_authorization(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        authorization: Option<ToolInvocationAuthorization>,
+    ) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -12753,17 +12825,22 @@ impl ToolExecutor for CliToolExecutor {
                         .expect("generator checked above"),
                 )
                 .map_err(ToolError::new)
-        } else if let Some(output) = self
-            .tool_registry
-            .execute_plugin_tool_with(tool_name, &value, || {
-                let Some(supervisor) = &self.plugin_supervisor else {
-                    return self.tool_registry.execute(tool_name, &value);
-                };
-                supervisor
-                    .execute_tool(tool_name, &value)
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(ToolError::new)?
+        } else if let Some(output) = if let Some(supervisor) = &self.plugin_supervisor {
+            self.tool_registry.execute_plugin_tool_with_authorization(
+                tool_name,
+                &value,
+                authorization,
+                |grant| {
+                    supervisor
+                        .execute_tool_with_grant(tool_name, &value, grant)
+                        .map_err(|error| error.to_string())
+                },
+            )
+        } else {
+            self.tool_registry
+                .execute_plugin_tool_invocation(tool_name, &value, authorization)
+        }
+        .map_err(ToolError::new)?
         {
             Ok(output)
         } else {
@@ -12826,8 +12903,8 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         thinking,
                         signature,
                     } => {
-                        // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
-                        // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
+                        // ?? Thinking ??OpenAI ????????? reasoning_content ??
+                        // ??? DeepSeek V4??? 400 "reasoning_content must be passed back" ???
                         Some(InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
@@ -13008,7 +13085,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
         out,
-        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
+        "  do not run `{DEPRECATED_INSTALL_COMMAND}` -- it installs a deprecated stub"
     )?;
     writeln!(out, "  claw init")?;
     writeln!(out, "  claw export")?;
@@ -14318,7 +14395,7 @@ mod tests {
 
     #[test]
     fn parses_global_model_for_system_prompt() {
-        // given: a global OpenAI-compatible model before system-prompt
+        // ?? Thinking ??OpenAI ????????? reasoning_content ??
         let args = vec![
             "--model".to_string(),
             "openai/gpt-4.1-mini".to_string(),
@@ -15099,6 +15176,27 @@ mod tests {
     }
 
     #[test]
+    fn plugin_load_failure_json_exposes_stable_source_readiness_details() {
+        let failure = PluginLoadFailure::new(
+            PathBuf::from("/tmp/source-plugin"),
+            PluginKind::External,
+            "local-source".to_string(),
+            PluginError::BuildRequired {
+                message: "build the generated source before registration".to_string(),
+                build_required: true,
+                source_only: true,
+                registration_ready: false,
+            },
+        );
+
+        let rendered = super::plugin_load_failure_json(&failure);
+        assert_eq!(rendered["error_code"], "plugin_build_required");
+        assert_eq!(rendered["error_details"]["buildRequired"], true);
+        assert_eq!(rendered["error_details"]["sourceOnly"], true);
+        assert_eq!(rendered["error_details"]["registrationReady"], false);
+    }
+
+    #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
         // #143: previously `claw status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
@@ -15290,7 +15388,7 @@ mod tests {
             message.contains("no worker state file found at"),
             "error should keep the canonical prefix: {message}"
         );
-        // New actionable hints — this is what #139 is fixing.
+        // New actionable hints -- this is what #139 is fixing.
         assert!(
             message.contains("claw prompt"),
             "error should name `claw prompt <text>` as a producer: {message}"
@@ -15483,11 +15581,19 @@ mod tests {
             classify_error_kind("something completely unknown"),
             "unknown"
         );
-        // #762: coverage for all classifier arms added since #77 — prevents silent fallback
+        // #762: coverage for all classifier arms added since #77 -- prevents silent fallback
         // to "unknown" if discriminant strings drift.
         assert_eq!(
             classify_error_kind("Manifest source files are missing: /tmp/x"),
             "missing_manifests"
+        );
+        assert_eq!(
+            classify_error_kind("plugin_build_required: plugin manifest is source-only"),
+            "plugin_build_required"
+        );
+        assert_eq!(
+            classify_error_kind("plugin_source_not_ready: registrationReady=false"),
+            "plugin_source_not_ready"
         );
         assert_eq!(
             classify_error_kind("no managed sessions found in /tmp"),
@@ -15498,7 +15604,7 @@ mod tests {
             "legacy_session_no_workspace_binding"
         );
         // #780: full error string produced by resume_session includes the
-        // "failed to restore session: " prefix — the specific arm must win.
+        // "failed to restore session: " prefix -- the specific arm must win.
         assert_eq!(
             classify_error_kind("failed to restore session: legacy session is missing workspace binding: /path/to/session.jsonl"),
             "legacy_session_no_workspace_binding"
@@ -15548,7 +15654,7 @@ mod tests {
             classify_error_kind("slash command /compact is interactive-only"),
             "interactive_only"
         );
-        // #774: agents now uses \n-delimited format — update test string to match real emission
+        // #774: agents now uses \n-delimited format -- update test string to match real emission
         assert_eq!(
             classify_error_kind("unknown agents subcommand: bogus.\nSupported: list, show, help"),
             "unknown_agents_subcommand"
@@ -15856,7 +15962,7 @@ mod tests {
         assert!(markdown.contains("How do I list files?"));
         assert!(markdown.contains("## 2. Assistant"));
         assert!(markdown.contains("**Tool call** `bash`"));
-        assert!(markdown.contains("toolu_abcdef…"));
+        assert!(markdown.contains("toolu_abcdef-?"));
         assert!(markdown.contains("ls -la"));
         assert!(markdown.contains("## 3. Tool"));
         assert!(markdown.contains("**Tool result** `bash`"));
@@ -15905,7 +16011,7 @@ mod tests {
 
         // then
         assert_eq!(compacted, r#"{"command":"ls -la","cwd":"/tmp"}"#);
-        assert!(truncated.ends_with('…'));
+        assert!(truncated.ends_with("-?"));
         assert!(truncated.chars().count() <= 281);
     }
 
@@ -15920,7 +16026,7 @@ mod tests {
         let trimmed_short = short_tool_id(short);
 
         // then
-        assert_eq!(trimmed_long, "toolu_01ABCD…");
+        assert_eq!(trimmed_long, "toolu_01ABCD-?");
         assert_eq!(trimmed_short, "tool_1");
     }
 
@@ -16222,7 +16328,7 @@ mod tests {
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
-        // #140: Guard against test pollution — isolate cwd + env so this test
+        // #140: Guard against test pollution -- isolate cwd + env so this test
         // doesn't pick up a stale .claw/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
         let _guard = env_lock();
@@ -19334,6 +19440,7 @@ UU conflicted.rs",
             refreshed_state,
             false,
             Some(runtime.plugin_supervisor.clone()),
+            runtime.plugin_approval_issuer.clone(),
         )
         .expect("runtime should rebuild after hot swap");
         runtime.set_plugin_owner(false);
@@ -19433,6 +19540,7 @@ UU conflicted.rs",
             turn_state,
             false,
             Some(cli.runtime.plugin_supervisor.clone()),
+            cli.runtime.plugin_approval_issuer.clone(),
         )
         .expect("turn runtime should build");
         turn_runtime.set_plugin_owner(false);
@@ -19459,6 +19567,7 @@ UU conflicted.rs",
             failure_turn_state,
             false,
             Some(cli.runtime.plugin_supervisor.clone()),
+            cli.runtime.plugin_approval_issuer.clone(),
         )
         .expect("failure turn runtime should build");
         failure_turn_runtime.set_plugin_owner(false);

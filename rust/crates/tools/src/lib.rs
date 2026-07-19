@@ -20,7 +20,7 @@ use os_sense::{
     OsSenseRuntime, OsSenseRuntimeConfig, ProcessQuery as OsProcessQuery,
     ServiceQuery as OsServiceQuery, TimeSeriesWindow,
 };
-use plugins::PluginTool;
+use plugins::{PluginApprovalGrant, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_with_policy, execute_bash,
@@ -38,7 +38,8 @@ use runtime::{
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, SystemPromptProvider, TaskPacket, ToolError, ToolExecutor, WorkspacePathPolicy,
+    Session, SystemPromptProvider, TaskPacket, ToolAuthorizationRequest, ToolError, ToolExecutor,
+    ToolInvocationAuthorization, WorkspacePathPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -473,6 +474,104 @@ impl GlobalToolRegistry {
         execute().map(Some)
     }
 
+    pub fn plugin_tool_authorization_request(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<Option<ToolAuthorizationRequest>, String> {
+        let Some(tool) = self
+            .plugin_tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+        else {
+            return Ok(None);
+        };
+        let Some(request) = tool
+            .authorization_request(input)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ToolAuthorizationRequest {
+            tool_name: name.to_string(),
+            plugin_id: Some(request.plugin_id),
+            input_hash: request.input_hash,
+            plan_hash: request.plan_hash,
+            plan: request.plan,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: request.reason,
+        }))
+    }
+
+    pub fn execute_plugin_tool_with_authorization<F>(
+        &self,
+        name: &str,
+        input: &Value,
+        authorization: Option<ToolInvocationAuthorization>,
+        execute: F,
+    ) -> Result<Option<String>, String>
+    where
+        F: FnOnce(Option<&PluginApprovalGrant>) -> Result<String, String>,
+    {
+        let Some(tool) = self
+            .plugin_tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+        else {
+            return Ok(None);
+        };
+        let required_mode = permission_mode_from_plugin(tool.required_permission())?;
+        maybe_enforce_permission_check_with_mode(
+            self.enforcer.as_ref(),
+            name,
+            input,
+            required_mode,
+        )?;
+        let plugin_context = match authorization.as_ref() {
+            Some(authorization) => {
+                let request = tool
+                    .authorization_request(input)
+                    .map_err(|error| error.to_string())?;
+                request.and_then(|request| {
+                    authorization.plugin_approval_grant(
+                        tool.plugin_id(),
+                        name,
+                        &request.input_hash,
+                        &request.plan_hash,
+                    )
+                })
+            }
+            None => None,
+        };
+        execute(plugin_context).map(Some)
+    }
+
+    pub fn execute_plugin_tool_invocation(
+        &self,
+        name: &str,
+        input: &Value,
+        authorization: Option<ToolInvocationAuthorization>,
+    ) -> Result<Option<String>, String> {
+        self.execute_plugin_tool_with_authorization(name, input, authorization, |context| {
+            self.execute_plugin_tool_direct_with_context(name, input, context)
+        })
+    }
+
+    fn execute_plugin_tool_direct_with_context(
+        &self,
+        name: &str,
+        input: &Value,
+        context: Option<&PluginApprovalGrant>,
+    ) -> Result<String, String> {
+        let tool = self
+            .plugin_tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        let _ = context;
+        tool.execute(input).map_err(|error| error.to_string())
+    }
+
     #[must_use]
     pub fn search(
         &self,
@@ -607,7 +706,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "OpsPluginScaffold",
-            description: "Generate an installable Python or Rust operations plugin scaffold inside the workspace using Kylin/Linux executable entrypoints.",
+            description: "Generate a Python operations plugin scaffold or a Rust source scaffold that must be built into fixed bin/tool and bin/mcp entrypoints before registration.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2652,7 +2751,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             let body = response.text().unwrap_or_default();
             let truncated_body = if body.len() > 8192 {
                 format!(
-                    "{}\n\n[response truncated — {} bytes total]",
+                    "{}\n\n[response truncated -?{} bytes total]",
                     &body[..8192],
                     body.len()
                 )
@@ -3186,7 +3285,9 @@ fn run_ops_plugin_scaffold(input: OpsPluginScaffoldInput) -> Result<String, Stri
             "destination must be a workspace-relative path without parent traversal".into(),
         );
     }
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let workspace = std::env::current_dir()
+        .and_then(|cwd| std::fs::canonicalize(cwd))
+        .map_err(|error| error.to_string())?;
     let destination = workspace.join(&input.destination);
     let output = ops_plugin_sdk::generate_scaffold(&ScaffoldRequest {
         language: input.language,
@@ -3196,11 +3297,29 @@ fn run_ops_plugin_scaffold(input: OpsPluginScaffoldInput) -> Result<String, Stri
     });
     let files = ops_plugin_sdk::write_scaffold(&destination, &output)
         .map_err(|error| format!("failed to write plugin scaffold: {error}"))?;
+    let canonical_destination = std::fs::canonicalize(&destination)
+        .map_err(|error| format!("failed to verify plugin scaffold destination: {error}"))?;
+    if !canonical_destination.starts_with(&workspace) {
+        return Err("destination resolved outside the current workspace".to_string());
+    }
+    let rust_source_scaffold = matches!(input.language, ops_plugin_sdk::SdkLanguage::Rust);
     to_pretty_json(json!({
-        "status": "created",
-        "destination": destination,
+        "status": if rust_source_scaffold { "source_created" } else { "created" },
+        "destination": canonical_destination,
         "files": files,
-        "entrypoints": output.files.iter().filter(|file| file.executable).map(|file| file.path.clone()).collect::<Vec<_>>()
+        "entrypoints": output.files.iter().filter(|file| file.executable).map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "buildRequired": rust_source_scaffold,
+        "registrationReady": !rust_source_scaffold,
+        "build": if rust_source_scaffold {
+            serde_json::json!({
+                "tool": "/usr/bin/cargo build --release --bin tool",
+                "mcp": "/usr/bin/cargo build --release --bin mcp",
+                "finalEntrypoints": ["./bin/tool", "./bin/mcp"],
+                "note": "Rust scaffold manifests point at plugin-contained binaries; build and atomically copy target/release outputs into bin/ before registration."
+            })
+        } else {
+            Value::Null
+        }
     }))
 }
 
@@ -4920,7 +5039,7 @@ fn preview_text(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     let shortened = input.chars().take(max_chars).collect::<String>();
-    format!("{}…", shortened.trim_end())
+    format!("{}...", shortened.trim_end())
 }
 
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
@@ -8908,7 +9027,7 @@ mod tests {
         let settings = serde_json::json!({ "trustedRoots": [tmp_root] }).to_string();
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
-        // WorkerCreate with no per-call trusted_roots — config should supply them
+        // WorkerCreate with no per-call trusted_roots -?config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
         let created = execute_tool(
             "WorkerCreate",
@@ -9073,7 +9192,7 @@ mod tests {
         let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = created_output["worker_id"].as_str().expect("worker_id");
 
-        // Worker is still in spawning — await_ready should return not-ready snapshot
+        // Worker is still in spawning -?await_ready should return not-ready snapshot
         let snapshot = execute_tool("WorkerAwaitReady", &json!({"worker_id": worker_id}))
             .expect("WorkerAwaitReady should succeed even when not ready");
         let snap_output: serde_json::Value = serde_json::from_str(&snapshot).expect("json");
@@ -9278,7 +9397,7 @@ mod tests {
         );
         assert_eq!(
             restarted_output["trust_gate_cleared"], false,
-            "restart clears trust — next observe loop must re-acquire trust"
+            "restart clears trust -?next observe loop must re-acquire trust"
         );
     }
 
@@ -12561,12 +12680,21 @@ printf 'pwsh:%s' "$1"
             )
             .expect("scaffold");
         let value: Value = serde_json::from_str(&output).expect("json");
-        assert_eq!(value["status"], "created");
+        assert_eq!(value["status"], "source_created");
+        assert_eq!(value["buildRequired"], true);
+        assert_eq!(value["registrationReady"], false);
         let root = workspace.join("plugins/kylin_ops");
-        assert!(root.join("run.sh").is_file());
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(root.join("src").join("main.rs").is_file());
+        assert!(root.join("src").join("bin").join("mcp.rs").is_file());
+        assert!(root.join("bin").join("tool").is_file());
+        assert!(root.join("bin").join("mcp").is_file());
+        assert!(!root.join("run.sh").exists());
         assert!(!root.join("run.cmd").exists());
         let manifest = fs::read_to_string(root.join("plugin.json")).expect("manifest");
-        assert!(manifest.contains("\"command\": \"./run.sh\""));
+        assert!(manifest.contains("\"command\": \"./bin/tool\""));
+        assert!(manifest.contains("\"command\": \"./bin/mcp\""));
+        assert!(!manifest.contains("/usr/bin/cargo"));
         assert!(manifest.contains("\"executionPolicy\""));
         std::env::set_current_dir(previous_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(workspace);
@@ -13221,6 +13349,44 @@ printf 'pwsh:%s' "$1"
             .execute("plugin_writer", &json!({}))
             .expect_err("plugin tool should be denied before command spawn");
         assert!(err.contains("requires 'workspace-write'"));
+    }
+
+    #[test]
+    fn plugin_registry_passes_runtime_authorization_context_to_builtin_ops_tool() {
+        use plugins::{builtin_plugins, Plugin as _};
+
+        let firewall_tool = builtin_plugins()
+            .into_iter()
+            .find(|plugin| plugin.metadata().id == "firewall_manager@builtin")
+            .expect("firewall builtin")
+            .tools()[0]
+            .clone();
+        let registry =
+            GlobalToolRegistry::with_plugin_tools(vec![firewall_tool]).expect("registry");
+        let input = json!({
+            "action": "update_rule",
+            "dryRun": false,
+            "confirm": true,
+            "handle": 1,
+            "protocol": "tcp",
+            "port": 22
+        });
+        let denied = registry
+            .execute_plugin_tool_invocation("ops_firewall_manager", &input, None)
+            .expect("structured denial")
+            .expect("plugin output");
+        let denied: Value = serde_json::from_str(&denied).expect("json");
+        assert_eq!(denied["status"], "requires_confirmation");
+
+        let request = registry
+            .plugin_tool_authorization_request("ops_firewall_manager", &input)
+            .expect("auth request")
+            .expect("mutation request");
+        assert_eq!(
+            request.plugin_id.as_deref(),
+            Some("firewall_manager@builtin")
+        );
+        assert_eq!(request.tool_name, "ops_firewall_manager");
     }
 
     #[test]

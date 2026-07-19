@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 atomic-write-file = "0.3"
 fs2 = "0.4"
+getrandom = "0.2"
 rustix = { version = "1", features = ["process"] }
 semver = "1.0"
 serde = { version = "1", features = ["derive"] }

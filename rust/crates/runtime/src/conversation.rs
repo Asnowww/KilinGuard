@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use plugins::{PluginApprovalGrant, PluginApprovalIssuer};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
@@ -11,7 +12,8 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -67,6 +69,94 @@ pub trait SystemPromptProvider: Send + Sync {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn authorization_request(
+        &self,
+        _tool_name: &str,
+        _input: &str,
+    ) -> Option<ToolAuthorizationRequest> {
+        None
+    }
+
+    fn execute_with_authorization(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        _authorization: Option<ToolInvocationAuthorization>,
+    ) -> Result<String, ToolError> {
+        self.execute(tool_name, input)
+    }
+}
+
+/// Runtime-generated authorization request for tools that need an explicit
+/// trusted human approval beyond the model-supplied JSON arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAuthorizationRequest {
+    pub tool_name: String,
+    pub plugin_id: Option<String>,
+    pub input_hash: String,
+    pub plan_hash: String,
+    pub plan: Value,
+    pub required_mode: PermissionMode,
+    pub reason: String,
+}
+
+/// One-shot authorization granted by the runtime after a trusted prompt.
+#[derive(Debug, Clone)]
+pub struct ToolInvocationAuthorization {
+    plugin_grant: Option<PluginApprovalGrant>,
+}
+
+impl ToolInvocationAuthorization {
+    #[must_use]
+    fn from_request(
+        request: &ToolAuthorizationRequest,
+        plugin_approval_issuer: Option<&PluginApprovalIssuer>,
+    ) -> Self {
+        let plugin_grant = request.plugin_id.as_deref().and_then(|plugin_id| {
+            plugin_approval_issuer.and_then(|issuer| {
+                issuer
+                    .issue(
+                        plugin_id,
+                        &request.tool_name,
+                        &request.input_hash,
+                        &request.plan_hash,
+                    )
+                    .ok()
+            })
+        });
+        Self { plugin_grant }
+    }
+
+    #[must_use]
+    pub fn is_consumed(&self) -> bool {
+        self.plugin_grant
+            .as_ref()
+            .is_some_and(PluginApprovalGrant::is_consumed)
+    }
+
+    #[must_use]
+    pub fn plugin_approval_grant(
+        &self,
+        plugin_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        plan_hash: &str,
+    ) -> Option<&PluginApprovalGrant> {
+        self.plugin_grant
+            .as_ref()
+            .filter(|grant| grant_matches(grant, plugin_id, tool_name, input_hash, plan_hash))
+    }
+}
+
+fn grant_matches(
+    grant: &PluginApprovalGrant,
+    plugin_id: &str,
+    tool_name: &str,
+    input_hash: &str,
+    plan_hash: &str,
+) -> bool {
+    grant.matches_request(plugin_id, tool_name, input_hash, plan_hash)
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -147,6 +237,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    plugin_approval_issuer: Option<PluginApprovalIssuer>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -197,6 +288,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            plugin_approval_issuer: None,
         }
     }
 
@@ -209,6 +301,12 @@ where
     #[must_use]
     pub fn with_system_prompt_provider(mut self, provider: Arc<dyn SystemPromptProvider>) -> Self {
         self.system_prompt_providers.push(provider);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_approval_issuer(mut self, issuer: PluginApprovalIssuer) -> Self {
+        self.plugin_approval_issuer = Some(issuer);
         self
     }
 
@@ -482,9 +580,89 @@ where
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
+                        let invocation_authorization = match self
+                            .tool_executor
+                            .authorization_request(&tool_name, &effective_input)
+                        {
+                            Some(request) => match prompter.as_mut() {
+                                Some(prompt) => {
+                                    let prompt_input = serde_json::json!({
+                                        "input": effective_input,
+                                        "canonicalInputHash": request.input_hash.clone(),
+                                        "planHash": request.plan_hash.clone(),
+                                        "plan": request.plan.clone(),
+                                    })
+                                    .to_string();
+                                    let permission_request = PermissionRequest {
+                                        tool_name: tool_name.clone(),
+                                        input: prompt_input,
+                                        current_mode: self
+                                            .permission_policy
+                                            .effective_active_mode(),
+                                        required_mode: request.required_mode,
+                                        reason: Some(request.reason.clone()),
+                                    };
+                                    match prompt.decide(&permission_request) {
+                                        PermissionPromptDecision::Allow
+                                        | PermissionPromptDecision::AllowOnce
+                                        | PermissionPromptDecision::AllowForSession => {
+                                            Some(ToolInvocationAuthorization::from_request(
+                                                &request,
+                                                self.plugin_approval_issuer.as_ref(),
+                                            ))
+                                        }
+                                        PermissionPromptDecision::Deny { reason } => {
+                                            let output = merge_hook_feedback(
+                                                pre_hook_result.messages(),
+                                                reason,
+                                                true,
+                                            );
+                                            let result_message = ConversationMessage::tool_result(
+                                                tool_use_id,
+                                                tool_name,
+                                                output,
+                                                true,
+                                            );
+                                            self.session
+                                                .push_message(result_message.clone())
+                                                .map_err(|error| {
+                                                    RuntimeError::new(error.to_string())
+                                                })?;
+                                            self.record_tool_finished(iterations, &result_message);
+                                            tool_results.push(result_message);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let output = merge_hook_feedback(
+                                        pre_hook_result.messages(),
+                                        request.reason,
+                                        true,
+                                    );
+                                    let result_message = ConversationMessage::tool_result(
+                                        tool_use_id,
+                                        tool_name,
+                                        output,
+                                        true,
+                                    );
+                                    self.session
+                                        .push_message(result_message.clone())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    self.record_tool_finished(iterations, &result_message);
+                                    tool_results.push(result_message);
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
                         self.record_tool_started(iterations, &tool_name);
                         let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
+                            match self.tool_executor.execute_with_authorization(
+                                &tool_name,
+                                &effective_input,
+                                invocation_authorization,
+                            ) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
@@ -868,8 +1046,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, SystemPromptProvider, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, SystemPromptProvider, ToolAuthorizationRequest, ToolExecutor,
+        ToolInvocationAuthorization, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1165,6 +1343,223 @@ mod tests {
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
         ));
+    }
+
+    struct TrustedAuthApiClient;
+
+    impl ApiClient for TrustedAuthApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                return Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "ops_mutate".to_string(),
+                    input: r#"{"action":"restart","target":"demo","dryRun":false}"#.to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[derive(Default)]
+    struct TrustedAuthExecutor {
+        calls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl ToolExecutor for TrustedAuthExecutor {
+        fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            Err(ToolError::new("missing trusted authorization"))
+        }
+
+        fn authorization_request(
+            &self,
+            tool_name: &str,
+            _input: &str,
+        ) -> Option<ToolAuthorizationRequest> {
+            Some(ToolAuthorizationRequest {
+                tool_name: tool_name.to_string(),
+                plugin_id: Some("ops@builtin".to_string()),
+                input_hash: "sha256:input".to_string(),
+                plan_hash: "sha256:plan".to_string(),
+                plan: serde_json::json!([{ "step": "execute" }]),
+                required_mode: PermissionMode::DangerFullAccess,
+                reason: "trusted runtime authorization required".to_string(),
+            })
+        }
+
+        fn execute_with_authorization(
+            &mut self,
+            _tool_name: &str,
+            _input: &str,
+            authorization: Option<ToolInvocationAuthorization>,
+        ) -> Result<String, ToolError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(authorization.is_some());
+            authorization
+                .map(|_| "authorized".to_string())
+                .ok_or_else(|| ToolError::new("missing trusted authorization"))
+        }
+    }
+
+    #[test]
+    fn trusted_tool_authorization_prompts_even_in_danger_mode() {
+        struct AllowPrompter {
+            seen_prompt: bool,
+        }
+        impl PermissionPrompter for AllowPrompter {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                assert_eq!(request.tool_name, "ops_mutate");
+                assert!(request.input.contains("canonicalInputHash"));
+                assert!(request.input.contains("planHash"));
+                self.seen_prompt = true;
+                PermissionPromptDecision::AllowOnce
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TrustedAuthApiClient,
+            TrustedAuthExecutor {
+                calls: calls.clone(),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let mut prompter = AllowPrompter { seen_prompt: false };
+        let summary = runtime
+            .run_turn("mutate", Some(&mut prompter))
+            .expect("turn");
+        assert!(prompter.seen_prompt);
+        assert_eq!(summary.tool_results.len(), 1);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[true]
+        );
+    }
+
+    #[test]
+    fn trusted_tool_authorization_denies_without_prompter_or_when_rejected() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TrustedAuthApiClient,
+            TrustedAuthExecutor {
+                calls: calls.clone(),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let summary = runtime.run_turn("mutate", None).expect("turn");
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { is_error: true, output, .. }
+                if output.contains("trusted runtime authorization required")
+        ));
+
+        struct RejectPrompter;
+        impl PermissionPrompter for RejectPrompter {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                PermissionPromptDecision::Deny {
+                    reason: "operator denied".to_string(),
+                }
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TrustedAuthApiClient,
+            TrustedAuthExecutor {
+                calls: calls.clone(),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("mutate", Some(&mut RejectPrompter))
+            .expect("turn");
+        assert!(calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { is_error: true, output, .. } if output == "operator denied"
+        ));
+    }
+
+    #[test]
+    fn invocation_authorization_is_bound_to_plugin_tool_input_plan_and_one_use() {
+        let (issuer, _verifier) =
+            plugins::plugin_approval_channel().expect("approval channel should build");
+        let request = ToolAuthorizationRequest {
+            tool_name: "ops_service_manager".to_string(),
+            plugin_id: Some("service_manager@builtin".to_string()),
+            input_hash: "sha256:input".to_string(),
+            plan_hash: "sha256:plan".to_string(),
+            plan: serde_json::json!([{ "step": "execute" }]),
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: "trusted runtime authorization required".to_string(),
+        };
+        let different_tool = ToolInvocationAuthorization::from_request(&request, Some(&issuer));
+        assert!(different_tool
+            .plugin_approval_grant(
+                "service_manager@builtin",
+                "ops_user_manager",
+                "sha256:input",
+                "sha256:plan"
+            )
+            .is_none());
+        assert!(!different_tool.is_consumed());
+
+        let different_input = ToolInvocationAuthorization::from_request(&request, Some(&issuer));
+        assert!(different_input
+            .plugin_approval_grant(
+                "service_manager@builtin",
+                "ops_service_manager",
+                "sha256:other",
+                "sha256:plan"
+            )
+            .is_none());
+        assert!(!different_input.is_consumed());
+
+        let authorization = ToolInvocationAuthorization::from_request(&request, Some(&issuer));
+        assert!(authorization
+            .plugin_approval_grant(
+                "service_manager@builtin",
+                "ops_service_manager",
+                "sha256:input",
+                "sha256:plan"
+            )
+            .is_some());
+        assert!(!authorization.is_consumed());
+        assert!(authorization
+            .plugin_approval_grant(
+                "service_manager@builtin",
+                "ops_service_manager",
+                "sha256:input",
+                "sha256:plan"
+            )
+            .is_some());
     }
 
     #[test]
