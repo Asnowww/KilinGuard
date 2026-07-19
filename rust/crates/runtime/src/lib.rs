@@ -37,6 +37,7 @@ pub mod recovery_recipes;
 mod remote;
 mod report_schema;
 pub mod safety_intent;
+pub mod safety_rules;
 pub mod sandbox;
 mod session;
 pub mod session_control;
@@ -175,11 +176,17 @@ pub use report_schema::{
     ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
 };
 pub use safety_intent::{
-    analyze_plan, analyze_plan_with_config, ImpactScope, ImplicitOperation, IntentRiskAssessment,
-    IntentTarget, IntentTargetKind, IntentUncertainty, RiskFactor, RiskFactorAssessment,
-    RiskFactorWeights, RiskLevel, RiskPolicy, RiskThresholds, SafetyAction, SafetyIntent,
-    SafetyIntentConfig, SafetyIntentError, SafetyIntentErrorCode, SafetyIntentLimits,
-    SafetyIntentReport, ToolCallPlan, ToolExecutionPlan,
+    analyze_plan, analyze_plan_with_config, analyze_plan_with_rule_store,
+    analyze_plan_with_snapshot, ImpactScope, ImplicitOperation, IntentRiskAssessment, IntentTarget,
+    IntentTargetKind, IntentUncertainty, RiskFactor, RiskFactorAssessment, RiskFactorWeights,
+    RiskLevel, RiskPolicy, RiskThresholds, SafetyAction, SafetyIntent, SafetyIntentConfig,
+    SafetyIntentError, SafetyIntentErrorCode, SafetyIntentLimits, SafetyIntentReport, ToolCallPlan,
+    ToolExecutionPlan,
+};
+pub use safety_rules::{
+    builtin_safety_rule_snapshot, SafetyRuleConfigFile, SafetyRuleDefinition, SafetyRuleError,
+    SafetyRuleErrorCode, SafetyRuleInput, SafetyRuleMatch, SafetyRuleMatchKind, SafetyRuleSnapshot,
+    SafetyRuleStore, SAFETY_RULE_SCHEMA_VERSION,
 };
 pub use sandbox::{
     build_linux_sandbox_command, build_overlayfs_plan, build_sandbox_invocation,
