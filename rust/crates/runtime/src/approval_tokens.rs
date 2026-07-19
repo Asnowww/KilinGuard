@@ -219,6 +219,10 @@ impl ApprovalTokenLedger {
         self.grants.insert(grant.token.clone(), grant);
     }
 
+    pub fn remove(&mut self, token: &str) -> Option<ApprovalTokenGrant> {
+        self.grants.remove(token)
+    }
+
     #[must_use]
     pub fn get(&self, token: &str) -> Option<&ApprovalTokenGrant> {
         self.grants.get(token)
@@ -285,7 +289,7 @@ impl ApprovalTokenLedger {
 
         if grant
             .expires_at_epoch_seconds
-            .is_some_and(|expires_at| now_epoch_seconds > expires_at)
+            .is_some_and(|expires_at| now_epoch_seconds >= expires_at)
         {
             return Err(ApprovalTokenError::ApprovalExpired);
         }
@@ -437,7 +441,7 @@ mod tests {
             Err(ApprovalTokenError::ScopeMismatch { .. })
         ));
         assert!(matches!(
-            ledger.verify("tok-expiring", &scope, "bot", 21),
+            ledger.verify("tok-expiring", &scope, "bot", 20),
             Err(ApprovalTokenError::ApprovalExpired)
         ));
 

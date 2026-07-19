@@ -36,6 +36,7 @@ mod prompt;
 pub mod recovery_recipes;
 mod remote;
 mod report_schema;
+pub mod safety_confirmation;
 pub mod safety_intent;
 pub mod safety_rules;
 pub mod sandbox;
@@ -174,6 +175,13 @@ pub use report_schema::{
     NegativeEvidence, NegativeFindingStatus, ProjectionProvenance, RedactionProvenance,
     ReportClaim, ReportConfidence, ReportIdentity, ReportProjectionV1, ReportSchemaField,
     ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
+};
+pub use safety_confirmation::{
+    ConfirmationConfig, ConfirmationDecision, ConfirmationDecisionOutcome,
+    ConfirmationDecisionStatus, ConfirmationError, ConfirmationErrorCode, ConfirmationGate,
+    ConfirmationMode, ConfirmationRequest, ConfirmationRequestItem, ConfirmationRequirement,
+    ConfirmationRuleEvidence, RollbackAdvice, RollbackStatus, VerifiedRollbackItem,
+    VerifiedRollbackMetadata,
 };
 pub use safety_intent::{
     analyze_plan, analyze_plan_with_config, analyze_plan_with_rule_store,
