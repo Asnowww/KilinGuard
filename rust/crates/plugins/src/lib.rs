@@ -1060,6 +1060,8 @@ pub struct PluginTool {
     args: Vec<String>,
     required_permission: PluginToolPermission,
     root: Option<PathBuf>,
+    permission_declarations: Vec<PluginPermissionDeclaration>,
+    structured_permissions_enforced: bool,
     external_subprocess_allowed: bool,
     os_sandbox_required: bool,
 }
@@ -1083,9 +1085,26 @@ impl PluginTool {
             args,
             required_permission,
             root,
+            permission_declarations: Vec::new(),
+            structured_permissions_enforced: false,
             external_subprocess_allowed: true,
             os_sandbox_required: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_permission_declarations(
+        mut self,
+        declarations: Vec<PluginPermissionDeclaration>,
+    ) -> Self {
+        self.permission_declarations = declarations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_structured_permissions_enforced(mut self, enforced: bool) -> Self {
+        self.structured_permissions_enforced = enforced;
+        self
     }
 
     #[must_use]
@@ -1167,6 +1186,8 @@ impl PluginTool {
             cwd: self.root.clone(),
             timeout: Duration::from_millis(PLUGIN_TOOL_TIMEOUT_MS),
             permission: self.required_permission,
+            permission_declarations: self.permission_declarations.clone(),
+            structured_permissions_enforced: self.structured_permissions_enforced,
             external_subprocess_allowed: self.external_subprocess_allowed,
             os_sandbox_required: self.os_sandbox_required,
             env: BTreeMap::from([
@@ -1216,6 +1237,8 @@ struct ControlledChildRequest {
     cwd: Option<PathBuf>,
     timeout: Duration,
     permission: PluginToolPermission,
+    permission_declarations: Vec<PluginPermissionDeclaration>,
+    structured_permissions_enforced: bool,
     external_subprocess_allowed: bool,
     os_sandbox_required: bool,
     env: BTreeMap<String, String>,
@@ -1232,6 +1255,7 @@ struct ControlledChildOutput {
 fn run_controlled_child(
     request: ControlledChildRequest,
 ) -> Result<ControlledChildOutput, PluginError> {
+    validate_controlled_child_permissions(&request)?;
     if !request.external_subprocess_allowed {
         return Err(PluginError::CommandFailed(format!(
             "external plugin subprocess `{}` was refused: FR-2.13 requires an OS sandbox, and this runner only provides process policy guards; set executionPolicy.allowExternalSubprocess=true only for explicitly trusted plugins",
@@ -1323,6 +1347,65 @@ fn run_controlled_child(
     })
 }
 
+fn validate_controlled_child_permissions(
+    request: &ControlledChildRequest,
+) -> Result<(), PluginError> {
+    if !request.structured_permissions_enforced {
+        return Ok(());
+    }
+    if !process_command_is_declared(
+        request.cwd.as_deref(),
+        &request.command,
+        &request.permission_declarations,
+    ) {
+        return Err(PluginError::CommandFailed(format!(
+            "external plugin subprocess `{}` was refused: command is not exactly declared in Process.commands",
+            sanitize_plugin_error(&request.command)
+        )));
+    }
+    Ok(())
+}
+
+fn process_command_is_declared(
+    root: Option<&Path>,
+    command: &str,
+    declarations: &[PluginPermissionDeclaration],
+) -> bool {
+    declarations.iter().any(|declaration| match declaration {
+        PluginPermissionDeclaration::Process { commands } => commands
+            .iter()
+            .any(|declared| declared_process_command_matches(root, command, declared)),
+        _ => false,
+    })
+}
+
+fn declared_process_command_matches(root: Option<&Path>, command: &str, declared: &str) -> bool {
+    let declared = declared.trim();
+    if declared.is_empty() {
+        return false;
+    }
+    if declared.starts_with("./") || Path::new(declared).is_absolute() {
+        let Some(root) = root else {
+            return false;
+        };
+        let declared_path = if Path::new(declared).is_absolute() {
+            PathBuf::from(declared)
+        } else {
+            root.join(declared)
+        };
+        return paths_match_allow_missing(&declared_path, Path::new(command));
+    }
+    !Path::new(command).is_absolute() && command == declared
+}
+
+fn paths_match_allow_missing(left: &Path, right: &Path) -> bool {
+    normalize_existing_or_raw(left) == normalize_existing_or_raw(right)
+}
+
+fn normalize_existing_or_raw(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[cfg(target_os = "linux")]
 fn linux_plugin_sandbox_command(request: &ControlledChildRequest) -> Result<Command, PluginError> {
     const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -1365,10 +1448,11 @@ fn linux_plugin_sandbox_command(request: &ControlledChildRequest) -> Result<Comm
             "CLAWD_PLUGIN_ROOT",
             &cwd.display().to_string(),
         )?;
-        if matches!(request.permission, PluginToolPermission::WorkspaceWrite) {
-            command.arg(format!("--property=ReadWritePaths={}", cwd.display()));
-        } else {
-            command.arg(format!("--property=ReadOnlyPaths={}", cwd.display()));
+        for path in declared_sandbox_paths(request, false) {
+            command.arg(format!("--property=ReadOnlyPaths={}", path.display()));
+        }
+        for path in declared_sandbox_paths(request, true) {
+            command.arg(format!("--property=ReadWritePaths={}", path.display()));
         }
     }
     for (key, value) in &request.env {
@@ -1383,6 +1467,49 @@ fn linux_plugin_sandbox_command(request: &ControlledChildRequest) -> Result<Comm
     }
     command.arg("--").arg(&request.command).args(&request.args);
     Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn declared_sandbox_paths(request: &ControlledChildRequest, writable: bool) -> Vec<PathBuf> {
+    let Some(root) = request.cwd.as_deref() else {
+        return Vec::new();
+    };
+    let mut paths = BTreeSet::<PathBuf>::new();
+    if !writable {
+        let command_path = if Path::new(&request.command).is_absolute() {
+            PathBuf::from(&request.command)
+        } else {
+            root.join(&request.command)
+        };
+        paths.insert(normalize_existing_or_raw(&command_path));
+    }
+    for declaration in &request.permission_declarations {
+        let PluginPermissionDeclaration::Filesystem {
+            paths: raw_paths,
+            mode,
+        } = declaration
+        else {
+            continue;
+        };
+        let include = if writable {
+            matches!(
+                mode,
+                PluginFilesystemPermissionMode::Write | PluginFilesystemPermissionMode::ReadWrite
+            )
+        } else {
+            matches!(
+                mode,
+                PluginFilesystemPermissionMode::Read | PluginFilesystemPermissionMode::ReadWrite
+            )
+        };
+        if !include {
+            continue;
+        }
+        for raw_path in raw_paths {
+            paths.insert(normalize_existing_or_raw(&root.join(raw_path)));
+        }
+    }
+    paths.into_iter().collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1494,7 +1621,7 @@ fn terminate_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn validate_json_schema_value(
+pub fn validate_json_schema_value(
     schema: &Value,
     value: &Value,
     location: &str,
@@ -1509,12 +1636,20 @@ fn validate_json_schema_value(
         let type_matches = if let Some(schema_type) = schema_type.as_str() {
             json_schema_type_matches(schema_type, value)
         } else if let Some(types) = schema_type.as_array() {
-            types
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|schema_type| json_schema_type_matches(schema_type, value))
+            let mut matched = false;
+            for schema_type in types {
+                let Some(schema_type) = schema_type.as_str() else {
+                    return Err(PluginError::CommandFailed(format!(
+                        "{location} schema type array must contain only strings"
+                    )));
+                };
+                matched |= json_schema_type_matches(schema_type, value);
+            }
+            matched
         } else {
-            true
+            return Err(PluginError::CommandFailed(format!(
+                "{location} schema type must be a string or string array"
+            )));
         };
         if !type_matches {
             return Err(PluginError::CommandFailed(format!(
@@ -1696,8 +1831,164 @@ fn json_schema_type_matches(schema_type: &str, value: &Value) -> bool {
         "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
         "number" => value.is_number(),
         "null" => value.is_null(),
-        _ => true,
+        _ => false,
     }
+}
+
+fn validate_json_schema_definition(
+    schema: &Value,
+    location: &str,
+    errors: &mut Vec<PluginManifestValidationError>,
+) {
+    if let Err(detail) = validate_json_schema_definition_inner(schema, location, 0) {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: format!("{location} schema is invalid: {detail}"),
+        });
+    }
+}
+
+fn validate_json_schema_definition_inner(
+    schema: &Value,
+    location: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 32 {
+        return Err("schema nesting exceeds 32 levels".to_string());
+    }
+    let Some(object) = schema.as_object() else {
+        return Err("schema must be a JSON object".to_string());
+    };
+
+    if let Some(schema_type) = object.get("type") {
+        validate_json_schema_type_definition(schema_type, location)?;
+    }
+    if let Some(enum_values) = object.get("enum") {
+        let values = enum_values
+            .as_array()
+            .ok_or_else(|| "`enum` must be an array".to_string())?;
+        if values.is_empty() {
+            return Err("`enum` must not be empty".to_string());
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(value) = object.get(keyword) {
+            let schemas = value
+                .as_array()
+                .ok_or_else(|| format!("`{keyword}` must be an array of schemas"))?;
+            if schemas.is_empty() {
+                return Err(format!("`{keyword}` must not be empty"));
+            }
+            for (index, nested) in schemas.iter().enumerate() {
+                validate_json_schema_definition_inner(
+                    nested,
+                    &format!("{location}.{keyword}[{index}]"),
+                    depth + 1,
+                )?;
+            }
+        }
+    }
+    if let Some(properties) = object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| "`properties` must be an object".to_string())?;
+        for (name, nested) in properties {
+            validate_json_schema_definition_inner(
+                nested,
+                &format!("{location}.properties.{name}"),
+                depth + 1,
+            )?;
+        }
+    }
+    if let Some(required) = object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| "`required` must be an array of strings".to_string())?;
+        let mut seen = BTreeSet::new();
+        for entry in required {
+            let Some(field) = entry.as_str() else {
+                return Err("`required` must contain only strings".to_string());
+            };
+            if field.is_empty() || !seen.insert(field.to_string()) {
+                return Err("`required` entries must be unique non-empty strings".to_string());
+            }
+        }
+    }
+    if let Some(additional) = object.get("additionalProperties") {
+        if additional.is_object() {
+            validate_json_schema_definition_inner(
+                additional,
+                &format!("{location}.additionalProperties"),
+                depth + 1,
+            )?;
+        } else if !additional.is_boolean() {
+            return Err("`additionalProperties` must be a boolean or schema object".to_string());
+        }
+    }
+    if let Some(items) = object.get("items") {
+        if items.is_object() {
+            validate_json_schema_definition_inner(items, &format!("{location}.items"), depth + 1)?;
+        } else {
+            return Err("`items` must be a schema object".to_string());
+        }
+    }
+    for keyword in [
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    ] {
+        if let Some(value) = object.get(keyword) {
+            if value.as_u64().is_none() {
+                return Err(format!("`{keyword}` must be an unsigned integer"));
+            }
+        }
+    }
+    for keyword in ["minimum", "maximum"] {
+        if let Some(value) = object.get(keyword) {
+            if !value.is_number() {
+                return Err(format!("`{keyword}` must be a number"));
+            }
+        }
+    }
+    if let Some(pattern) = object.get("pattern") {
+        if !pattern.is_string() {
+            return Err("`pattern` must be a string".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_schema_type_definition(value: &Value, location: &str) -> Result<(), String> {
+    const TYPES: &[&str] = &[
+        "object", "array", "string", "boolean", "integer", "number", "null",
+    ];
+    let validate_one = |schema_type: &str| {
+        if TYPES.contains(&schema_type) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{location} has unsupported JSON Schema type `{schema_type}`"
+            ))
+        }
+    };
+    if let Some(schema_type) = value.as_str() {
+        return validate_one(schema_type);
+    }
+    if let Some(types) = value.as_array() {
+        if types.is_empty() {
+            return Err("`type` array must not be empty".to_string());
+        }
+        for entry in types {
+            let Some(schema_type) = entry.as_str() else {
+                return Err("`type` array must contain only strings".to_string());
+            };
+            validate_one(schema_type)?;
+        }
+        return Ok(());
+    }
+    Err("`type` must be a string or array of strings".to_string())
 }
 
 fn json_schema_pattern_matches(pattern: &str, value: &str) -> bool {
@@ -4789,6 +5080,7 @@ impl Plugin for BundledPlugin {
             self.lifecycle(),
             self.execution_policy(),
             self.permissions(),
+            self.permission_declarations(),
             "init",
             &self.lifecycle.init,
             deadline,
@@ -4805,6 +5097,7 @@ impl Plugin for BundledPlugin {
             self.lifecycle(),
             self.execution_policy(),
             self.permissions(),
+            self.permission_declarations(),
             "shutdown",
             &self.lifecycle.shutdown,
             deadline,
@@ -4894,6 +5187,7 @@ impl Plugin for ExternalPlugin {
             self.lifecycle(),
             self.execution_policy(),
             self.permissions(),
+            self.permission_declarations(),
             "init",
             &self.lifecycle.init,
             deadline,
@@ -4910,6 +5204,7 @@ impl Plugin for ExternalPlugin {
             self.lifecycle(),
             self.execution_policy(),
             self.permissions(),
+            self.permission_declarations(),
             "shutdown",
             &self.lifecycle.shutdown,
             deadline,
@@ -6547,6 +6842,8 @@ fn execute_registered_command(
         cwd: metadata.root.clone(),
         timeout: Duration::from_millis(PLUGIN_TOOL_TIMEOUT_MS),
         permission: lifecycle_child_permission(plugin.definition.permissions()),
+        permission_declarations: plugin.definition.permission_declarations().to_vec(),
+        structured_permissions_enforced: metadata.kind == PluginKind::External,
         external_subprocess_allowed: metadata.kind != PluginKind::External
             || plugin
                 .definition
@@ -10007,6 +10304,8 @@ fn load_plugin_definition(
         &metadata.id,
         &metadata.name,
         &manifest.tools,
+        &manifest.permission_declarations,
+        kind == PluginKind::External,
         external_subprocess_allowed,
         kind == PluginKind::External,
     );
@@ -10077,7 +10376,91 @@ fn validate_plugin_registration_policy(
             "external plugin hooks are rejected by default: FR-2.5 requires a unified sandboxed hook runner before external hooks can be registered".to_string(),
         ));
     }
+    if kind == PluginKind::External {
+        validate_external_plugin_contract(manifest)?;
+    }
     Ok(())
+}
+
+fn validate_external_plugin_contract(manifest: &PluginManifest) -> Result<(), PluginError> {
+    for tool in &manifest.tools {
+        if tool.output_schema.is_none() {
+            return Err(PluginError::InvalidManifest(format!(
+                "external plugin tool `{}` must declare outputSchema for FR-2.12",
+                tool.name
+            )));
+        }
+        require_declared_process_command(&manifest.permission_declarations, &tool.command, "tool")?;
+    }
+    for command in &manifest.commands {
+        require_declared_process_command(
+            &manifest.permission_declarations,
+            &command.command,
+            "slash command",
+        )?;
+    }
+    for command in manifest
+        .lifecycle
+        .init
+        .iter()
+        .chain(manifest.lifecycle.shutdown.iter())
+    {
+        require_declared_process_command(
+            &manifest.permission_declarations,
+            command,
+            "lifecycle command",
+        )?;
+    }
+    for (server_name, server) in &manifest.mcp_servers {
+        if server.transport == PluginMcpTransport::Stdio {
+            let command = server.command.as_deref().ok_or_else(|| {
+                PluginError::InvalidManifest(format!(
+                    "external plugin MCP server `{server_name}` stdio command is missing"
+                ))
+            })?;
+            require_declared_process_command(
+                &manifest.permission_declarations,
+                command,
+                "mcp server",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn require_declared_process_command(
+    declarations: &[PluginPermissionDeclaration],
+    command: &str,
+    kind: &str,
+) -> Result<(), PluginError> {
+    let declared = declarations.iter().any(|declaration| match declaration {
+        PluginPermissionDeclaration::Process { commands } => commands
+            .iter()
+            .any(|declared| manifest_process_command_matches(declared, command)),
+        _ => false,
+    });
+    if declared {
+        Ok(())
+    } else {
+        Err(PluginError::InvalidManifest(format!(
+            "external plugin {kind} `{}` must be exactly declared in Process.commands",
+            sanitize_plugin_error(command)
+        )))
+    }
+}
+
+fn manifest_process_command_matches(declared: &str, command: &str) -> bool {
+    let declared = declared.trim();
+    let command = command.trim();
+    if declared == command {
+        return true;
+    }
+    let Some(relative) = declared.strip_prefix("./") else {
+        return false;
+    };
+    !relative.is_empty()
+        && Path::new(command).is_absolute()
+        && Path::new(command).ends_with(Path::new(relative))
 }
 
 pub fn load_plugin_from_directory(root: &Path) -> Result<PluginManifest, PluginError> {
@@ -11177,6 +11560,12 @@ fn build_manifest_tools(
             errors.push(PluginManifestValidationError::InvalidToolInputSchema {
                 tool_name: name.clone(),
             });
+        } else {
+            validate_json_schema_definition(
+                &tool.input_schema,
+                &format!("plugin tool `{name}` inputSchema"),
+                errors,
+            );
         }
         if tool
             .output_schema
@@ -11187,6 +11576,15 @@ fn build_manifest_tools(
                 kind: "tool output",
                 name: name.clone(),
             });
+        }
+        if let Some(output_schema) = &tool.output_schema {
+            if output_schema.is_object() {
+                validate_json_schema_definition(
+                    output_schema,
+                    &format!("plugin tool `{name}` outputSchema"),
+                    errors,
+                );
+            }
         }
         let Some(required_permission) =
             PluginToolPermission::parse(tool.required_permission.trim())
@@ -11342,6 +11740,15 @@ fn build_manifest_prompts(
                     kind: "prompt argument",
                     name: format!("{}:{}", prompt.name, argument.name),
                 });
+            } else {
+                validate_json_schema_definition(
+                    &argument.schema,
+                    &format!(
+                        "plugin prompt `{}` argument `{}`",
+                        prompt.name, argument.name
+                    ),
+                    errors,
+                );
             }
         }
         prompt.name = name;
@@ -11455,6 +11862,19 @@ fn build_manifest_mcp_servers(
                     kind: "mcp tool",
                     name: format!("{server_name}:{}", tool.name),
                 });
+            } else {
+                validate_json_schema_definition(
+                    &tool.input_schema,
+                    &format!("plugin MCP tool `{server_name}:{}` inputSchema", tool.name),
+                    errors,
+                );
+            }
+            if let Some(output_schema) = &tool.output_schema {
+                validate_json_schema_definition(
+                    output_schema,
+                    &format!("plugin MCP tool `{server_name}:{}` outputSchema", tool.name),
+                    errors,
+                );
             }
         }
     }
@@ -12015,6 +12435,8 @@ fn resolve_tools(
     plugin_id: &str,
     plugin_name: &str,
     tools: &[PluginToolManifest],
+    permission_declarations: &[PluginPermissionDeclaration],
+    structured_permissions_enforced: bool,
     external_subprocess_allowed: bool,
     os_sandbox_required: bool,
 ) -> Vec<PluginTool> {
@@ -12035,6 +12457,8 @@ fn resolve_tools(
                 tool.required_permission,
                 Some(root.to_path_buf()),
             )
+            .with_permission_declarations(permission_declarations.to_vec())
+            .with_structured_permissions_enforced(structured_permissions_enforced)
             .with_external_subprocess_allowed(external_subprocess_allowed)
             .with_os_sandbox_required(os_sandbox_required)
         })
@@ -12149,6 +12573,7 @@ fn run_lifecycle_commands(
     lifecycle: &PluginLifecycle,
     execution_policy: &PluginExecutionPolicy,
     permissions: &[PluginPermission],
+    permission_declarations: &[PluginPermissionDeclaration],
     phase: &str,
     commands: &[String],
     deadline: Option<Instant>,
@@ -12159,7 +12584,9 @@ fn run_lifecycle_commands(
 
     for command in commands {
         let timeout = lifecycle_command_timeout(deadline, &metadata.id, phase)?;
-        let (runner, args) = if cfg!(windows) {
+        let (runner, args) = if metadata.kind == PluginKind::External {
+            (command.clone(), Vec::new())
+        } else if cfg!(windows) {
             if command.ends_with(".sh") {
                 (command.clone(), Vec::new())
             } else {
@@ -12175,6 +12602,8 @@ fn run_lifecycle_commands(
             cwd: metadata.root.clone(),
             timeout,
             permission: lifecycle_child_permission(permissions),
+            permission_declarations: permission_declarations.to_vec(),
+            structured_permissions_enforced: metadata.kind == PluginKind::External,
             external_subprocess_allowed: metadata.kind != PluginKind::External
                 || execution_policy.allow_external_subprocess,
             os_sandbox_required: metadata.kind == PluginKind::External,
@@ -14868,7 +15297,7 @@ mod tests {
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"executionPolicy\": {{ \"allowExternalSubprocess\": true, \"reason\": \"test fixture\" }},\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"permissions\": [{{\"type\":\"process\",\"commands\":[\"./lifecycle/init.sh\",\"./lifecycle/shutdown.sh\"]}}],\n  \"executionPolicy\": {{ \"allowExternalSubprocess\": true, \"reason\": \"test fixture\" }},\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
             )
             .as_str(),
         );
@@ -14896,7 +15325,7 @@ mod tests {
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"tool plugin\",\n  \"permissions\": [\"write\"],\n  \"executionPolicy\": {{ \"allowExternalSubprocess\": true, \"reason\": \"test fixture\" }},\n  \"tools\": [\n    {{\n      \"name\": \"{tool_name}\",\n      \"description\": \"Echo JSON input\",\n      \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"message\": {{\"type\": \"string\"}}}}, \"required\": [\"message\"], \"additionalProperties\": false}},\n      \"command\": \"./tools/echo-json.sh\",\n      \"requiredPermission\": \"workspace-write\"\n    }}\n  ]\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"tool plugin\",\n  \"permissions\": [{{\"type\":\"process\",\"commands\":[\"./tools/echo-json.sh\"]}},{{\"type\":\"filesystem\",\"paths\":[\"data\"],\"mode\":\"write\"}}],\n  \"executionPolicy\": {{ \"allowExternalSubprocess\": true, \"reason\": \"test fixture\" }},\n  \"tools\": [\n    {{\n      \"name\": \"{tool_name}\",\n      \"description\": \"Echo JSON input\",\n      \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"message\": {{\"type\": \"string\"}}}}, \"required\": [\"message\"], \"additionalProperties\": false}},\n      \"outputSchema\": {{\"type\":\"object\",\"properties\":{{\"plugin\":{{\"type\":\"string\"}},\"tool\":{{\"type\":\"string\"}},\"input\":{{\"type\":\"object\"}}}},\"required\":[\"plugin\",\"tool\",\"input\"],\"additionalProperties\": false}},\n      \"command\": \"./tools/echo-json.sh\",\n      \"requiredPermission\": \"workspace-write\"\n    }}\n  ]\n}}"
             )
             .as_str(),
         );
@@ -15589,6 +16018,173 @@ mod tests {
 
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn manifest_schema_definition_validation_rejects_bad_type_and_keyword_shapes() {
+        let _guard = env_guard();
+        let root = temp_dir("manifest-schema-definition");
+        write_file(
+            root.join("tools").join("inspect.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "schemaVersion": 1,
+  "name": "bad-schema-demo",
+  "version": "1.0.0",
+  "description": "Bad schema demo",
+  "permissions": ["read"],
+  "tools": [{
+    "name": "inspect",
+    "description": "Inspect",
+    "inputSchema": {
+      "type": "not-a-json-schema-type",
+      "properties": [],
+      "maxLength": "long"
+    },
+    "command": "./tools/inspect.sh",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+
+        let error = load_plugin_from_directory(&root).expect_err("bad schema should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unsupported JSON Schema type"));
+        assert!(rendered.contains("schema is invalid"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_plugin_registration_requires_output_schema_and_exact_process_declaration() {
+        let _guard = env_guard();
+        let root = temp_dir("external-contract-output");
+        write_file(
+            root.join("tools").join("echo.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "missing-output",
+  "version": "1.0.0",
+  "description": "Missing output schema",
+  "permissions": ["read", {"type":"process","commands":["./tools/echo.sh"]}],
+  "tools": [{
+    "name": "echo",
+    "description": "Echo",
+    "inputSchema": {"type":"object"},
+    "command": "./tools/echo.sh",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+        let error = load_plugin_definition(
+            &root,
+            PluginKind::External,
+            "test".to_string(),
+            EXTERNAL_MARKETPLACE,
+        )
+        .expect_err("external outputSchema should be required");
+        assert!(error.to_string().contains("outputSchema"));
+        let _ = fs::remove_dir_all(root);
+
+        let root = temp_dir("external-contract-process");
+        write_file(
+            root.join("tools").join("echo.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(
+            root.join("tools").join("other.sh").as_path(),
+            "#!/bin/sh\ncat\n",
+        );
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "bad-process",
+  "version": "1.0.0",
+  "description": "Bad process declaration",
+  "permissions": ["read", {"type":"process","commands":["./tools/other.sh"]}],
+  "tools": [{
+    "name": "echo",
+    "description": "Echo",
+    "inputSchema": {"type":"object"},
+    "outputSchema": {"type":"object", "additionalProperties": true},
+    "command": "./tools/echo.sh",
+    "requiredPermission": "read-only"
+  }]
+}"#,
+        );
+        let error = load_plugin_definition(
+            &root,
+            PluginKind::External,
+            "test".to_string(),
+            EXTERNAL_MARKETPLACE,
+        )
+        .expect_err("external process declaration should be exact");
+        assert!(error.to_string().contains("Process.commands"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolved_process_command_matches_only_the_declared_relative_components() {
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\plugins\demo")
+        } else {
+            PathBuf::from("/plugins/demo")
+        };
+        assert!(manifest_process_command_matches(
+            "./tools/echo.sh",
+            &root.join("tools/echo.sh").display().to_string(),
+        ));
+        assert!(!manifest_process_command_matches(
+            "./tools/echo.sh",
+            &root.join("other/echo.sh").display().to_string(),
+        ));
+        assert!(!manifest_process_command_matches(
+            "echo.sh",
+            &root.join("tools/echo.sh").display().to_string(),
+        ));
+    }
+
+    #[test]
+    fn external_tool_execution_checks_exact_process_declaration_before_spawn() {
+        let root = temp_dir("external-exec-process-gate");
+        let command = root.join("tools").join("echo.sh");
+        write_file(&command, "#!/bin/sh\ncat\n");
+        let tool = PluginTool::new(
+            "process-gate@external",
+            "process-gate",
+            PluginToolDefinition {
+                name: "echo".to_string(),
+                description: Some("Echo".to_string()),
+                input_schema: serde_json::json!({"type":"object"}),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true
+                })),
+            },
+            command.display().to_string(),
+            Vec::new(),
+            PluginToolPermission::ReadOnly,
+            Some(root.clone()),
+        )
+        .with_permission_declarations(vec![PluginPermissionDeclaration::Process {
+            commands: vec!["./tools/other.sh".to_string()],
+        }])
+        .with_structured_permissions_enforced(true)
+        .with_external_subprocess_allowed(true)
+        .with_os_sandbox_required(true);
+
+        let error = tool
+            .execute(&serde_json::json!({}))
+            .expect_err("undeclared process command should fail before sandbox/spawn");
+        assert!(error.to_string().contains("Process.commands"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -18405,15 +19001,17 @@ mod tests {
         write_file(
             source_root.join(MANIFEST_RELATIVE_PATH).as_path(),
             r#"{
+  "schemaVersion": 1,
   "name": "tool-no-opt",
   "version": "1.0.0",
   "description": "tool plugin without subprocess opt-in",
-  "permissions": ["read"],
+  "permissions": ["read", {"type":"process","commands":["./tools/echo-json.sh"]}],
   "tools": [
     {
       "name": "plugin_echo",
       "description": "Echo JSON input",
       "inputSchema": { "type": "object" },
+      "outputSchema": { "type": "object", "additionalProperties": true },
       "command": "./tools/echo-json.sh",
       "requiredPermission": "read-only"
     }
@@ -18450,6 +19048,7 @@ mod tests {
   "name": "lifecycle-no-opt",
   "version": "1.0.0",
   "description": "lifecycle plugin without subprocess opt-in",
+  "permissions": [{"type":"process","commands":["./lifecycle/init.sh"]}],
   "lifecycle": {
     "Init": ["./lifecycle/init.sh"]
   }
@@ -18718,16 +19317,18 @@ mod tests {
         write_file(
             root.join(MANIFEST_FILE_NAME).as_path(),
             r#"{
+  "schemaVersion": 1,
   "name": "ext-demo",
   "version": "1.0.0",
   "description": "Extended manifest",
-  "permissions": ["read"],
+  "permissions": ["read", {"type":"process","commands":["./tools/inspect.sh"]}],
   "capabilities": { "tools": true, "prompts": true, "workflows": true },
   "tools": [
     {
       "name": "inspect",
       "description": "Inspect input",
       "inputSchema": { "type": "object" },
+      "outputSchema": { "type": "object", "additionalProperties": true },
       "command": "./tools/inspect.sh",
       "requiredPermission": "read-only"
     }

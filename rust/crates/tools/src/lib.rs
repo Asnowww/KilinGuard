@@ -248,6 +248,7 @@ pub struct RuntimeToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    pub output_schema: Option<Value>,
     pub required_permission: PermissionMode,
 }
 
@@ -8808,6 +8809,7 @@ mod tests {
                 name: "echo".to_string(),
                 description: Some("Echo tool".to_string()),
                 input_schema: Some(json!({"type": "object"})),
+                output_schema: None,
             }],
             vec![],
             None,
@@ -8885,6 +8887,7 @@ mod tests {
                 name: "echo".to_string(),
                 description: Some("Echo tool".to_string()),
                 input_schema: Some(json!({"type": "object"})),
+                output_schema: None,
             }],
             vec![],
             None,
@@ -9634,6 +9637,7 @@ mod tests {
                     "properties": { "text": { "type": "string" } },
                     "additionalProperties": false
                 }),
+                output_schema: None,
                 required_permission: runtime::PermissionMode::ReadOnly,
             }])
             .expect("runtime tools should register");

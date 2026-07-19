@@ -52,9 +52,10 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{
-    sanitize_plugin_error, PluginApprovalIssuer, PluginHooks, PluginManager, PluginManagerConfig,
-    PluginMcpServerManifest, PluginMcpTransport, PluginRegistry, PluginRuntimeRegistry,
-    PluginRuntimeStatus, PluginTool, PreparedPluginHotReload,
+    sanitize_plugin_error, validate_json_schema_value, PluginApprovalIssuer, PluginHooks,
+    PluginManager, PluginManagerConfig, PluginMcpServerManifest, PluginMcpTransport,
+    PluginRegistry, PluginRuntimeRegistry, PluginRuntimeStatus, PluginTool,
+    PreparedPluginHotReload,
 };
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::permission_enforcer::PermissionEnforcer;
@@ -5579,6 +5580,21 @@ impl RuntimeMcpState {
             })
     }
 
+    fn managed_tool_for_qualified_tool(
+        &self,
+        qualified_tool_name: &str,
+    ) -> Option<runtime::ManagedMcpTool> {
+        self.manager
+            .server_catalogs()
+            .into_iter()
+            .find_map(|catalog| {
+                catalog
+                    .tools
+                    .into_iter()
+                    .find(|tool| tool.qualified_name == qualified_tool_name)
+            })
+    }
+
     fn protocol_state_for_server(&self, server_name: &str) -> serde_json::Value {
         self.manager
             .server_catalogs()
@@ -5669,6 +5685,30 @@ impl RuntimeMcpState {
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
+        let managed_tool = self.managed_tool_for_qualified_tool(qualified_tool_name);
+        let output_schema = managed_tool
+            .as_ref()
+            .and_then(|tool| tool.tool.output_schema.clone());
+        let normalized_arguments = arguments.clone().unwrap_or_else(|| json!({}));
+        if let Some(input_schema) = managed_tool
+            .as_ref()
+            .and_then(|tool| tool.tool.input_schema.as_ref())
+        {
+            if let Err(error) = validate_json_schema_value(
+                input_schema,
+                &normalized_arguments,
+                "mcp tool arguments",
+            ) {
+                return bounded_mcp_tool_json(&json!({
+                    "status": "error",
+                    "protocol": self.protocol_state_for_qualified_tool(qualified_tool_name),
+                    "heartbeat": self.heartbeat_state_for_qualified_tool(qualified_tool_name),
+                    "error": format!(
+                        "MCP tool `{qualified_tool_name}` arguments failed inputSchema validation: {error}"
+                    ),
+                }));
+            }
+        }
         if let Err(error) = self.refresh_due_heartbeat_for_qualified_tool(qualified_tool_name) {
             let protocol = self.protocol_state_for_qualified_tool(qualified_tool_name);
             let heartbeat = self.heartbeat_state_for_qualified_tool(qualified_tool_name);
@@ -5722,6 +5762,32 @@ impl RuntimeMcpState {
         let value = serde_json::to_value(result).map_err(|error| {
             ToolError::new(format!("failed to serialize MCP tool result: {error}"))
         })?;
+        if let Some(output_schema) = output_schema {
+            let Some(structured_content) = value.get("structuredContent") else {
+                return bounded_mcp_tool_json(&json!({
+                    "status": "error",
+                    "protocol": self.protocol_state_for_qualified_tool(qualified_tool_name),
+                    "heartbeat": self.heartbeat_state_for_qualified_tool(qualified_tool_name),
+                    "error": format!(
+                        "MCP tool `{qualified_tool_name}` declared outputSchema but returned no structuredContent"
+                    ),
+                }));
+            };
+            if let Err(error) = validate_json_schema_value(
+                &output_schema,
+                structured_content,
+                "mcp tool structuredContent",
+            ) {
+                return bounded_mcp_tool_json(&json!({
+                    "status": "error",
+                    "protocol": self.protocol_state_for_qualified_tool(qualified_tool_name),
+                    "heartbeat": self.heartbeat_state_for_qualified_tool(qualified_tool_name),
+                    "error": format!(
+                        "MCP tool `{qualified_tool_name}` result failed outputSchema validation: {error}"
+                    ),
+                }));
+            }
+        }
         let mut value = Self::value_with_protocol(
             value,
             self.protocol_state_for_qualified_tool(qualified_tool_name),
@@ -6267,6 +6333,7 @@ fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDef
             .input_schema
             .clone()
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
+        output_schema: tool.tool.output_schema.clone(),
         required_permission: permission_mode_for_mcp_tool(&tool.tool),
     }
 }
@@ -6287,6 +6354,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["qualifiedName"],
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::DangerFullAccess,
         },
         RuntimeToolDefinition {
@@ -6302,6 +6370,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
@@ -6317,6 +6386,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
@@ -6331,6 +6401,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["server", "uri"],
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
@@ -6346,6 +6417,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
@@ -6361,6 +6433,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["server", "name"],
                 "additionalProperties": false
             }),
+            output_schema: None,
             required_permission: PermissionMode::ReadOnly,
         },
     ]
@@ -13748,7 +13821,13 @@ mod tests {
             "name": name,
             "version": "1.0.0",
             "description": "runtime plugin MCP fixture",
-            "permissions": ["read"],
+            "permissions": [
+                "read",
+                {
+                    "type": "process",
+                    "commands": [script_path.to_string_lossy()]
+                }
+            ],
             "mcpServers": {
                 "embedded": {
                     "transport": "stdio",
@@ -18611,6 +18690,32 @@ UU conflicted.rs",
             serde_json::from_str(&tool_output).expect("tool output should be json");
         assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
 
+        let bad_input_output = executor
+            .execute("mcp__alpha__echo", r#"{"text":123}"#)
+            .expect("invalid MCP tool arguments should return structured JSON");
+        let bad_input_json: serde_json::Value =
+            serde_json::from_str(&bad_input_output).expect("bad input output should be json");
+        assert_eq!(bad_input_json["status"], "error");
+        assert!(
+            bad_input_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("inputSchema validation")),
+            "{bad_input_json}"
+        );
+
+        let bad_output = executor
+            .execute("mcp__alpha__echo", r#"{"text":""}"#)
+            .expect("invalid MCP tool result should return structured JSON");
+        let bad_output_json: serde_json::Value =
+            serde_json::from_str(&bad_output).expect("bad output should be json");
+        assert_eq!(bad_output_json["status"], "error");
+        assert!(
+            bad_output_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("outputSchema validation")),
+            "{bad_output_json}"
+        );
+
         let wrapped_output = executor
             .execute(
                 "MCPTool",
@@ -19719,6 +19824,12 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "                            'type': 'object',",
             "                            'properties': {'text': {'type': 'string'}},",
             "                            'required': ['text'],",
+            "                            'additionalProperties': False",
+            "                        },",
+            "                        'outputSchema': {",
+            "                            'type': 'object',",
+            "                            'properties': {'echoed': {'type': 'string', 'minLength': 1}},",
+            "                            'required': ['echoed'],",
             "                            'additionalProperties': False",
             "                        },",
             "                        'annotations': {'readOnlyHint': True}",

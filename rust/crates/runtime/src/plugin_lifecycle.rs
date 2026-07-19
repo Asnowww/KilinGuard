@@ -355,6 +355,7 @@ mod tests {
             name: name.to_string(),
             description: Some(format!("{name} tool")),
             input_schema: None,
+            output_schema: None,
         }
     }
 

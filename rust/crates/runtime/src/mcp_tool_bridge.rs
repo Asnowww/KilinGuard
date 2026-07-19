@@ -20,6 +20,7 @@ use crate::mcp_stdio::{
     McpGetPromptResult, McpListPromptsResult, McpListResourceTemplatesResult,
     McpListResourcesResult, McpReadResourceResult, McpServerManager,
 };
+use plugins::validate_json_schema_value;
 use serde::{Deserialize, Serialize};
 
 /// Status of a managed MCP server connection.
@@ -69,6 +70,8 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// Metadata about an MCP prompt exposed by a server.
@@ -864,25 +867,63 @@ impl McpToolRegistry {
             )));
         }
 
-        if !state.tools.iter().any(|t| t.name == tool_name) {
-            return Err(McpToolCallError::without_protocol(format!(
-                "tool '{}' not found on server '{}'",
-                tool_name, server_name
-            )));
+        let tool = state
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .cloned()
+            .ok_or_else(|| {
+                McpToolCallError::without_protocol(format!(
+                    "tool '{}' not found on server '{}'",
+                    tool_name, server_name
+                ))
+            })?;
+        if let Some(input_schema) = &tool.input_schema {
+            validate_json_schema_value(input_schema, arguments, "mcp tool arguments").map_err(
+                |error| {
+                    McpToolCallError::without_protocol(format!(
+                        "MCP tool `{server_name}/{tool_name}` arguments failed inputSchema validation: {error}"
+                    ))
+                },
+            )?;
         }
-
+        let output_schema = tool.output_schema.clone();
         drop(inner);
 
         let manager = self.manager.get().cloned().ok_or_else(|| {
             McpToolCallError::without_protocol("MCP server manager is not configured")
         })?;
 
-        Self::spawn_tool_call(
+        let output = Self::spawn_tool_call(
             manager,
             server_name.to_string(),
             mcp_tool_name(server_name, tool_name),
             (!arguments.is_null()).then(|| arguments.clone()),
-        )
+        )?;
+        if let Some(output_schema) = output_schema {
+            let structured = output.result.get("structuredContent").ok_or_else(|| {
+                McpToolCallError::new(
+                    format!(
+                        "MCP tool `{server_name}/{tool_name}` declared outputSchema but returned no structuredContent"
+                    ),
+                    output.protocol.clone(),
+                )
+            })?;
+            validate_json_schema_value(&output_schema, structured, "mcp tool structuredContent")
+                .map_err(|error| {
+                    McpToolCallError::new(
+                        format!(
+                            "MCP tool `{server_name}/{tool_name}` result failed outputSchema validation: {error}"
+                        ),
+                        output.protocol.clone(),
+                    )
+                })?;
+        } else if !output.result.is_object() {
+            return Err(McpToolCallError::without_protocol(format!(
+                "MCP tool `{server_name}/{tool_name}` returned a non-object result"
+            )));
+        }
+        Ok(output)
     }
 
     pub fn call_tool(
@@ -1125,6 +1166,7 @@ mod tests {
                 name: "greet".into(),
                 description: Some("Greet someone".into()),
                 input_schema: None,
+                output_schema: None,
             }],
             vec![McpResourceInfo {
                 uri: "res://data".into(),
@@ -1408,6 +1450,7 @@ mod tests {
                 name: "greet".into(),
                 description: None,
                 input_schema: None,
+                output_schema: None,
             }],
             vec![],
             None,
@@ -1422,6 +1465,33 @@ mod tests {
         assert!(registry
             .call_tool("srv", "missing", &serde_json::json!({}))
             .is_err());
+    }
+
+    #[test]
+    fn validates_mcp_tool_arguments_before_manager_call() {
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "srv",
+            McpConnectionStatus::Connected,
+            vec![McpToolInfo {
+                name: "greet".into(),
+                description: None,
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": false
+                })),
+                output_schema: None,
+            }],
+            vec![],
+            None,
+        );
+
+        let error = registry
+            .call_tool_with_protocol("srv", "greet", &serde_json::json!({"name": 3}))
+            .expect_err("invalid arguments should fail before manager lookup");
+        assert!(error.message.contains("inputSchema validation"));
     }
 
     #[test]
@@ -1446,6 +1516,15 @@ mod tests {
                     "type": "object",
                     "properties": {"text": {"type": "string"}},
                     "required": ["text"]
+                })),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string"},
+                        "echoed": {"type": "string"}
+                    },
+                    "required": ["server", "echoed"],
+                    "additionalProperties": true
                 })),
             }],
             vec![],
@@ -1498,6 +1577,51 @@ mod tests {
     }
 
     #[test]
+    fn validates_mcp_tool_structured_content_against_output_schema() {
+        let script_path = write_bridge_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("bad-output-schema.log");
+        let servers = BTreeMap::from([(
+            "srv".to_string(),
+            manager_server_config(&script_path, "srv", &log_path),
+        )]);
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "srv",
+            McpConnectionStatus::Connected,
+            vec![McpToolInfo {
+                name: "echo".into(),
+                description: Some("Echo tool for srv".into()),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"]
+                })),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"missing": {"type": "string"}},
+                    "required": ["missing"],
+                    "additionalProperties": true
+                })),
+            }],
+            vec![],
+            None,
+        );
+        registry
+            .set_manager(Arc::new(Mutex::new(McpServerManager::from_servers(
+                &servers,
+            ))))
+            .expect("manager should only be set once");
+
+        let error = registry
+            .call_tool_with_protocol("srv", "echo", &serde_json::json!({"text": "world"}))
+            .expect_err("outputSchema mismatch should fail");
+        assert!(error.message.contains("outputSchema validation"));
+
+        cleanup_script(&script_path);
+    }
+
+    #[test]
     fn rejects_tool_call_on_disconnected_server() {
         let registry = McpToolRegistry::new();
         registry.register_server(
@@ -1507,6 +1631,7 @@ mod tests {
                 name: "greet".into(),
                 description: None,
                 input_schema: None,
+                output_schema: None,
             }],
             vec![],
             None,
@@ -1623,6 +1748,7 @@ mod tests {
                 name: "inspect".into(),
                 description: Some("Inspect data".into()),
                 input_schema: Some(serde_json::json!({"type": "object"})),
+                output_schema: None,
             }],
             vec![],
             None,
@@ -1706,6 +1832,7 @@ mod tests {
                     "properties": {"text": {"type": "string"}},
                     "required": ["text"]
                 })),
+                output_schema: None,
             }],
             vec![],
             None,
@@ -1741,6 +1868,7 @@ mod tests {
                 name: "inspect".into(),
                 description: None,
                 input_schema: None,
+                output_schema: None,
             }],
             vec![],
             Some("Inspector".into()),
